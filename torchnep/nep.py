@@ -135,7 +135,9 @@ class NEPCalculator:
         c2 = np.array(data[di:di + c2_size]).reshape(
             self.n_max_radial + 1, self.basis_size_radial + 1,
             self.num_types, self.num_types)
-        self.c2 = torch.tensor(c2, dtype=self.dtype, device=self.device)
+        # save_nep_txt stores c2 transposed as (n_max+1, basis+1, nt, nt);
+        # ops.compute_descriptors expects (nt, nt, n_max+1, basis+1).
+        self.c2 = torch.tensor(c2, dtype=self.dtype, device=self.device).permute(2, 3, 0, 1).contiguous()
         di += c2_size
 
         if self.l_max_3b > 0:
@@ -143,7 +145,7 @@ class NEPCalculator:
             c3 = np.array(data[di:di + c3_size]).reshape(
                 self.n_max_angular + 1, self.basis_size_angular + 1,
                 self.num_types, self.num_types)
-            self.c3 = torch.tensor(c3, dtype=self.dtype, device=self.device)
+            self.c3 = torch.tensor(c3, dtype=self.dtype, device=self.device).permute(2, 3, 0, 1).contiguous()
             di += c3_size
 
         # q_scaler

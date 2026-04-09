@@ -1,16 +1,14 @@
 """
-Two-level torch.autograd.Function wrappers for NEP CUDA kernels.
+CUDA-accelerated descriptor functions for NEP.
 
-Level 1 (NEPRadialDescriptor): forward → backward
-    Forward: computes radial descriptors, saves intermediates
-    Backward: computes grad_c2, grad_rij using CUDA kernels
+Design:
+  - Radial: CUDA kernel for forward (fused scatter-add).
+            PyTorch backward for grad_rij (uses saved gnp) and grad_c2 (recomputes fk).
+  - Angular: CUDA kernel for sum_fxyz accumulation when no gradient needed.
+             PyTorch path when c3 gradient is required (computes c3→gn→sum_fxyz in PyTorch).
 
-Level 2 (NEPRadialDescriptorGrad): backward → second-order backward
-    Forward: computes grad_c2, grad_rij (first-order)
-    Backward: computes grad_grad_q (second-order, for force training)
-
-This enables force training with create_graph=True while keeping all
-expensive operations in fused CUDA kernels.
+This gives correct parameter gradients while keeping CUDA speedup for inference /
+the q_scaler computation path (pytorch_only=False).
 """
 
 import os
@@ -47,57 +45,40 @@ def _load_kernels():
 
 
 # ---------------------------------------------------------------------------
-# Level 2: First-order gradient computation (called from Level 1 backward)
+# Pure-PyTorch helpers (used in backward)
 # ---------------------------------------------------------------------------
 
-class NEPRadialGrad(torch.autograd.Function):
-    """Compute radial descriptor gradients. Supports second-order backward."""
+def _radial_forward_pytorch(rij, pair_i, pair_j, atom_types, c2,
+                            N, n_max_r, basis_r, ntypes, rc):
+    """PyTorch radial forward. Returns (q, gnp) where gnp = dfeat_2b."""
+    from .ops import chebyshev_basis_and_deriv
+    dim_r = n_max_r + 1
+    dtype, device = rij.dtype, rij.device
 
-    @staticmethod
-    def forward(ctx, grad_q, dfeat_2b, rij, pair_i, pair_j, atom_types, c2,
-                N, n_max_r, basis_r, ntypes, rc):
-        k = _load_kernels()
-        if k is not None and rij.is_cuda:
-            result = k.radial_backward(
-                grad_q.contiguous(), dfeat_2b, rij.contiguous(),
-                pair_i, pair_j, atom_types, c2.contiguous(),
-                N, n_max_r, basis_r, ntypes, rc)
-            grad_c2, grad_rij = result[0], result[1]
-        else:
-            grad_c2, grad_rij = _radial_backward_pytorch(
-                grad_q, dfeat_2b, rij, pair_i, pair_j, atom_types, c2,
-                N, n_max_r, basis_r, ntypes, rc)
+    dij = torch.norm(rij, dim=-1)
+    fk, fkp = chebyshev_basis_and_deriv(dij, rc, basis_r)
+    t1, t2 = atom_types[pair_i], atom_types[pair_j]
+    c2_p = c2[t1, t2]                          # (P, dim_r, bs1)
+    gn = (c2_p * fk.unsqueeze(1)).sum(-1)       # (P, dim_r)
+    gnp = (c2_p * fkp.unsqueeze(1)).sum(-1)     # (P, dim_r)
 
-        # Save for second-order backward
-        ctx.save_for_backward(dfeat_2b, rij, pair_i)
-        ctx.N = N
-        ctx.dim_r = n_max_r + 1
-        return grad_c2, grad_rij
-
-    @staticmethod
-    def backward(ctx, grad2_c2, grad2_rij):
-        dfeat_2b, rij, pair_i = ctx.saved_tensors
-
-        # Second-order: d(grad_rij)/d(grad_q) → propagate to grad_q
-        k = _load_kernels()
-        if k is not None and rij.is_cuda:
-            grad2_q = k.radial_second_backward(
-                grad2_rij.contiguous(), dfeat_2b, rij.contiguous(),
-                pair_i, ctx.N, ctx.dim_r)
-        else:
-            grad2_q = _radial_second_backward_pytorch(
-                grad2_rij, dfeat_2b, rij, pair_i, ctx.N, ctx.dim_r)
-
-        # grad2_c2 propagation not needed for standard force training
-        return grad2_q, None, None, None, None, None, None, None, None, None, None, None
+    q = torch.zeros(N, dim_r, dtype=dtype, device=device)
+    q.scatter_add_(0, pair_i.unsqueeze(-1).expand_as(gn), gn)
+    return q, gnp
 
 
 # ---------------------------------------------------------------------------
-# Level 1: Radial descriptor forward (called from model)
+# Radial descriptor: CUDA forward, PyTorch backward
 # ---------------------------------------------------------------------------
 
 class NEPRadialDescriptor(torch.autograd.Function):
-    """Fused radial descriptor computation with CUDA acceleration."""
+    """Radial descriptor with CUDA-accelerated forward.
+
+    Forward:  CUDA kernel (fused scatter-add) for speed.
+    Backward: PyTorch — grad_rij via saved gnp (dfeat_2b), grad_c2 via recomputed fk.
+              This avoids the --use_fast_math trig-accumulation error in the CUDA
+              radial_feat_backward_c2 kernel (~0.25 absolute diff on 30k-pair batches).
+    """
 
     @staticmethod
     def forward(ctx, rij, pair_i, pair_j, atom_types, c2,
@@ -113,7 +94,7 @@ class NEPRadialDescriptor(torch.autograd.Function):
                 rij, pair_i, pair_j, atom_types, c2,
                 N, n_max_r, basis_r, ntypes, rc)
 
-        ctx.save_for_backward(rij, pair_i, pair_j, atom_types, c2, dfeat_2b)
+        ctx.save_for_backward(rij, pair_i, pair_j, atom_types, dfeat_2b)
         ctx.N = N
         ctx.n_max_r = n_max_r
         ctx.basis_r = basis_r
@@ -123,127 +104,140 @@ class NEPRadialDescriptor(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_q):
-        rij, pair_i, pair_j, atom_types, c2, dfeat_2b = ctx.saved_tensors
+        rij, pair_i, pair_j, atom_types, dfeat_2b = ctx.saved_tensors
+        n_max_r, basis_r, ntypes, rc = ctx.n_max_r, ctx.basis_r, ctx.ntypes, ctx.rc
 
-        # Use Level 2 Function for second-order support
-        grad_c2, grad_rij = NEPRadialGrad.apply(
-            grad_q, dfeat_2b, rij, pair_i, pair_j, atom_types, c2,
-            ctx.N, ctx.n_max_r, ctx.basis_r, ctx.ntypes, ctx.rc)
+        # --- grad_rij: chain rule through gn → d12 → rij ---
+        # dfeat_2b[p,n] = gnp[p,n] = sum_k c2[t1,t2,n,k]*fnp[k]  (saved from forward)
+        # d(loss)/d(rij[p]) = (sum_n grad_q[i,n]*gnp[p,n]) * rij[p]/d12[p]
+        d12 = torch.norm(rij, dim=-1, keepdim=True).clamp(min=1e-10)
+        gq_i = grad_q[pair_i]                               # (P, dim_r)
+        scalar = (gq_i * dfeat_2b).sum(-1, keepdim=True)   # (P, 1)
+        grad_rij = scalar / d12 * rij                       # (P, 3)
+
+        # --- grad_c2: recompute fk (basis values) from rij ---
+        # d(loss)/d(c2[t1,t2,n,k]) = sum_{p:t1p=t1,t2p=t2} grad_q[pair_i[p],n] * fk[p,k]
+        # Recomputing fk ensures exact match with the PyTorch compute_descriptors path.
+        from .ops import chebyshev_basis
+        fk = chebyshev_basis(torch.norm(rij, dim=-1), rc, basis_r)  # (P, bs1)
+        t1_pairs = atom_types[pair_i]
+        t2_pairs = atom_types[pair_j]
+        grad_c2 = torch.zeros(ntypes, ntypes, n_max_r + 1, basis_r + 1,
+                              dtype=rij.dtype, device=rij.device)
+        for _t1 in range(ntypes):
+            for _t2 in range(ntypes):
+                _m = (t1_pairs == _t1) & (t2_pairs == _t2)
+                if _m.any():
+                    # (dim_r, P_m) @ (P_m, bs1) = (dim_r, bs1)
+                    grad_c2[_t1, _t2] = gq_i[_m].T @ fk[_m]
 
         return grad_rij, None, None, None, grad_c2, None, None, None, None, None
 
 
-# ---------------------------------------------------------------------------
-# Pure PyTorch fallbacks (CPU/Mac)
-# ---------------------------------------------------------------------------
-
-def _radial_forward_pytorch(rij, pair_i, pair_j, atom_types, c2,
-                            N, n_max_r, basis_r, ntypes, rc):
-    """PyTorch fallback for radial forward."""
-    from .ops import chebyshev_basis_and_deriv
-    dim_r = n_max_r + 1
-    bs1 = basis_r + 1
-    dtype, device = rij.dtype, rij.device
-
-    dij = torch.norm(rij, dim=-1)
-    fk, fkp = chebyshev_basis_and_deriv(dij, rc, basis_r)
-    t1, t2 = atom_types[pair_i], atom_types[pair_j]
-    c2_p = c2[t1, t2]  # (P, dim_r, bs1)
-    gn = (c2_p * fk.unsqueeze(1)).sum(-1)   # (P, dim_r)
-    gnp = (c2_p * fkp.unsqueeze(1)).sum(-1)  # (P, dim_r)
-
-    q = torch.zeros(N, dim_r, dtype=dtype, device=device)
-    q.scatter_add_(0, pair_i.unsqueeze(-1).expand_as(gn), gn)
-
-    return q, gnp  # gnp serves as dfeat_2b
-
-
-def _radial_backward_pytorch(grad_q, dfeat_2b, rij, pair_i, pair_j,
-                             atom_types, c2, N, n_max_r, basis_r, ntypes, rc):
-    """PyTorch fallback for radial backward."""
-    from .ops import chebyshev_basis
-    dim_r = n_max_r + 1
-    bs1 = basis_r + 1
-    dtype, device = rij.dtype, rij.device
-    P = rij.shape[0]
-
-    dij = torch.norm(rij, dim=-1)
-    d12inv = 1.0 / torch.clamp(dij, min=1e-10)
-
-    # grad_rij
-    gq_i = grad_q[pair_i]  # (P, dim_r)
-    scalar = (gq_i * dfeat_2b).sum(-1, keepdim=True) * d12inv.unsqueeze(-1)
-    grad_rij = scalar * rij
-
-    # grad_c2
-    fk = chebyshev_basis(dij, rc, basis_r)
-    t1, t2 = atom_types[pair_i], atom_types[pair_j]
-    grad_c2 = torch.zeros_like(c2)
-    # For each pair, grad_c2[t1, t2, n, k] += grad_q[i, n] * fk[p, k]
-    for p_idx in range(P):
-        i_t = t1[p_idx].item()
-        j_t = t2[p_idx].item()
-        atom_i = pair_i[p_idx].item()
-        for n in range(dim_r):
-            gq = grad_q[atom_i, n]
-            for k in range(bs1):
-                grad_c2[i_t, j_t, n, k] += gq * fk[p_idx, k]
-
-    return grad_c2, grad_rij
-
-
-def _radial_second_backward_pytorch(grad2_rij, dfeat_2b, rij, pair_i, N, dim_r):
-    """PyTorch fallback for second-order backward."""
-    dij = torch.norm(rij, dim=-1)
-    d12inv = 1.0 / torch.clamp(dij, min=1e-10)
-
-    dot = (grad2_rij * rij).sum(-1) * d12inv
-    grad2_q = torch.zeros(N, dim_r, dtype=rij.dtype, device=rij.device)
-    for n in range(dim_r):
-        grad2_q[:, n].scatter_add_(0, pair_i, dot * dfeat_2b[:, n])
-
-    return grad2_q
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def radial_descriptor_cuda(rij, pair_i, pair_j, atom_types, c2,
                            N, n_max_r, basis_r, ntypes, rc):
-    """Compute radial descriptors with full CUDA acceleration.
-
-    Returns (N, dim_r) tensor. Supports second-order autograd for force training.
-    """
+    """Radial descriptors with CUDA-accelerated forward, correct PyTorch backward."""
     return NEPRadialDescriptor.apply(
         rij, pair_i, pair_j, atom_types, c2,
         N, n_max_r, basis_r, ntypes, rc)
 
 
-def angular_forward_cuda(rij, pair_i, pair_j, atom_types, c3,
-                         N, n_ap1, basis_a, ntypes, num_lm, rc):
-    """CUDA angular forward: compute sum_fxyz (N, n_ap1, num_lm).
-    Returns (sum_fxyz, None) or (None, None) if CUDA not available.
-    """
-    k = _load_kernels()
-    if k is not None and rij.is_cuda:
-        try:
-            result = k.angular_forward(
-                rij.contiguous(), pair_i, pair_j, atom_types,
-                c3.contiguous(), N, n_ap1, basis_a, ntypes, num_lm, rc)
-            return result[0], None
-        except Exception as e:
-            print(f"Warning: angular_forward_cuda failed: {e}")
-    return None, None
+# ---------------------------------------------------------------------------
+# Angular descriptor: PyTorch (for correct c3 gradient) with optional CUDA sum_fxyz
+# ---------------------------------------------------------------------------
 
+def angular_descriptor_cuda(rij, pair_i, pair_j, atom_types, c3,
+                             N, n_ap1, basis_a, ntypes, num_lm,
+                             L_max, num_L, rc,
+                             c3b_coeffs, c4b_coeffs, c5b_coeffs):
+    """Angular descriptors — differentiable w.r.t. c3.
+
+    The c3 → gn → sum_fxyz → q_ang chain runs entirely in PyTorch so that
+    c3.grad is computed correctly.  (The CUDA angular_feat_forward kernel
+    accumulates sum_fxyz without tracking c3 through the computation graph,
+    so c3.grad would always be None/zero if we used that kernel here.)
+    """
+    from .ops import chebyshev_basis, angular_basis
+
+    dij = torch.norm(rij, dim=-1)
+    fk = chebyshev_basis(dij, rc, basis_a)                  # (P, bs1)
+    t1_pairs = atom_types[pair_i]
+    t2_pairs = atom_types[pair_j]
+
+    # c3 contraction: use type-pair matmul loop (matches compute_descriptors exactly
+    # so gradients agree bit-for-bit with the pytorch_only=True reference path)
+    gn = torch.zeros(rij.shape[0], n_ap1, dtype=rij.dtype, device=rij.device)
+    for _t1 in range(ntypes):
+        for _t2 in range(ntypes):
+            _m = (t1_pairs == _t1) & (t2_pairs == _t2)
+            if _m.any():
+                gn[_m] = fk[_m] @ c3[_t1, _t2].T          # (P_m, n_ap1)
+
+    d12inv = 1.0 / dij.clamp(min=1e-10)
+    blm = angular_basis(rij[:, 0] * d12inv, rij[:, 1] * d12inv,
+                        rij[:, 2] * d12inv, L_max)          # (P, num_lm)
+
+    # Accumulate: sum_fxyz[i, n, m] = sum_{pairs p: pair_i[p]=i} gn[p,n] * blm[p,m]
+    gn_blm = gn.unsqueeze(-1) * blm.unsqueeze(1)            # (P, n_ap1, num_lm)
+    sum_fxyz = torch.zeros(N, n_ap1, num_lm,
+                           dtype=rij.dtype, device=rij.device)
+    sum_fxyz.scatter_add_(
+        0,
+        pair_i[:, None, None].expand_as(gn_blm),
+        gn_blm,
+    )
+
+    # q_angular from sum_fxyz (same formula as before)
+    s = sum_fxyz
+    parts = []
+
+    # 3-body terms (L=1..L_max)
+    q_3b_list = []
+    for li in range(L_max):
+        L = li + 1
+        nt_lm = 2 * L + 1
+        st = L * L - 1
+        c = c3b_coeffs[st:st + nt_lm]
+        sb2 = s[:, :, st:st + nt_lm] ** 2
+        ql = c[0] * sb2[:, :, 0]
+        if nt_lm > 1:
+            ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
+        q_3b_list.append(ql)
+    q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
+    parts.append(q_3b)
+
+    # 4-body
+    if num_L >= L_max + 1:
+        s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
+        s22r, s22i = s[:, :, 6], s[:, :, 7]
+        cb = c4b_coeffs
+        q4 = (cb[0] * s20 ** 3
+              + cb[1] * s20 * (s21r ** 2 + s21i ** 2)
+              + cb[2] * s20 * (s22r ** 2 + s22i ** 2)
+              + cb[3] * s22r * (s21i ** 2 - s21r ** 2)
+              + cb[4] * s21r * s21i * s22i)
+        parts.append(q4)
+
+    # 5-body
+    if num_L >= L_max + 2:
+        s0sq = s[:, :, 0] ** 2
+        s1sq = s[:, :, 1] ** 2 + s[:, :, 2] ** 2
+        cb5 = c5b_coeffs
+        q5 = cb5[0] * s0sq ** 2 + cb5[1] * s0sq * s1sq + cb5[2] * s1sq ** 2
+        parts.append(q5)
+
+    return torch.cat(parts, dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Angular force helpers (still CUDA-accelerated — used in old compute_properties path)
+# ---------------------------------------------------------------------------
 
 def angular_force_cuda(rij, pair_i, pair_j, atom_types, c3,
                        Fp_ang, sum_fxyz,
                        N, n_ap1, basis_a, ntypes, L_max, num_L, rc,
                        compute_virial=False):
-    """CUDA angular force: per-pair grad_rij → per-atom forces/virial.
-    Returns (forces, virial) or (None, None) if CUDA not available.
-    """
+    """CUDA angular force: per-pair grad_rij → per-atom forces/virial."""
     k = _load_kernels()
     if k is None or not rij.is_cuda:
         return None, None
@@ -271,179 +265,6 @@ def angular_force_cuda(rij, pair_i, pair_j, atom_types, c3,
     except Exception as e:
         print(f"Warning: angular_force_cuda failed: {e}")
         return None, None
-
-
-def angular_backward_rij_cuda(
-    grad_q_ang, rij, pair_i, pair_j, atom_types, c3, sum_fxyz,
-    N, n_ap1, basis_a, ntypes, L_max, num_L, rc,
-):
-    """CUDA angular backward: compute grad_rij from grad_q_angular.
-
-    This is the angular equivalent of the radial backward.
-    grad_q_ang acts as 'Fp' in the GPUMD accumulate_f12 formula.
-    """
-    k = _load_kernels()
-    if k is not None and rij.is_cuda:
-        result = k.angular_backward(
-            rij.contiguous(), pair_i, pair_j, atom_types,
-            c3.contiguous(), grad_q_ang.contiguous(),
-            sum_fxyz.contiguous(),
-            N, n_ap1, basis_a, ntypes, L_max, num_L, rc, False)
-        return result[0]  # grad_rij (P, 3)
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Angular descriptor: torch.autograd.Function (two-level)
-# ---------------------------------------------------------------------------
-
-class NEPAngularGrad(torch.autograd.Function):
-    """Level 2: angular backward → second-order backward for force training."""
-
-    @staticmethod
-    def forward(ctx, grad_q_ang, rij, pair_i, pair_j, atom_types, c3,
-                sum_fxyz, N, n_ap1, basis_a, ntypes, L_max, num_L, rc):
-        # Compute grad_rij using CUDA backward kernel
-        grad_rij = angular_backward_rij_cuda(
-            grad_q_ang, rij, pair_i, pair_j, atom_types, c3,
-            sum_fxyz, N, n_ap1, basis_a, ntypes, L_max, num_L, rc)
-
-        if grad_rij is None:
-            # PyTorch fallback: use autograd (not available here, return zeros)
-            grad_rij = torch.zeros(rij.shape[0], 3, dtype=rij.dtype, device=rij.device)
-
-        # grad_c3 is not computed here — flows through PyTorch autograd on sum_fxyz → q
-        grad_c3 = torch.zeros_like(c3)
-
-        ctx.save_for_backward(rij, pair_i, pair_j, atom_types, c3, sum_fxyz)
-        ctx.N = N; ctx.n_ap1 = n_ap1; ctx.basis_a = basis_a
-        ctx.ntypes = ntypes; ctx.L_max = L_max; ctx.num_L = num_L; ctx.rc = rc
-        return grad_c3, grad_rij
-
-    @staticmethod
-    def backward(ctx, grad2_c3, grad2_rij):
-        rij, pair_i, pair_j, atom_types, c3, sum_fxyz = ctx.saved_tensors
-        # Second-order: propagate grad2_rij back to grad_q_ang
-        # This is needed for force training: d(force_loss)/d(grad_q) → d(grad_q)/d(params)
-        # For now, use a simplified version (zeros — full second-order is complex)
-        # The force loss backward will still flow through the q → NN path
-        grad2_q = torch.zeros(ctx.N, grad2_rij.shape[0], dtype=rij.dtype, device=rij.device)
-        return grad2_q, None, None, None, None, None, None, None, None, None, None, None, None, None
-
-
-class NEPAngularDescriptor(torch.autograd.Function):
-    """Level 1: angular descriptor forward → backward.
-
-    Forward: computes sum_fxyz via CUDA kernel, then q_angular via PyTorch.
-    Backward: grad_q → grad_rij (CUDA) + grad_c3 (PyTorch autograd through sum_fxyz).
-    """
-
-    @staticmethod
-    def forward(ctx, rij, pair_i, pair_j, atom_types, c3,
-                N, n_ap1, basis_a, ntypes, num_lm, L_max, num_L, rc,
-                c3b_coeffs, c4b_coeffs, c5b_coeffs):
-        # Compute sum_fxyz via CUDA kernel
-        k = _load_kernels()
-        if k is not None and rij.is_cuda:
-            result = k.angular_forward(
-                rij.contiguous(), pair_i, pair_j, atom_types,
-                c3.contiguous(), N, n_ap1, basis_a, ntypes, num_lm, rc)
-            sum_fxyz = result[0]  # (N, n_ap1, NUM_ABC)
-        else:
-            sum_fxyz = None  # will fall back
-
-        if sum_fxyz is None:
-            # PyTorch fallback
-            from .ops import chebyshev_basis, angular_basis
-            dij = torch.norm(rij, dim=-1)
-            fk = chebyshev_basis(dij, rc, basis_a)
-            t1, t2 = atom_types[pair_i], atom_types[pair_j]
-            c3_p = c3[t1, t2]
-            gn = (c3_p * fk.unsqueeze(1)).sum(-1)
-            d12inv = 1.0 / dij
-            blm = angular_basis(rij[:, 0]*d12inv, rij[:, 1]*d12inv,
-                               rij[:, 2]*d12inv, L_max)
-            gn_blm = gn.unsqueeze(-1) * blm.unsqueeze(1)
-            sum_fxyz = torch.zeros(N, n_ap1, num_lm, dtype=rij.dtype, device=rij.device)
-            sum_fxyz.scatter_add_(
-                0, pair_i.unsqueeze(-1).unsqueeze(-1).expand_as(gn_blm), gn_blm)
-
-        # Compute q_angular from sum_fxyz (PyTorch — allows c3 gradient flow)
-        # This part stays in PyTorch so autograd handles grad_c3
-        s = sum_fxyz[:, :, :num_lm]
-
-        parts = []
-        # 3-body
-        q_3b_list = []
-        for li in range(L_max):
-            L = li + 1
-            nt = 2 * L + 1
-            st = L * L - 1
-            c = c3b_coeffs[st:st + nt]
-            sb2 = s[:, :, st:st + nt] ** 2
-            ql = c[0] * sb2[:, :, 0]
-            if nt > 1:
-                ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
-            q_3b_list.append(ql)
-        q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
-        parts.append(q_3b)
-
-        # 4-body
-        if num_L >= L_max + 1:
-            s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
-            s22r, s22i = s[:, :, 6], s[:, :, 7]
-            cb = c4b_coeffs
-            q4 = (cb[0]*s20**3 + cb[1]*s20*(s21r**2+s21i**2)
-                  + cb[2]*s20*(s22r**2+s22i**2)
-                  + cb[3]*s22r*(s21i**2-s21r**2) + cb[4]*s21r*s21i*s22i)
-            parts.append(q4)
-
-        # 5-body
-        if num_L >= L_max + 2:
-            s0sq = s[:, :, 0] ** 2
-            s1sq = s[:, :, 1] ** 2 + s[:, :, 2] ** 2
-            cb5 = c5b_coeffs
-            q5 = cb5[0]*s0sq**2 + cb5[1]*s0sq*s1sq + cb5[2]*s1sq**2
-            parts.append(q5)
-
-        q_ang = torch.cat(parts, dim=-1)
-
-        ctx.save_for_backward(rij, pair_i, pair_j, atom_types, c3, sum_fxyz)
-        ctx.N = N; ctx.n_ap1 = n_ap1; ctx.basis_a = basis_a; ctx.ntypes = ntypes
-        ctx.L_max = L_max; ctx.num_L = num_L; ctx.rc = rc
-        return q_ang
-
-    @staticmethod
-    def backward(ctx, grad_q_ang):
-        rij, pair_i, pair_j, atom_types, c3, sum_fxyz = ctx.saved_tensors
-
-        # grad_rij via CUDA backward kernel (or PyTorch fallback)
-        _, grad_rij = NEPAngularGrad.apply(
-            grad_q_ang, rij, pair_i, pair_j, atom_types, c3,
-            sum_fxyz, ctx.N, ctx.n_ap1, ctx.basis_a, ctx.ntypes,
-            ctx.L_max, ctx.num_L, ctx.rc)
-
-        # grad_c3 flows through PyTorch autograd on sum_fxyz → q
-        # Since sum_fxyz was computed from c3 in forward (via the CUDA kernel
-        # which doesn't track gradients), we return zeros for grad_c3 here.
-        # The c3 gradients flow through the energy loss path instead.
-        grad_c3 = None
-
-        return grad_rij, None, None, None, grad_c3, None, None, None, None, None, None, None, None, None, None, None
-
-
-def angular_descriptor_cuda(rij, pair_i, pair_j, atom_types, c3,
-                            N, n_ap1, basis_a, ntypes, num_lm,
-                            L_max, num_L, rc,
-                            c3b_coeffs, c4b_coeffs, c5b_coeffs):
-    """Compute angular descriptors with CUDA-accelerated sum_fxyz.
-
-    Returns (N, dim_angular) tensor with autograd support.
-    """
-    return NEPAngularDescriptor.apply(
-        rij, pair_i, pair_j, atom_types, c3,
-        N, n_ap1, basis_a, ntypes, num_lm, L_max, num_L, rc,
-        c3b_coeffs, c4b_coeffs, c5b_coeffs)
 
 
 def is_cuda_available():

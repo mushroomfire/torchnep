@@ -298,8 +298,13 @@ def compute_energy_shift(structures, num_types):
 
 
 @torch.no_grad()
-def compute_q_scaler(model, data_store, batch_size=64):
-    """Compute descriptor min/max across training set."""
+def compute_q_scaler(model, data_store, batch_size=64, pytorch_only=True):
+    """Compute descriptor min/max across training set.
+
+    pytorch_only must match the value used during training so that the
+    descriptor statistics (and therefore q_scaler normalization) are
+    consistent with the actual training-time descriptor values.
+    """
     model.eval()
     dev = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -314,6 +319,7 @@ def compute_q_scaler(model, data_store, batch_size=64):
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
+            pytorch_only=pytorch_only,
         )
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
@@ -361,6 +367,8 @@ def train_nep(
     use_compile: bool = False,
     restart: bool = True,
     checkpoint_interval: int = 100,
+    seed: int = None,
+    pytorch_only: bool = True,
 ):
     """Train a NEP model.
 
@@ -390,10 +398,33 @@ def train_nep(
         If True and checkpoint.pt exists in output_dir, resume from it.
     checkpoint_interval : int
         Save checkpoint every N epochs (also saves on best loss).
+    seed : int, optional
+        Random seed for reproducibility (model init + batch shuffle).
+    pytorch_only : bool
+        If True (default), force pure-PyTorch path everywhere — no handwritten
+        CUDA kernels.  Set to False to allow CUDA-kernel acceleration when
+        running on GPU (radial/angular descriptor kernels in cuda_ops.py).
+        The training loop itself (compute_properties_cached + analytical forces)
+        is always pure PyTorch; this flag currently affects only q_scaler
+        descriptor computation.  When comparing pure-torch vs CUDA-kernel
+        correctness, run once with pytorch_only=True and once with False.
     """
     os.makedirs(output_dir, exist_ok=True)
     dev = torch.device(device)
     dtype = torch.float32 if precision == "float32" else torch.float64
+
+    # Fix random seed for reproducibility (model init + epoch shuffle)
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        # Make cuDNN deterministic — avoids non-deterministic convolution algorithms.
+        # Does NOT fully eliminate scatter_add non-determinism; use
+        # torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG=:4096:8
+        # if exact bit-for-bit reproducibility is required.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     # 1. Config
     print("Parsing nep.in...")
@@ -435,7 +466,8 @@ def train_nep(
 
     # 7. q_scaler
     print("Computing q_scaler...")
-    q_min, q_max = compute_q_scaler(model, data_store, batch_size)
+    q_min, q_max = compute_q_scaler(model, data_store, batch_size,
+                                    pytorch_only=pytorch_only)
     model.set_q_scaler(q_min, q_max)
 
     # 8. Compile (PyTorch 2.0+)
@@ -462,8 +494,11 @@ def train_nep(
     has_forces = data_store.has_forces and lambda_f > 0
     has_virial = data_store.has_virial and lambda_v > 0
 
+    backend_str = ("pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated")
+    seed_str = f"seed={seed}" if seed is not None else "no seed (non-reproducible)"
     print(f"\nTraining: epochs {start_epoch}-{num_epochs}, batch={batch_size}, "
           f"device={device}, dtype={precision}")
+    print(f"Backend: {backend_str} | {seed_str}")
     print(f"Loss: E={lambda_e} F={lambda_f} V={lambda_v} "
           f"L1={lambda_1} L2={lambda_2}")
     print("-" * 72)
@@ -478,7 +513,13 @@ def train_nep(
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
             model.train()
-            perm = torch.randperm(n_structs)
+            # Per-epoch seeded generator ensures identical batch order across runs
+            # when a seed is provided (independent of CUDA RNG state).
+            if seed is not None:
+                _gen = torch.Generator().manual_seed(seed + epoch)
+                perm = torch.randperm(n_structs, generator=_gen)
+            else:
+                perm = torch.randperm(n_structs)
             sum_loss = 0.0
             sum_le = 0.0
             sum_lf = 0.0
@@ -491,23 +532,15 @@ def train_nep(
                 idx = perm[start:start + batch_size].tolist()
                 batch = data_store.collate(idx)
 
-                # Use compute_properties (autograd path) for force/virial training.
-                # compute_descriptors now uses type-pair matmul for c2/c3 backward
-                # (avoids atomic scatter contention → ~2.5x faster than fancy index).
-                # compute_properties_cached with analytical forces is available for
-                # large systems where create_graph=True would OOM.
-                if has_forces or has_virial:
-                    result = model.compute_properties(
-                        batch["rij_rad"], batch["rij_ang"],
-                        batch["pair_i_rad"], batch["pair_j_rad"],
-                        batch["pair_i_ang"], batch["pair_j_ang"],
-                        batch["atom_types"], batch["N"],
-                        batch["struct_idx"], batch["num_structures"],
-                        need_forces=has_forces, need_virial=has_virial)
-                else:
-                    # Energy-only: use fast cached path (no rij recomputation)
-                    result = model.compute_properties_cached(
-                        batch, need_forces=False, need_virial=False)
+                # Always use analytical-force cached path:
+                # - Avoids create_graph=True (no second-order gradients)
+                # - Second-order gradients from create_graph=True are numerically
+                #   unstable for high-order descriptors (l_max=4 quartic 5-body,
+                #   n_max=8), causing gradient explosions around epoch ~600.
+                # - Analytical path is fully differentiable through c2/c3 and NN
+                #   weights via explicit chain rule — same gradient quality, stable.
+                result = model.compute_properties_cached(
+                    batch, need_forces=has_forces, need_virial=has_virial)
 
                 # Energy loss (per-atom MSE)
                 e_pa_pred = result["Etot"] / batch["natoms"]

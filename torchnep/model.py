@@ -276,15 +276,33 @@ class NEPModel(nn.Module):
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
         Ei = Ei - self.b1  # subtract shared output bias
 
-        # ZBL (energy only — ZBL force not yet supported in cached path)
+        # ZBL energy
+        zbl_forces = None
+        zbl_virial = None
         if self.zbl is not None:
+            # ZBL has no trainable parameters — compute forces via a local autograd
+            # call without create_graph (no gradient flows to model params through ZBL).
+            rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
             Ei_zbl = ops.compute_zbl(
                 batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
-                batch["rij_ang"], N, self.atomic_numbers.tolist(),
+                rij_zbl, N, self.atomic_numbers.tolist(),
                 self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
                 getattr(self, "zbl_rc_inner_per_type", None),
                 getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
-            Ei = Ei + Ei_zbl
+            Ei = Ei + Ei_zbl.detach()
+            if need_forces and Ei_zbl.requires_grad:
+                g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
+                                            allow_unused=True)[0]
+                if g_zbl is not None:
+                    # Accumulate ZBL forces via existing helper (angular pairs only)
+                    empty_i = torch.zeros(0, dtype=torch.long, device=device)
+                    empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
+                    zbl_forces, zbl_virial = ops.accumulate_forces_virial(
+                        N, empty_i, empty_i, empty_r, empty_r,
+                        batch["pair_i_ang"], batch["pair_j_ang"],
+                        batch["rij_ang"].detach(), g_zbl.detach(),
+                        dtype, device,
+                    )
 
         Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
         Etot.scatter_add_(0, batch["struct_idx"], Ei)
@@ -309,6 +327,10 @@ class NEPModel(nn.Module):
                 dtype, device,
                 compute_virial=need_virial,
             )
+            if zbl_forces is not None:
+                forces = forces + zbl_forces
+                if need_virial:
+                    virial = virial + zbl_virial
             result["forces"] = forces
             if need_virial and virial is not None:
                 result["virial"] = virial

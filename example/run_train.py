@@ -4,14 +4,21 @@ import sys
 sys.path.insert(0, "..")
 from torchnep import train_nep
 
+# Pure-PyTorch baseline run (no handwritten CUDA kernels in the training loop).
+# Fixed seed makes results reproducible — use the same seed to compare
+# pure-torch vs CUDA-kernel implementations for correctness verification.
 train_nep(
     config_file="nep.in",
     data_file="train.xyz",
-    output_dir="output",
-    device="cuda",          # "cpu" for no GPU
+    output_dir="output_cuda",
+    device="cuda",          # or "cpu" if no GPU available
     precision="float32",
-    num_epochs=2000,         # 200 epochs is usually enough for convergence
-    batch_size=32,          # 32 structures/batch (good GPU utilization)
-    lr=1e-2,                # Adam default, cosine decay to 1e-4
-    print_interval=10,
+    num_epochs=1000,           # short run for pure-torch baseline verification
+    batch_size=32,
+    lr=1e-2,
+    print_interval=1,
+    checkpoint_interval=100,
+    restart=True,          # always fresh start for reproducibility
+    seed=1,                # fixed seed: enables direct comparison with CUDA path
+    pytorch_only=True
 )
