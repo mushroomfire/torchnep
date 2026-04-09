@@ -20,5 +20,5 @@ train_nep(
     checkpoint_interval=100,
     restart=True,          # always fresh start for reproducibility
     seed=1,                # fixed seed: enables direct comparison with CUDA path
-    pytorch_only=True
+    pytorch_only=False
 )
