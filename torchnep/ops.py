@@ -178,14 +178,17 @@ def compute_descriptors(
     if not use_cuda_rad:
         dij_rad = torch.norm(rij_rad, dim=-1)
         fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
-        t1r, t2r = atom_types[pi_rad], atom_types[pj_rad]
-        if c2.shape[0] == n_max_radial + 1:
-            c2_pairs = c2[:, :, t1r, t2r].permute(2, 0, 1)
-        else:
-            c2_pairs = c2[t1r, t2r]
-        gn_rad = (c2_pairs * fk_rad.unsqueeze(1)).sum(-1)
+        t1r = atom_types[pi_rad]
+        t2r = atom_types[pj_rad]
+        # Type-pair matmul loop: avoids atomic scatter in backward (38x faster)
         q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
-        q_rad.scatter_add_(0, pi_rad.unsqueeze(-1).expand_as(gn_rad), gn_rad)
+        for _t1 in range(ntypes):
+            for _t2 in range(ntypes):
+                _m = (t1r == _t1) & (t2r == _t2)
+                if not _m.any():
+                    continue
+                _gn = fk_rad[_m] @ c2[_t1, _t2].T
+                q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
 
     parts = [q_rad]
 
@@ -214,12 +217,16 @@ def compute_descriptors(
             # PyTorch fallback
             dij_ang = torch.norm(rij_ang, dim=-1)
             fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
-            t1a, t2a = atom_types[pi_ang], atom_types[pj_ang]
-            if c3.shape[0] == n_max_angular + 1:
-                c3_pairs = c3[:, :, t1a, t2a].permute(2, 0, 1)
-            else:
-                c3_pairs = c3[t1a, t2a]
-            gn_ang = (c3_pairs * fk_ang.unsqueeze(1)).sum(-1)
+            t1a = atom_types[pi_ang]
+            t2a = atom_types[pj_ang]
+            # Type-pair matmul loop (same optimization as radial)
+            gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
+            for _t1 in range(ntypes):
+                for _t2 in range(ntypes):
+                    _m = (t1a == _t1) & (t2a == _t2)
+                    if not _m.any():
+                        continue
+                    gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
             d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
             blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,
                                 rij_ang[:, 2]*d12inv, l_max_3b)

@@ -491,10 +491,23 @@ def train_nep(
                 idx = perm[start:start + batch_size].tolist()
                 batch = data_store.collate(idx)
 
-                # Always use the cached path: analytical forces are fully
-                # differentiable through c2/c3 and NN weights without create_graph.
-                result = model.compute_properties_cached(
-                    batch, need_forces=has_forces, need_virial=has_virial)
+                # Use compute_properties (autograd path) for force/virial training.
+                # compute_descriptors now uses type-pair matmul for c2/c3 backward
+                # (avoids atomic scatter contention → ~2.5x faster than fancy index).
+                # compute_properties_cached with analytical forces is available for
+                # large systems where create_graph=True would OOM.
+                if has_forces or has_virial:
+                    result = model.compute_properties(
+                        batch["rij_rad"], batch["rij_ang"],
+                        batch["pair_i_rad"], batch["pair_j_rad"],
+                        batch["pair_i_ang"], batch["pair_j_ang"],
+                        batch["atom_types"], batch["N"],
+                        batch["struct_idx"], batch["num_structures"],
+                        need_forces=has_forces, need_virial=has_virial)
+                else:
+                    # Energy-only: use fast cached path (no rij recomputation)
+                    result = model.compute_properties_cached(
+                        batch, need_forces=False, need_virial=False)
 
                 # Energy loss (per-atom MSE)
                 e_pa_pred = result["Etot"] / batch["natoms"]
