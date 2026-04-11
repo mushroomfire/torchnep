@@ -891,18 +891,41 @@ def train_nep(
 # ---------------------------------------------------------------------------
 
 def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
-                precision, num_epochs, batch_size, lr, print_interval):
-    """Worker function for DDP training."""
+                precision="float32", num_epochs=None, batch_size=None,
+                lr=None, print_interval=10, pytorch_only=True):
+    """Worker function for DDP training.
+
+    Training parameters (num_epochs, batch_size, lr) are read from the config
+    file (nep.in).  Explicit function arguments override the config values.
+
+    Parameters
+    ----------
+    pytorch_only : bool
+        If True (default), use pure-PyTorch backend.
+        If False, use custom CUDA kernels for basis functions.
+    """
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
 
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
     dev = torch.device(f"cuda:{rank}")
     dtype = torch.float32 if precision == "float32" else torch.float64
     is_main = rank == 0
 
     config = parse_nep_in(config_file)
+
+    # Training params: function arg > nep.in > hardcoded default
+    def _cfg(arg_val, cfg_key, default):
+        if arg_val is not None:
+            return arg_val
+        return config.get(cfg_key, default)
+
+    num_epochs = _cfg(num_epochs, "num_epochs", 200)
+    batch_size = _cfg(batch_size, "batch_size", 32)
+    lr = _cfg(lr, "lr", 0.01)
+
     lambda_e = config.get("lambda_e", 1.0)
     lambda_f = config.get("lambda_f", 1.0)
     lambda_v = config.get("lambda_v", 0.1)
@@ -923,7 +946,8 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
 
     # q_scaler: compute on rank 0, broadcast
     if is_main:
-        q_min, q_max = compute_q_scaler(model, data_store, batch_size)
+        q_min, q_max = compute_q_scaler(model, data_store, batch_size,
+                                        pytorch_only=pytorch_only)
     else:
         q_min = torch.zeros(model.dim, dtype=dtype, device=dev)
         q_max = torch.zeros(model.dim, dtype=dtype, device=dev)
@@ -976,18 +1000,9 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
             idx = perm[start:start + batch_size].tolist()
             batch = data_store.collate(idx)
 
-            if data_store.has_cached_basis:
-                result = raw_model.compute_properties_cached(
+            result = raw_model.compute_properties_cached(
                     batch, need_forces=has_forces, need_virial=has_virial,
-                    pytorch_only=True)
-            else:
-                result = raw_model.compute_properties(
-                    batch["rij_rad"], batch["rij_ang"],
-                    batch["pair_i_rad"], batch["pair_j_rad"],
-                    batch["pair_i_ang"], batch["pair_j_ang"],
-                    batch["atom_types"], batch["N"],
-                    batch["struct_idx"], batch["num_structures"],
-                    need_forces=has_forces, need_virial=has_virial)
+                    pytorch_only=pytorch_only)
 
             e_pa = result["Etot"] / batch["natoms"]
             e_ref = batch["energy"] / batch["natoms"]
@@ -1057,7 +1072,8 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"))
         print(f"\nDone. Best loss: {best_loss:.6e}")
 
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def train_nep_ddp(
@@ -1065,19 +1081,26 @@ def train_nep_ddp(
     data_file: str,
     output_dir: str = ".",
     precision: str = "float32",
-    num_epochs: int = 200,
-    batch_size: int = 32,
-    lr: float = 1e-2,
+    num_epochs: int = None,
+    batch_size: int = None,
+    lr: float = None,
     print_interval: int = 10,
+    pytorch_only: bool = True,
     num_gpus: int = None,
 ):
     """Launch DDP multi-GPU training.
+
+    Training parameters (num_epochs, batch_size, lr) are read from the config
+    file (nep.in).  Explicit function arguments override the config values.
 
     Uses torchrun-compatible spawn. Can also be launched via:
         torchrun --nproc_per_node=2 -m torchnep.train_ddp ...
 
     Parameters
     ----------
+    pytorch_only : bool
+        If True (default), use pure-PyTorch backend.
+        If False, use custom CUDA kernels for basis functions.
     num_gpus : int
         Number of GPUs. Default: all available.
     """
@@ -1087,14 +1110,16 @@ def train_nep_ddp(
     if num_gpus <= 1:
         print("Only 1 GPU, falling back to single-GPU training")
         train_nep(config_file, data_file, output_dir, "cuda", precision,
-                  num_epochs, batch_size, lr, print_interval)
+                  num_epochs, batch_size, lr, print_interval,
+                  pytorch_only=pytorch_only)
         return
 
     import torch.multiprocessing as mp
     mp.spawn(
         _ddp_worker,
         args=(num_gpus, config_file, data_file, output_dir,
-              precision, num_epochs, batch_size, lr, print_interval),
+              precision, num_epochs, batch_size, lr, print_interval,
+              pytorch_only),
         nprocs=num_gpus,
         join=True,
     )
