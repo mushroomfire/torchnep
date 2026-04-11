@@ -174,8 +174,37 @@ def parse_nep_in(filename: str) -> Dict:
                     params["save_start"] = int(parts[2])
                 if len(parts) > 3:
                     params["save_count"] = int(parts[3])
+            # --- torchnep training parameters ---
+            elif key == "epoch":
+                params["num_epochs"] = int(parts[1])
+            elif key == "lr":
+                params["lr"] = float(parts[1])
+            elif key == "scheduler_patience":
+                params["scheduler_patience"] = int(parts[1])
+            elif key == "scheduler_factor":
+                params["scheduler_factor"] = float(parts[1])
+            elif key == "stop_lr":
+                params["stop_lr"] = float(parts[1])
+            elif key == "max_grad_norm":
+                params["max_grad_norm"] = float(parts[1])
+            elif key == "huber_delta":
+                params["huber_delta"] = float(parts[1])
+            elif key == "stage2":
+                params["stage2"] = int(parts[1]) != 0
+            elif key == "start_stage2":
+                params["start_stage2"] = int(parts[1])
+            elif key == "stage2_lr":
+                params["stage2_lr"] = float(parts[1])
+            elif key == "stage2_lambda_e":
+                params["stage2_pref_e"] = float(parts[1])
+            elif key == "stage2_lambda_f":
+                params["stage2_pref_f"] = float(parts[1])
+            elif key == "stage2_lambda_v":
+                params["stage2_pref_v"] = float(parts[1])
+            elif key == "use_swa":
+                params["use_swa"] = int(parts[1]) != 0
 
-    # Defaults
+    # Defaults — model
     params.setdefault("version", 4)
     params.setdefault("cutoff_radial", 6.0)
     params.setdefault("cutoff_angular", 6.0)

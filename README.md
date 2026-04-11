@@ -4,9 +4,13 @@ PyTorch implementation of the NEP4 (Neuroevolution Potential) for molecular dyna
 
 ## Features
 
+- **Training**: Train NEP4 models from `nep.in` + `train.xyz` with MACE-inspired training strategy
 - **Prediction**: Load trained `nep.txt` models and compute energy, forces, virial, descriptors
-- **Training**: Train NEP4 models from `nep.in` + `train.xyz` with GPU acceleration
-- **CUDA kernels**: JIT-compiled custom CUDA kernels for descriptor forward+backward (363x speedup over pure PyTorch loops)
+- **Three compute modes**:
+  - Autograd forces (cross-platform, gold-standard reference)
+  - Analytical forces in pure PyTorch (cross-platform, fast)
+  - CUDA kernel accelerated (NVIDIA GPU only, fastest)
+- **MACE-style training**: ReduceLROnPlateau + Stage 2 energy-focused fine-tuning with SWA
 - **ZBL**: Universal ZBL potential with typewise cutoff support
 - **Multi-device**: Auto-detects CUDA > MPS (Apple Silicon) > CPU
 - **Precision**: Configurable float32 (training) / float64 (prediction)
@@ -28,19 +32,9 @@ pip install ninja
 
 ## Quick Start
 
-### Prediction from trained model
-
-```python
-from torchnep import NEPCalculator
-
-calc = NEPCalculator("nep.txt")
-result = calc.compute(species, positions, cell)
-# result["energy"]  — per-atom energy (N,)
-# result["forces"]  — forces (N, 3)
-# result["virial"]  — per-atom virial (N, 9)
-```
-
 ### Training
+
+All training parameters are configured in `nep.in`:
 
 ```python
 from torchnep import train_nep
@@ -49,23 +43,31 @@ train_nep(
     config_file="nep.in",
     data_file="train.xyz",
     output_dir="output",
-    # device auto-detected: CUDA → MPS → CPU
-    precision="float32",
-    num_epochs=200,
-    batch_size=64,
-    lr=1e-2,
+    device="cuda",
+    pytorch_only=False,  # CUDA kernel acceleration
 )
 ```
 
 Output files:
 
-- `nep.txt` — best model (GPUMD-compatible)
-- `nep_final.txt` — final epoch model
-- `loss.out` — training loss per epoch
-- `energy_predict.out` — predicted vs reference energies
-- `force_predict.out` — predicted vs reference forces
-- `virial_predict.out` — predicted vs reference virials
-- `checkpoint.pt` — training state for restart
+- `nep.txt` -- best model (GPUMD-compatible)
+- `nep_swa.txt` -- SWA averaged model (if Stage 2 enabled)
+- `nep_final.txt` -- final epoch model
+- `loss.out` -- training metrics per epoch
+- `energy_predict.out`, `force_predict.out`, `virial_predict.out` -- predictions
+- `checkpoint.pt` -- training state for restart
+
+### Prediction from trained model
+
+```python
+from torchnep import NEPCalculator
+
+calc = NEPCalculator("nep.txt")
+result = calc.compute(species, positions, cell)
+# result["energy"]  -- per-atom energy (N,)
+# result["forces"]  -- forces (N, 3)
+# result["virial"]  -- per-atom virial (N, 9)
+```
 
 ### Full-dataset prediction
 
@@ -73,10 +75,21 @@ Output files:
 from torchnep import predict_dataset
 
 predict_dataset("nep.txt", "test.xyz", output_dir="results")
-# Writes: energy_predict.out, force_predict.out, virial_predict.out
 ```
 
+## Compute Modes
+
+|   | Autograd | Analytical PyTorch | CUDA Kernel |
+| --- | --- | --- | --- |
+| **Settings** | `autograd=True, pytorch_only=True` | `autograd=False, pytorch_only=True` | `autograd=False, pytorch_only=False` |
+| **Force method** | `torch.autograd.grad` | Explicit chain rule (PyTorch ops) | Explicit chain rule (CUDA kernels) |
+| **CUDA code** | None | None | 4 `.cu` files (~1500 lines) |
+| **Cross-platform** | CPU / CUDA / MPS | CPU / CUDA / MPS | CUDA only (auto-fallback) |
+| **Speed** | Slowest | Fast | Fastest |
+
 ## Input Parameters (nep.in)
+
+### Model parameters (GPUMD-compatible)
 
 | Parameter                  | Default   | Description                              |
 | -------------------------- | --------- | ---------------------------------------- |
@@ -89,30 +102,97 @@ predict_dataset("nep.txt", "test.xyz", output_dir="results")
 | `basis_size`               | `12 12`  | Number of Chebyshev basis functions       |
 | `l_max`                    | `4 2 0`  | Max L for 3-body, 4-body, 5-body         |
 | `neuron`                   | 40        | Hidden layer size                        |
-| `lambda_e`                 | 1.0       | Energy loss weight                       |
-| `lambda_f`                 | 1.0       | Force loss weight                        |
-| `lambda_v`                 | 0.1       | Virial loss weight                       |
-| `lambda_1`                 | 0         | L1 regularization                        |
-| `lambda_2`                 | 0         | L2 regularization (weight decay)         |
-| `batch`                    | 1000      | Batch size                               |
+
+### Training parameters (torchnep extensions)
+
+| Parameter            | Default  | Description                                      |
+| -------------------- | -------- | ------------------------------------------------ |
+| `lambda_e`           | 1.0      | Energy loss weight (Stage 1)                     |
+| `lambda_f`           | 100.0    | Force loss weight (Stage 1)                      |
+| `lambda_v`           | 1.0      | Virial loss weight (Stage 1)                     |
+| `lambda_1`           | 0        | L1 regularization                                |
+| `lambda_2`           | 0        | L2 regularization (weight decay)                 |
+| `epoch`              | 200      | Number of training epochs                        |
+| `batch`              | 32       | Batch size                                       |
+| `lr`                 | 0.01     | Initial learning rate                            |
+| `stop_lr`            | 1e-6     | Minimum learning rate                            |
+| `scheduler_patience` | 50       | Epochs w/o improvement before LR reduction       |
+| `scheduler_factor`   | 0.8      | LR reduction factor on plateau                   |
+| `max_grad_norm`      | 10.0     | Gradient clipping threshold                      |
+| `huber_delta`        | 0        | Huber loss delta (0 = use MSE)                   |
+| `stage2`             | 0        | Enable Stage 2 fine-tuning (0/1)                 |
+| `start_stage2`       | 75%      | Epoch to begin Stage 2                           |
+| `stage2_lr`          | 1e-3     | Stage 2 learning rate                            |
+| `stage2_lambda_e`    | 1000.0   | Stage 2 energy weight                            |
+| `stage2_lambda_f`    | 100.0    | Stage 2 force weight                             |
+| `stage2_lambda_v`    | 10.0     | Stage 2 virial weight                            |
+| `use_swa`            | 1        | Stochastic Weight Averaging in Stage 2 (0/1)     |
+
+### Example nep.in
+
+```
+type 3 Cr Co Ni
+version    4
+zbl        2.5
+cutoff     6 4
+n_max      8 8
+basis_size 12 12
+l_max      4 2 1
+neuron     80
+
+lambda_e   1.0
+lambda_f   100.0
+lambda_v   1.0
+
+epoch      1000
+batch      32
+lr         0.01
+stop_lr    1e-6
+
+stage2           1
+start_stage2     750
+stage2_lambda_e  1000.0
+stage2_lambda_f  100.0
+stage2_lambda_v  10.0
+```
+
+## Training Strategy
+
+Training follows a MACE-inspired two-stage approach:
+
+**Stage 1** -- Fixed loss weights + ReduceLROnPlateau scheduler.
+- Forces dominate the loss (weight 100x energy) to learn atomic environments first.
+- LR auto-reduces when loss plateaus (patience=50, factor=0.8).
+
+**Stage 2** (optional) -- Energy-focused fine-tuning with SWA.
+- Energy weight increases 1000x to push energy error down.
+- Lower fixed LR (1e-3) for stable convergence.
+- Stochastic Weight Averaging smooths the final model.
+- Outputs both best-loss model (`nep.txt`) and SWA model (`nep_swa.txt`).
+
+All function parameters can also be passed directly to `train_nep()` to override `nep.in`:
+
+```python
+train_nep("nep.in", "train.xyz", lr=0.005, pref_f=50.0)  # override specific params
+```
 
 ## Project Structure
 
 ```text
 torchnep/
-  data.py        — XYZ parser, nep.in parser
-  ops.py         — core operations (neighbor list, basis functions, descriptors)
-  model.py       — NEPModel (trainable nn.Module)
-  train.py       — training pipeline with GPU data pre-loading
-  nep.py         — NEPCalculator (prediction from nep.txt)
-  predict.py     — full-dataset prediction with output files
-  cuda_ops.py    — torch.autograd.Function CUDA wrappers
-  constants.py   — physical constants, element data, C3B/C4B/C5B coefficients
-  csrc/          — CUDA kernels (JIT-compiled at runtime)
-    nep_cached.cu    — type-contraction kernels for training
-    nep_kernels.cu   — fused radial+angular descriptor forward+backward
-    nep_ops.cu       — force/virial accumulation kernel
-    nep_descriptor.cu — fused radial descriptor + force kernel
+  data.py        -- XYZ parser, nep.in parser
+  ops.py         -- core operations (basis functions, descriptors, analytical forces)
+  model.py       -- NEPModel (trainable nn.Module)
+  train.py       -- training pipeline with GPU data pre-loading
+  nep.py         -- NEPCalculator (prediction from nep.txt)
+  predict.py     -- full-dataset prediction with output files
+  cuda_ops.py    -- torch.autograd.Function CUDA wrappers
+  constants.py   -- physical constants, element data, C3B/C4B/C5B coefficients
+  csrc/          -- CUDA kernels (JIT-compiled at runtime)
+    nep_cached.cu    -- type-contraction kernels for training
+    nep_kernels.cu   -- fused radial+angular descriptor forward+backward
+    nep_ops.cu       -- force/virial accumulation kernel
+    nep_descriptor.cu -- fused radial descriptor + force kernel
 ```
 
 ## Performance
@@ -126,14 +206,6 @@ Training benchmark (1024 atoms, 66k radial pairs, 18k angular pairs):
 | **Speedup**                    | **363x**  |                  |
 
 Prediction accuracy: < 1e-14 vs NEP_CPU reference.
-
-## CUDA Kernel Architecture
-
-The training path uses custom CUDA kernels for the type-pair contraction operations:
-
-- **Scatter contraction** (radial): Forward computes `q[i,n] = sum_p sum_k c[t1,t2,n,k] * basis[p,k]` via atomicAdd, and pre-accumulates `dfeat_c[i,t2,k]` for backward. Backward uses per-atom outer products (N atoms instead of P pairs).
-- **Type contraction** (angular): Forward computes `gn[p,n] = sum_k c[t1,t2,n,k] * basis[p,k]`. Backward accumulates `grad_c` via per-pair atomicAdd.
-- Falls back to pure PyTorch on CPU/MPS automatically.
 
 ## Architecture
 
@@ -152,4 +224,4 @@ The training path uses custom CUDA kernels for the type-pair contraction operati
 ### Force computation
 
 - Analytical forces via precomputed Chebyshev derivatives + angular derivatives
-- No `create_graph=True` needed — stable for high-order descriptors
+- No `create_graph=True` needed -- stable for high-order descriptors

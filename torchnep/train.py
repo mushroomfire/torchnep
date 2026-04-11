@@ -419,31 +419,40 @@ def train_nep(
     output_dir: str = ".",
     device: str = None,
     precision: str = "float32",
-    num_epochs: int = 200,
-    batch_size: int = 32,
-    lr: float = 1e-3,
+    num_epochs: int = None,
+    batch_size: int = None,
+    lr: float = None,
     print_interval: int = 10,
     use_compile: bool = False,
     restart: bool = True,
     checkpoint_interval: int = 100,
     pytorch_only: bool = True,
     use_autograd_forces: bool = False,
-    max_grad_norm: float = 1.0,
-    # Dynamic loss weighting (MatPL-style, lr-dependent).
-    # pref = limit + (start - limit) * (cur_lr / init_lr)
-    # At start: high force weight → descriptors learn atomic environments fast.
-    # At end: balanced weights → energy/virial fine-tuning.
-    start_pref_e: float = 0.02,
-    limit_pref_e: float = 1.0,
-    start_pref_f: float = 1000.0,
-    limit_pref_f: float = 1.0,
-    start_pref_v: float = 50.0,
-    limit_pref_v: float = 0.1,
-    # LR schedule: per-epoch exponential decay.
-    stop_lr: float = 3.51e-8,
-    lr_decay_interval: int = 1,
+    max_grad_norm: float = None,
+    # Stage 1 loss weights — read from nep.in lambda_e/f/v by default.
+    pref_e: float = None,
+    pref_f: float = None,
+    pref_v: float = None,
+    # LR schedule: ReduceLROnPlateau (MACE default).
+    scheduler_patience: int = None,
+    scheduler_factor: float = None,
+    stop_lr: float = None,
+    # Huber loss: if > 0, use Huber loss instead of MSE.
+    huber_delta: float = None,
+    # Stage 2 (MACE-inspired): energy-focused fine-tuning with SWA.
+    stage2: bool = None,
+    start_stage2: int = None,
+    stage2_lr: float = None,
+    stage2_pref_e: float = None,
+    stage2_pref_f: float = None,
+    stage2_pref_v: float = None,
+    use_swa: bool = None,
 ):
     """Train a NEP model.
+
+    Training strategy follows MACE (Batatia et al.):
+    - Stage 1: Fixed loss weights + ReduceLROnPlateau (patience=50, factor=0.8).
+    - Stage 2 (optional): Energy-focused fine-tuning with SWA model averaging.
 
     Parameters
     ----------
@@ -451,46 +460,34 @@ def train_nep(
         Path to nep.in.
     data_file : str
         Path to train.xyz.
-    output_dir : str
-        Directory for output files.
-    device : str
-        'cuda', 'mps', or 'cpu'. Default: auto-detect (CUDA → MPS → CPU).
-    precision : str
-        'float32' or 'float64'.
-    num_epochs : int
-        Number of training epochs.
-    batch_size : int
-        Structures per batch.
     lr : float
-        Initial learning rate.  Default 1e-3 (MatPL default).
-    print_interval : int
-        Print every N epochs.
-    use_compile : bool
-        Use torch.compile (PyTorch 2.0+).
-    restart : bool
-        If True and checkpoint.pt exists in output_dir, resume from it.
-    checkpoint_interval : int
-        Save checkpoint every N epochs (also saves on best loss).
-    pytorch_only : bool
-        If True (default), force pure-PyTorch path everywhere — no handwritten
-        CUDA kernels.
-    use_autograd_forces : bool
-        If True, compute forces via torch.autograd.grad (create_graph=True)
-        instead of analytical force formulas.  Slower and uses more memory,
-        but is the gold-standard pure-autograd reference for verifying
-        gradient correctness.  Default False (use analytical forces).
+        Initial learning rate.  Default 0.01.
     max_grad_norm : float
-        Clip gradient norm to this value.  0 means no clipping.  Default 1.0.
-    start_pref_e / limit_pref_e : float
-        Energy loss weight at start / end of training.  Default 0.02 → 1.0.
-    start_pref_f / limit_pref_f : float
-        Force loss weight at start / end of training.  Default 1000 → 1.0.
-    start_pref_v / limit_pref_v : float
-        Virial loss weight at start / end of training.  Default 50 → 0.1.
+        Clip gradient norm.  Default 10.0.
+    pref_e : float
+        Energy loss weight.  Default 1.0.
+    pref_f : float
+        Force loss weight.  Default 100.0.
+    pref_v : float
+        Virial loss weight.  Default 1.0.
+    scheduler_patience : int
+        Epochs w/o improvement before LR reduction.  Default 50.
+    scheduler_factor : float
+        Factor to multiply LR by on plateau.  Default 0.8.
     stop_lr : float
-        Minimum learning rate.  Default 3.51e-8.
-    lr_decay_interval : int
-        Decay lr every N epochs.  Default 1 (every epoch).
+        Minimum learning rate.  Default 1e-6.
+    huber_delta : float
+        If > 0, use Huber loss instead of MSE.  Default 0 (MSE).
+    stage2 : bool
+        Enable Stage 2 energy-focused fine-tuning.  Default False.
+    start_stage2 : int
+        Epoch to begin Stage 2.  Default: 75% of num_epochs.
+    stage2_lr : float
+        Fixed LR during Stage 2.  Default 1e-3.
+    stage2_pref_e / stage2_pref_f / stage2_pref_v : float
+        Loss weights during Stage 2.  Default 1000 / 100 / 10.
+    use_swa : bool
+        Use Stochastic Weight Averaging during Stage 2.  Default True.
     """
     os.makedirs(output_dir, exist_ok=True)
     if device is None:
@@ -499,14 +496,40 @@ def train_nep(
     dtype = torch.float32 if precision == "float32" else torch.float64
 
 
-    # 1. Config
+    # 1. Config — nep.in provides defaults, function args override.
     print("Parsing nep.in...")
     config = parse_nep_in(config_file)
-    lambda_e = config.get("lambda_e", 1.0)
-    lambda_f = config.get("lambda_f", 1.0)
-    lambda_v = config.get("lambda_v", 0.1)
+
+    # Regularization (always from nep.in)
     lambda_1 = config.get("lambda_1", 0.0)
     lambda_2 = config.get("lambda_2", 0.0)
+
+    # Training params: function arg > nep.in > hardcoded default
+    def _cfg(arg_val, cfg_key, default):
+        if arg_val is not None:
+            return arg_val
+        return config.get(cfg_key, default)
+
+    num_epochs = _cfg(num_epochs, "num_epochs", 200)
+    batch_size = _cfg(batch_size, "batch_size", 32)
+    lr = _cfg(lr, "lr", 0.01)
+    max_grad_norm = _cfg(max_grad_norm, "max_grad_norm", 10.0)
+    # Stage 1 weights: lambda_e/f/v in nep.in → pref_e/f/v
+    pref_e = _cfg(pref_e, "lambda_e", 1.0)
+    pref_f = _cfg(pref_f, "lambda_f", 100.0)
+    pref_v = _cfg(pref_v, "lambda_v", 1.0)
+    scheduler_patience = _cfg(scheduler_patience, "scheduler_patience", 50)
+    scheduler_factor = _cfg(scheduler_factor, "scheduler_factor", 0.8)
+    stop_lr = _cfg(stop_lr, "stop_lr", 1e-6)
+    huber_delta = _cfg(huber_delta, "huber_delta", 0.0)
+    # Stage 2
+    stage2 = _cfg(stage2, "stage2", False)
+    start_stage2 = _cfg(start_stage2, "start_stage2", None)
+    stage2_lr = _cfg(stage2_lr, "stage2_lr", 1e-3)
+    stage2_pref_e = _cfg(stage2_pref_e, "stage2_pref_e", 1000.0)
+    stage2_pref_f = _cfg(stage2_pref_f, "stage2_pref_f", 100.0)
+    stage2_pref_v = _cfg(stage2_pref_v, "stage2_pref_v", 10.0)
+    use_swa = _cfg(use_swa, "use_swa", True)
 
     # 2. Load data
     print("Loading training data...")
@@ -561,53 +584,65 @@ def train_nep(
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # 9. Optimizer (Adam, MatPL-style)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=lambda_2)
+    # 9. Optimizer (Adam, MACE-style: amsgrad + small weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr,
+                                 weight_decay=lambda_2, amsgrad=True)
 
-    # LR schedule: exponential decay every lr_decay_interval epochs.
-    # Total decay steps = num_epochs / lr_decay_interval.
-    # decay_factor chosen so lr reaches stop_lr at num_epochs.
-    n_decays = max(num_epochs // max(lr_decay_interval, 1), 1)
-    if n_decays > 0 and stop_lr < lr:
-        decay_factor = np.exp(np.log(stop_lr / lr) / n_decays)
-    else:
-        decay_factor = 1.0
+    # Stage 2 setup
+    if stage2 and start_stage2 is None:
+        start_stage2 = max(1, int(num_epochs * 0.75))
 
-    def _set_epoch_lr(epoch):
-        """Set learning rate at epoch boundary (step decay)."""
-        n_steps = (epoch - 1) // max(lr_decay_interval, 1)
-        real_lr = lr * (decay_factor ** n_steps)
-        real_lr = max(real_lr, stop_lr)
-        for pg in optimizer.param_groups:
-            pg['lr'] = real_lr
-        return real_lr
+    # LR scheduler: ReduceLROnPlateau (MACE default)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=scheduler_factor,
+        patience=scheduler_patience, min_lr=stop_lr)
 
-    # 9b. Restart from checkpoint if available
+    # Huber loss helper
+    use_huber = huber_delta > 0
+    def _loss_fn(pred, ref):
+        """MSE or Huber loss depending on huber_delta setting."""
+        if use_huber:
+            return torch.nn.functional.huber_loss(pred, ref, reduction="mean",
+                                                  delta=huber_delta)
+        return torch.mean((pred - ref) ** 2)
+
+    # Stage 2 SWA setup (MACE-inspired)
+    swa_model = None
+    if stage2 and use_swa:
+        from torch.optim.swa_utils import AveragedModel, SWALR
+        m_ = model._orig_mod if hasattr(model, "_orig_mod") else model
+        swa_model = AveragedModel(m_)
+        swa_scheduler = SWALR(optimizer, swa_lr=stage2_lr,
+                              anneal_epochs=1, anneal_strategy="linear")
+
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
     if restart and os.path.exists(ckpt_path):
-        start_epoch, best_loss = _load_checkpoint(ckpt_path, model, optimizer, None, dev)
+        start_epoch, best_loss = _load_checkpoint(ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
         print(f"Resumed from checkpoint: epoch {start_epoch - 1}, best_loss={best_loss:.4e}")
 
     # 10. Training
     n_structs = data_store.n
-    has_forces = data_store.has_forces and lambda_f > 0
-    has_virial = data_store.has_virial and lambda_v > 0
+    has_forces = data_store.has_forces and pref_f > 0
+    has_virial = data_store.has_virial and pref_v > 0
 
     backend_str = ("pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated")
     force_str = ("autograd (create_graph)" if use_autograd_forces
                  else "analytical")
     clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
+    loss_type = f"Huber(delta={huber_delta})" if use_huber else "MSE"
     print(f"\nTraining: epochs {start_epoch}-{num_epochs}, batch={batch_size}, "
           f"device={device}, dtype={precision}")
-    print(f"Backend: {backend_str} | forces: {force_str} | {clip_str}")
-    print(f"LR: {lr} → {stop_lr} (decay every {lr_decay_interval} epochs, {n_decays} steps)")
-    print(f"Loss weights (start→end): "
-          f"E={start_pref_e}→{limit_pref_e}  "
-          f"F={start_pref_f}→{limit_pref_f}  "
-          f"V={start_pref_v}→{limit_pref_v}")
+    print(f"Backend: {backend_str} | forces: {force_str} | {clip_str} | loss: {loss_type}")
+    print(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
+          f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    print(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
+    if stage2:
+        print(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
+              f"lr={stage2_lr}, SWA={'ON' if use_swa else 'OFF'}")
+        print(f"Stage 2 weights: E={stage2_pref_e}  F={stage2_pref_f}  V={stage2_pref_v}")
     print("-" * 72)
 
     # Open log files: append if restarting, otherwise write fresh
@@ -633,15 +668,33 @@ def train_nep(
             sum_structs = 0
             n_batch = 0
 
-            # Set lr for this epoch (per-epoch exponential decay)
-            real_lr = _set_epoch_lr(epoch)
+            # Determine if we are in Stage 2
+            in_stage2 = stage2 and epoch >= start_stage2
 
-            # MatPL-style dynamic loss weighting:
-            # pref = limit + (start - limit) * (cur_lr / init_lr)
-            lr_ratio = real_lr / lr
-            pref_e = limit_pref_e + (start_pref_e - limit_pref_e) * lr_ratio
-            pref_f = limit_pref_f + (start_pref_f - limit_pref_f) * lr_ratio
-            pref_v = limit_pref_v + (start_pref_v - limit_pref_v) * lr_ratio
+            if in_stage2:
+                # Stage 2: energy-focused weights
+                cur_pref_e = stage2_pref_e
+                cur_pref_f = stage2_pref_f
+                cur_pref_v = stage2_pref_v
+                if use_swa and swa_model is not None:
+                    swa_scheduler.step()
+                else:
+                    for pg in optimizer.param_groups:
+                        pg['lr'] = stage2_lr
+
+                # Print stage transition once
+                if epoch == start_stage2:
+                    real_lr = optimizer.param_groups[0]['lr']
+                    print(f"\n{'='*72}")
+                    print(f"Stage 2 started at epoch {epoch}: "
+                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, V_w={cur_pref_v}, lr={real_lr:.2e}")
+                    print(f"{'='*72}")
+                    best_loss = float("inf")
+            else:
+                # Stage 1: fixed weights, ReduceLROnPlateau handles LR
+                cur_pref_e = pref_e
+                cur_pref_f = pref_f
+                cur_pref_v = pref_v
 
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size].tolist()
@@ -660,26 +713,27 @@ def train_nep(
                         batch, need_forces=has_forces, need_virial=has_virial,
                         pytorch_only=pytorch_only)
 
-                # Energy loss (MSE, per-atom)
+                # Energy loss (per-atom)
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
                 if e_mask.any():
-                    mse_e = torch.mean((e_pa_pred[e_mask] - e_pa_ref[e_mask]) ** 2)
-                    loss = loss + pref_e * mse_e
-                    sum_le += mse_e.item() * e_mask.sum().item()
+                    loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
+                    loss = loss + cur_pref_e * loss_e
+                    sum_le += loss_e.item() * e_mask.sum().item()
 
-                # Force loss (MSE)
+                # Force loss
                 if has_forces:
                     f_mask = batch["force_mask"]
                     if f_mask.any():
-                        f_diff = (result["forces"] - batch["forces"])[f_mask]
-                        mse_f = torch.mean(f_diff ** 2)
-                        loss = loss + pref_f * mse_f
-                        sum_lf += mse_f.item() * f_mask.sum().item()
+                        f_pred = result["forces"][f_mask]
+                        f_ref = batch["forces"][f_mask]
+                        loss_f = _loss_fn(f_pred, f_ref)
+                        loss = loss + cur_pref_f * loss_f
+                        sum_lf += loss_f.item() * f_mask.sum().item()
 
-                # Virial loss (MSE, per-atom)
+                # Virial loss (per-atom)
                 if has_virial and "virial" in result:
                     v_mask = batch["virial_mask"]
                     if v_mask.any():
@@ -691,9 +745,9 @@ def train_nep(
                         v_ref = batch["virial"]
                         if v_ref.shape[1] == 9:
                             na = batch["natoms"][v_mask].unsqueeze(-1)
-                            mse_v = torch.mean(((v_sys[v_mask] - v_ref[v_mask]) / na) ** 2)
-                            loss = loss + pref_v * mse_v
-                            sum_lv += mse_v.item() * v_mask.sum().item()
+                            loss_v = _loss_fn(v_sys[v_mask] / na, v_ref[v_mask] / na)
+                            loss = loss + cur_pref_v * loss_v
+                            sum_lv += loss_v.item() * v_mask.sum().item()
 
                 # L1
                 if lambda_1 > 0:
@@ -720,6 +774,11 @@ def train_nep(
 
                 optimizer.step()
 
+                # SWA: update averaged model parameters after each step
+                if in_stage2 and swa_model is not None:
+                    m_ = model._orig_mod if hasattr(model, "_orig_mod") else model
+                    swa_model.update_parameters(m_)
+
                 sum_loss += loss.item()
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
@@ -738,7 +797,8 @@ def train_nep(
             loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} {rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
             loss_log.flush()
 
-            epoch_line = (f"Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+            stage_str = "[S2] " if in_stage2 else ""
+            epoch_line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
                           f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A")
             v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
             cur_lr = optimizer.param_groups[0]['lr']
@@ -747,6 +807,10 @@ def train_nep(
                 print(epoch_line)
             grad_log.write(epoch_line + "\n")
             grad_log.flush()
+
+            # LR scheduler step (Stage 1 only — Stage 2 uses SWA/fixed LR)
+            if not in_stage2:
+                lr_scheduler.step(avg_loss)
 
             m = model._orig_mod if hasattr(model, "_orig_mod") else model
             if avg_loss < best_loss:
@@ -758,7 +822,7 @@ def train_nep(
 
             # Periodic checkpoint
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
-                _save_checkpoint(ckpt_path, model, optimizer, None,
+                _save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
                                  epoch, best_loss)
 
     finally:
@@ -770,6 +834,17 @@ def train_nep(
         m = m.module
     m.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                    max_NN_rad, max_NN_ang)
+
+    # Save SWA averaged model if available
+    if swa_model is not None:
+        # Copy SWA averaged weights into a fresh model for export
+        swa_state = swa_model.module.state_dict()
+        m.load_state_dict(swa_state)
+        m.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
+                       max_NN_rad, max_NN_ang)
+        torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
+        print(f"SWA model saved to nep_swa.txt")
+
     print(f"\nDone. Best loss: {best_loss:.6e}")
     print(f"Output: {output_dir}/")
 
