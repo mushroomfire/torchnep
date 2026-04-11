@@ -10,6 +10,7 @@ Falls back to pure PyTorch on CPU/Mac — no CUDA required.
 """
 
 import os
+import sys
 import torch
 from typing import List, Optional, Tuple
 
@@ -393,6 +394,37 @@ def precompute_basis(rij, dij, rc, basis_size, l_max_3b=0):
     return result
 
 
+def _scatter_contraction_pytorch(basis, pair_i, pair_j, atom_types, c, N):
+    """Pure PyTorch: type-contraction + scatter_add. Fully differentiable via autograd."""
+    ntypes = c.shape[0]
+    t1 = atom_types[pair_i]
+    t2 = atom_types[pair_j]
+    q = torch.zeros(N, c.shape[2], dtype=basis.dtype, device=basis.device)
+    for _t1 in range(ntypes):
+        for _t2 in range(ntypes):
+            _m = (t1 == _t1) & (t2 == _t2)
+            if not _m.any():
+                continue
+            _gn = basis[_m] @ c[_t1, _t2].T
+            q.scatter_add_(0, pair_i[_m].unsqueeze(-1).expand_as(_gn), _gn)
+    return q
+
+
+def _type_contraction_pytorch(basis, pair_i, pair_j, atom_types, c):
+    """Pure PyTorch: type-pair contraction (no scatter). Fully differentiable via autograd."""
+    ntypes = c.shape[0]
+    t1 = atom_types[pair_i]
+    t2 = atom_types[pair_j]
+    gn = torch.zeros(basis.shape[0], c.shape[2], dtype=basis.dtype, device=basis.device)
+    for _t1 in range(ntypes):
+        for _t2 in range(ntypes):
+            _m = (t1 == _t1) & (t2 == _t2)
+            if not _m.any():
+                continue
+            gn[_m] = basis[_m] @ c[_t1, _t2].T
+    return gn
+
+
 def compute_descriptors_cached(
     fk_rad, fk_ang, blm,
     pi_rad, pj_rad, pi_ang, pj_ang,
@@ -401,47 +433,44 @@ def compute_descriptors_cached(
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
     return_intermediates: bool = False,
+    pytorch_only: bool = False,
 ):
     """Compute descriptors using precomputed basis functions.
 
     Faster than compute_descriptors because Chebyshev/angular basis are cached.
     Differentiable through c2, c3 only (not rij).
 
+    When pytorch_only=True, uses pure PyTorch ops (no custom autograd.Function).
+    When pytorch_only=False, uses CUDA-accelerated type-pair contraction kernels
+    when available, falling back to vectorized PyTorch otherwise.
+
     If return_intermediates=True, returns (q, s, gn_ang) where:
       s      : (N, n_ap1, num_lm) sum_fxyz moments — needed for analytical forces
       gn_ang : (P_ang, n_ap1) pair-level angular radial factor
     """
-    # Radial descriptor: type-pair loop with matmul avoids atomic-scatter in backward
+    if pytorch_only:
+        _scatter_fn = _scatter_contraction_pytorch
+        _type_fn = _type_contraction_pytorch
+    else:
+        from .cuda_ops import scatter_contraction, type_contraction
+        _scatter_fn = scatter_contraction
+        _type_fn = type_contraction
+
     ntypes = c2.shape[0]
-    t1r = atom_types[pi_rad]
-    t2r = atom_types[pj_rad]
-    q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
-    for _t1 in range(ntypes):
-        for _t2 in range(ntypes):
-            _mask = (t1r == _t1) & (t2r == _t2)
-            if not _mask.any():
-                continue
-            # fk[mask] @ c2[t1,t2].T: backward is a clean matmul, no atomics
-            _gn = fk_rad[_mask] @ c2[_t1, _t2].T   # (P_ij, n_max_radial+1)
-            q_rad.scatter_add_(
-                0, pi_rad[_mask].unsqueeze(-1).expand_as(_gn), _gn)
+
+    # Radial descriptor: type-lookup + contraction + scatter
+    q_rad = _scatter_fn(fk_rad, pi_rad, pj_rad, atom_types, c2, N)
 
     parts = [q_rad]
     s_out = None
     gn_ang_out = None
 
     if l_max_3b > 0 and fk_ang.shape[0] > 0:
-        t1a = atom_types[pi_ang]
-        t2a = atom_types[pj_ang]
         n_ap1 = n_max_angular + 1
-        # Angular descriptor: same type-pair matmul trick
-        gn_ang = torch.zeros(fk_ang.shape[0], n_ap1, dtype=dtype, device=device)
-        for _t1 in range(ntypes):
-            for _t2 in range(ntypes):
-                _mask = (t1a == _t1) & (t2a == _t2)
-                if not _mask.any():
-                    continue
-                gn_ang[_mask] = fk_ang[_mask] @ c3[_t1, _t2].T   # (P_ij, n_ap1)
+
+        # Angular: type contraction (no scatter yet — need gn for blm product)
+        gn_ang = _type_fn(fk_ang, pi_ang, pj_ang, atom_types, c3)
+
         gn_blm = gn_ang.unsqueeze(-1) * blm.unsqueeze(1)
         s = torch.zeros(N, n_ap1, num_lm, dtype=dtype, device=device)
         s.scatter_add_(0, pi_ang.unsqueeze(-1).unsqueeze(-1).expand_as(gn_blm),
@@ -557,6 +586,7 @@ def compute_analytical_forces(
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
     compute_virial: bool = True,
+    pytorch_only: bool = False,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -568,7 +598,15 @@ def compute_analytical_forces(
     Geometry tensors (rij, fkp, d12inv, blm) are detached so PyTorch does not
     track gradients through them — they are not trainable parameters.  Only Fp
     (→ NN weights) and c2/c3 carry gradient information.
+
+    When pytorch_only=True, uses pure PyTorch ops (no custom autograd.Function).
     """
+    if pytorch_only:
+        _type_fn = _type_contraction_pytorch
+    else:
+        from .cuda_ops import type_contraction
+        _type_fn = type_contraction
+
     forces = torch.zeros(N, 3, dtype=dtype, device=device)
     virial = torch.zeros(N, 9, dtype=dtype, device=device) if compute_virial else None
     dim_r = n_max_radial + 1
@@ -588,9 +626,7 @@ def compute_analytical_forces(
 
     # ---- Radial force ----
     Fp_rad = Fp[:, :dim_r]
-    t1r, t2r = atom_types[pi_rad], atom_types[pj_rad]
-    c2_p = c2[t1r, t2r]
-    gnp_rad = (c2_p * fkp_rad.unsqueeze(1)).sum(-1)   # (P_rad, dim_r), differentiable via c2
+    gnp_rad = _type_fn(fkp_rad, pi_rad, pj_rad, atom_types, c2)
     tmp_rad = (Fp_rad[pi_rad] * gnp_rad).sum(-1, keepdim=True) * d12inv_rad.unsqueeze(-1)
     f12_rad = tmp_rad * rij_rad
 
@@ -605,9 +641,7 @@ def compute_analytical_forces(
         n_ap1 = n_max_angular + 1
 
         # gnp_ang: radial distance derivative term (differentiable via c3)
-        t1a, t2a = atom_types[pi_ang], atom_types[pj_ang]
-        c3_p = c3[t1a, t2a]
-        gnp_ang_v = (c3_p * fkp_ang.unsqueeze(1)).sum(-1)  # (P, n_ap1)
+        gnp_ang_v = _type_fn(fkp_ang, pi_ang, pj_ang, atom_types, c3)
 
         # weight = dEi/d(sum_fxyz): all body orders, differentiable via s→c3 and Fp→NN
         w_atom = _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b, l_max_4b, l_max_5b,
@@ -762,6 +796,17 @@ _cuda_ops = None
 _cuda_desc_ops = None
 
 
+def _get_platform_flags():
+    """Get platform-specific compiler flags for CUDA JIT compilation."""
+    import sys
+    extra_cflags = []
+    extra_cuda = ["-O3", "--use_fast_math"]
+    if sys.platform == "win32":
+        extra_cflags = ["/permissive-"]
+        extra_cuda.append("-Xcompiler=/permissive-")
+    return extra_cflags, extra_cuda
+
+
 def _load_cuda_ops():
     """JIT-compile CUDA kernels on first use."""
     global _cuda_ops
@@ -774,8 +819,10 @@ def _load_cuda_ops():
         csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_ops.cu")
         if not os.path.exists(csrc):
             return None
+        extra_cflags, extra_cuda = _get_platform_flags()
         _cuda_ops = load(name="nep_cuda_ops", sources=[csrc], verbose=False,
-                         extra_cuda_cflags=["-O3", "--use_fast_math"])
+                         extra_cflags=extra_cflags,
+                         extra_cuda_cflags=extra_cuda)
         return _cuda_ops
     except Exception:
         return None
@@ -793,8 +840,10 @@ def _load_cuda_desc_ops():
         csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_descriptor.cu")
         if not os.path.exists(csrc):
             return None
+        extra_cflags, extra_cuda = _get_platform_flags()
         _cuda_desc_ops = load(name="nep_cuda_desc", sources=[csrc], verbose=False,
-                              extra_cuda_cflags=["-O3", "--use_fast_math"])
+                              extra_cflags=extra_cflags,
+                              extra_cuda_cflags=extra_cuda)
         return _cuda_desc_ops
     except Exception:
         return None

@@ -18,7 +18,7 @@ def predict_dataset(
     xyz_file: str,
     output_dir: str = ".",
     dtype: str = "float64",
-    device: str = "cpu",
+    device: str = None,
 ):
     """Run prediction on full dataset and save results.
 
@@ -45,6 +45,13 @@ def predict_dataset(
     """
     import torch
 
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
     dt = torch.float64 if dtype == "float64" else torch.float32
     calc = NEPCalculator(model_file, dtype=dt, device=device)
     frames = read_xyz(xyz_file)
@@ -56,7 +63,7 @@ def predict_dataset(
     virial_file = open(os.path.join(output_dir, "virial_predict.out"), "w")
 
     # Write headers
-    energy_file.write("# energy_pred(eV)  energy_target(eV)\n")
+    energy_file.write("# energy_pred(eV/atom)  energy_target(eV/atom)\n")
     force_file.write("# fx_pred  fy_pred  fz_pred  fx_target  fy_target  fz_target\n")
     virial_file.write("# xx_pred yy_pred zz_pred xy_pred yz_pred zx_pred  xx_tgt yy_tgt zz_tgt xy_tgt yz_tgt zx_tgt\n")
 
@@ -66,17 +73,16 @@ def predict_dataset(
                 frame["species"], frame["positions"], frame["cell"]
             )
 
-            # --- Energy ---
-            e_pred = result["energy"].sum().item()
-            e_ref  = frame.get("energy", None)
-            if e_ref is not None:
-                energy_file.write(f"{e_pred:.10f}  {float(e_ref):.10f}\n")
-            else:
-                energy_file.write(f"{e_pred:.10f}\n")
+            # --- Energy (per-atom for easier comparison) ---
+            natoms = frame["natoms"]
+            e_pred = result["energy"].sum().item() / natoms
+            e_ref = frame.get("energy", None)
+            e_ref_str = f"{float(e_ref) / natoms:.10f}" if e_ref is not None else "nan"
+            energy_file.write(f"{e_pred:.10f}  {e_ref_str}\n")
 
             # --- Forces ---
             forces_pred = result["forces"].cpu().numpy()
-            forces_ref  = frame.get("forces", None)
+            forces_ref = frame.get("forces", None)
             for j, f in enumerate(forces_pred):
                 if forces_ref is not None:
                     r = forces_ref[j]
@@ -85,7 +91,10 @@ def predict_dataset(
                         f"{r[0]:.10f} {r[1]:.10f} {r[2]:.10f}\n"
                     )
                 else:
-                    force_file.write(f"{f[0]:.10f} {f[1]:.10f} {f[2]:.10f}\n")
+                    force_file.write(
+                        f"{f[0]:.10f} {f[1]:.10f} {f[2]:.10f}  "
+                        f"nan nan nan\n"
+                    )
 
             # --- Virial (6 unique: xx yy zz xy yz zx) ---
             v_pred = result["virial"].sum(dim=0).cpu().numpy()
@@ -95,17 +104,16 @@ def predict_dataset(
             v_ref = frame.get("virial", None)
             if v_ref is not None:
                 vr = np.asarray(v_ref).flatten()
-                # xyz file virial is typically stored as 9 components or 6
                 if vr.size == 9:
                     vr6 = [vr[0], vr[4], vr[8], vr[1], vr[5], vr[2]]
                 else:
                     vr6 = vr[:6].tolist()
-                virial_file.write(
-                    "  ".join(f"{x:.10f}" for x in vp) + "    " +
-                    "  ".join(f"{x:.10f}" for x in vr6) + "\n"
-                )
             else:
-                virial_file.write("  ".join(f"{x:.10f}" for x in vp) + "\n")
+                vr6 = [float("nan")] * 6
+            virial_file.write(
+                "  ".join(f"{x:.10f}" for x in vp) + "    " +
+                "  ".join(f"{x}" for x in vr6) + "\n"
+            )
 
             if (i + 1) % 100 == 0:
                 print(f"Predicted {i + 1}/{len(frames)} frames")

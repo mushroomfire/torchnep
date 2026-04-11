@@ -12,8 +12,10 @@ the q_scaler computation path (pytorch_only=False).
 """
 
 import os
+import sys
 import torch
 from typing import Optional
+
 
 _kernels = None
 
@@ -35,9 +37,15 @@ def _load_kernels():
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_kernels.cu")
         if not os.path.exists(src):
             return None
+        extra_cflags = []
+        extra_cuda = ["-O3", "--use_fast_math"]
+        if sys.platform == "win32":
+            extra_cflags = ["/permissive-"]
+            extra_cuda.append("-Xcompiler=/permissive-")
         _kernels = load(
             name="nep_kernels", sources=[src], verbose=False,
-            extra_cuda_cflags=["-O3", "--use_fast_math"])
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=extra_cuda)
         return _kernels
     except Exception as e:
         print(f"Warning: CUDA kernel compilation failed: {e}")
@@ -270,3 +278,177 @@ def angular_force_cuda(rij, pair_i, pair_j, atom_types, c3,
 def is_cuda_available():
     """Check if CUDA kernels are available."""
     return _load_kernels() is not None
+
+
+# ---------------------------------------------------------------------------
+# Cached type-pair contraction: CUDA-accelerated for training path
+# ---------------------------------------------------------------------------
+
+_cached_kernels = None
+
+
+def _load_cached_kernels():
+    """JIT-compile cached contraction CUDA kernels."""
+    global _cached_kernels
+    if _cached_kernels is not None:
+        return _cached_kernels
+    if os.environ.get("TORCHNEP_NO_CUDA_KERNELS", "0") == "1":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from torch.utils.cpp_extension import load
+        src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
+        if not os.path.exists(src):
+            return None
+        extra_cflags = []
+        extra_cuda = ["-O3"]
+        if sys.platform == "win32":
+            extra_cflags = ["/permissive-"]
+            extra_cuda.append("-Xcompiler=/permissive-")
+        _cached_kernels = load(
+            name="nep_cached", sources=[src], verbose=False,
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=extra_cuda)
+        return _cached_kernels
+    except Exception as e:
+        print(f"Warning: cached CUDA kernel compilation failed: {e}")
+        return None
+
+
+class ScatterContraction(torch.autograd.Function):
+    """Fused type-lookup + contraction + scatter for cached descriptor path.
+
+    Forward:  CUDA kernel computes q AND pre-accumulates dfeat_c for backward.
+    Backward: CUDA kernel uses dfeat_c (per-atom, not per-pair) for grad_c.
+
+    Only differentiable w.r.t. c (basis is precomputed/detached).
+    """
+
+    @staticmethod
+    def forward(ctx, basis, pair_i, pair_j, atom_types, c, N):
+        k = _load_cached_kernels()
+        ntypes = c.shape[0]
+        N_out = c.shape[2]
+        K = c.shape[3]
+
+        if k is not None and basis.is_cuda:
+            result = k.scatter_contraction_forward(
+                basis.contiguous(), pair_i, pair_j, atom_types,
+                c.contiguous(), N, N_out, ntypes)
+            q, dfeat_c = result[0], result[1]
+        else:
+            # Vectorized PyTorch fallback
+            t1 = atom_types[pair_i]
+            t2 = atom_types[pair_j]
+            c_p = c[t1, t2]  # (P, N_out, K)
+            gn = (c_p * basis.unsqueeze(1)).sum(-1)  # (P, N_out)
+            q = torch.zeros(N, N_out, dtype=basis.dtype, device=basis.device)
+            q.scatter_add_(0, pair_i.unsqueeze(-1).expand_as(gn), gn)
+            # Build dfeat_c for backward: dfeat_c[i, t2, k] = sum_{p: pair_i=i, type_j=t2} basis[p, k]
+            dfeat_c = torch.zeros(N, ntypes, K, dtype=basis.dtype, device=basis.device)
+            for p_idx in range(basis.shape[0]):
+                i = pair_i[p_idx].item()
+                tj = atom_types[pair_j[p_idx]].item()
+                dfeat_c[i, tj] += basis[p_idx]
+
+        ctx.save_for_backward(dfeat_c, atom_types)
+        ctx.N_out = N_out
+        ctx.K = K
+        ctx.ntypes = ntypes
+        return q
+
+    @staticmethod
+    def backward(ctx, grad_q):
+        dfeat_c, atom_types = ctx.saved_tensors
+        ntypes = ctx.ntypes
+        N_out = ctx.N_out
+        K = ctx.K
+
+        k = _load_cached_kernels()
+        if k is not None and grad_q.is_cuda:
+            grad_c = k.scatter_contraction_backward(
+                grad_q.contiguous(), dfeat_c.contiguous(),
+                atom_types, N_out, K, ntypes)
+        else:
+            # PyTorch fallback: per-atom outer product
+            N = grad_q.shape[0]
+            grad_c = torch.zeros(ntypes, ntypes, N_out, K,
+                                 dtype=grad_q.dtype, device=grad_q.device)
+            for i in range(N):
+                t1 = atom_types[i].item()
+                for t2 in range(ntypes):
+                    # grad_c[t1, t2, n, k] += grad_q[i, n] * dfeat_c[i, t2, k]
+                    grad_c[t1, t2] += grad_q[i].unsqueeze(-1) * dfeat_c[i, t2].unsqueeze(0)
+
+        return None, None, None, None, grad_c, None
+
+
+class TypeContraction(torch.autograd.Function):
+    """Type-lookup + contraction (no scatter) for cached angular path.
+
+    Forward:  CUDA kernel for gn[p,n] = Σ_k c[t1,t2,n,k] * basis[p,k].
+    Backward: CUDA kernel for grad_c[t1,t2,n,k] += grad_gn[p,n] * basis[p,k].
+
+    Only differentiable w.r.t. c.
+    """
+
+    @staticmethod
+    def forward(ctx, basis, pair_i, pair_j, atom_types, c):
+        k = _load_cached_kernels()
+        ntypes = c.shape[0]
+        N_out = c.shape[2]
+        K = c.shape[3]
+
+        if k is not None and basis.is_cuda:
+            gn = k.type_contraction_forward(
+                basis.contiguous(), pair_i, pair_j, atom_types,
+                c.contiguous(), N_out, ntypes)
+        else:
+            t1 = atom_types[pair_i]
+            t2 = atom_types[pair_j]
+            c_p = c[t1, t2]
+            gn = (c_p * basis.unsqueeze(1)).sum(-1)
+
+        ctx.save_for_backward(basis, pair_i, pair_j, atom_types)
+        ctx.c_shape = c.shape
+        ctx.ntypes = ntypes
+        ctx.N_out = N_out
+        ctx.K = K
+        return gn
+
+    @staticmethod
+    def backward(ctx, grad_gn):
+        basis, pair_i, pair_j, atom_types = ctx.saved_tensors
+        ntypes = ctx.ntypes
+        N_out = ctx.N_out
+        K = ctx.K
+
+        k = _load_cached_kernels()
+        if k is not None and grad_gn.is_cuda:
+            grad_c = k.type_contraction_backward(
+                grad_gn.contiguous(), basis.contiguous(),
+                pair_i, pair_j, atom_types,
+                N_out, K, ntypes)
+        else:
+            # PyTorch fallback: loop-based matmul
+            t1 = atom_types[pair_i]
+            t2 = atom_types[pair_j]
+            grad_c = torch.zeros(ctx.c_shape, dtype=basis.dtype, device=basis.device)
+            for _t1 in range(ntypes):
+                for _t2 in range(ntypes):
+                    _m = (t1 == _t1) & (t2 == _t2)
+                    if _m.any():
+                        grad_c[_t1, _t2] = grad_gn[_m].T @ basis[_m]
+
+        return None, None, None, None, grad_c
+
+
+def scatter_contraction(basis, pair_i, pair_j, atom_types, c, N):
+    """Fused type-contraction + scatter_add. Differentiable w.r.t. c."""
+    return ScatterContraction.apply(basis, pair_i, pair_j, atom_types, c, N)
+
+
+def type_contraction(basis, pair_i, pair_j, atom_types, c):
+    """Type-pair contraction without scatter. Differentiable w.r.t. c."""
+    return TypeContraction.apply(basis, pair_i, pair_j, atom_types, c)

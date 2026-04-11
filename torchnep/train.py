@@ -20,6 +20,15 @@ from .data import read_xyz, parse_nep_in
 from . import ops
 
 
+def _default_device() -> str:
+    """Select best available device: CUDA → MPS → CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 # ---------------------------------------------------------------------------
 # Neighbor list construction (numpy, CPU, runs once at startup)
 # ---------------------------------------------------------------------------
@@ -39,7 +48,7 @@ def build_neighbor_list_np(positions, cell, cutoff):
     shifts_cart = shifts_frac @ cell
     S = shifts_cart.shape[0]
 
-    # Memory check: vectorized if feasible
+    # Memory check: fully vectorized if feasible
     if N * N * S < 8_000_000:
         disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
                 - positions[:, None, None, :])
@@ -50,25 +59,28 @@ def build_neighbor_list_np(positions, cell, cutoff):
         idx_i, idx_j, idx_s = np.where(valid)
         return idx_i.astype(np.int64), idx_j.astype(np.int64), disp[idx_i, idx_j, idx_s]
     else:
-        # Loop-based for large systems
+        # Per-shift vectorization: O(S * N^2) but each shift is vectorized
+        zero_shift = np.all(shifts_frac == 0, axis=1)
         all_i, all_j, all_rij = [], [], []
+        idx_j_base = np.arange(N)
         for si in range(S):
-            sc = shifts_cart[si]
-            is_central = np.all(shifts_frac[si] == 0)
-            shifted = positions + sc
-            for i in range(N):
-                disp = shifted - positions[i]
-                dist = np.linalg.norm(disp, axis=1)
-                for j in range(N):
-                    if is_central and i == j:
-                        continue
-                    if 1e-10 < dist[j] < cutoff:
-                        all_i.append(i)
-                        all_j.append(j)
-                        all_rij.append(disp[j])
+            shifted = positions + shifts_cart[si]  # (N, 3)
+            # All pairwise displacements: disp[i, j] = shifted[j] - positions[i]
+            disp = shifted[None, :, :] - positions[:, None, :]  # (N, N, 3)
+            dist = np.linalg.norm(disp, axis=-1)  # (N, N)
+            valid = (dist < cutoff) & (dist > 1e-10)
+            if zero_shift[si]:
+                np.fill_diagonal(valid, False)
+            ii, jj = np.where(valid)
+            if len(ii) > 0:
+                all_i.append(ii)
+                all_j.append(jj)
+                all_rij.append(disp[ii, jj])
         if not all_i:
             return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 3), positions.dtype)
-        return np.array(all_i, np.int64), np.array(all_j, np.int64), np.array(all_rij)
+        return (np.concatenate(all_i).astype(np.int64),
+                np.concatenate(all_j).astype(np.int64),
+                np.concatenate(all_rij))
 
 
 # ---------------------------------------------------------------------------
@@ -109,8 +121,10 @@ class GPUDataStore:
         self.fkp_ang = []
         self.d12inv_ang = []
         self.blm = []
-        self.has_forces = "forces" in structures[0]
-        self.has_virial = "virial" in structures[0]
+        # Per-frame availability flags
+        self.has_energy_flag = []
+        self.has_forces_flag = []
+        self.has_virial_flag = []
 
         for s in structures:
             self.natoms.append(s["natoms"])
@@ -128,13 +142,31 @@ class GPUDataStore:
                 torch.tensor(s["pair_j_ang"], dtype=torch.long, device=device))
             ra = torch.tensor(s["rij_ang"], dtype=dtype, device=device)
             self.rij_ang.append(ra)
-            self.energy.append(s["energy"])
-            if self.has_forces:
+
+            if "energy" in s:
+                self.energy.append(s["energy"])
+                self.has_energy_flag.append(True)
+            else:
+                self.energy.append(0.0)
+                self.has_energy_flag.append(False)
+
+            if "forces" in s:
                 self.forces.append(
                     torch.tensor(s["forces"], dtype=dtype, device=device))
-            if self.has_virial:
+                self.has_forces_flag.append(True)
+            else:
+                self.forces.append(
+                    torch.zeros(s["natoms"], 3, dtype=dtype, device=device))
+                self.has_forces_flag.append(False)
+
+            if "virial" in s:
                 self.virial.append(
                     torch.tensor(s["virial"], dtype=dtype, device=device))
+                self.has_virial_flag.append(True)
+            else:
+                self.virial.append(
+                    torch.zeros(9, dtype=dtype, device=device))
+                self.has_virial_flag.append(False)
 
             # Precompute basis functions (fixed geometry)
             if config is not None:
@@ -165,6 +197,12 @@ class GPUDataStore:
                     self.d12inv_ang.append(torch.zeros(0, dtype=dtype, device=device))
                     num_lm = sum(2*ll+1 for ll in range(1, config["l_max"][0]+1))
                     self.blm.append(torch.zeros(0, num_lm, dtype=dtype, device=device))
+
+        self.n_energy = sum(self.has_energy_flag)
+        self.n_forces = sum(self.has_forces_flag)
+        self.n_virial = sum(self.has_virial_flag)
+        self.has_forces = self.n_forces > 0
+        self.has_virial = self.n_virial > 0
 
     def collate(self, indices: List[int]) -> Dict:
         """Fast GPU-side batch collation. No CPU→GPU transfer."""
@@ -208,10 +246,25 @@ class GPUDataStore:
             "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
             "energy": energy, "natoms": natoms,
         }
-        if self.has_forces:
-            batch["forces"] = torch.cat([self.forces[i] for i in indices])
-        if self.has_virial:
-            batch["virial"] = torch.stack([self.virial[i] for i in indices])
+
+        # Per-structure availability masks
+        energy_mask = torch.tensor([self.has_energy_flag[i] for i in indices],
+                                   dtype=torch.bool, device=self.device)
+        batch["energy_mask"] = energy_mask
+
+        batch["forces"] = torch.cat([self.forces[i] for i in indices])
+        # Per-atom force mask: expand structure-level flag to atoms
+        force_flags = [self.has_forces_flag[i] for i in indices]
+        batch["force_mask"] = torch.cat([
+            torch.full((self.natoms[indices[k]],), force_flags[k],
+                       dtype=torch.bool, device=self.device)
+            for k in range(B)
+        ])
+
+        batch["virial"] = torch.stack([self.virial[i] for i in indices])
+        batch["virial_mask"] = torch.tensor(
+            [self.has_virial_flag[i] for i in indices],
+            dtype=torch.bool, device=self.device)
 
         if self.has_cached_basis:
             batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
@@ -285,14 +338,17 @@ def compute_max_neighbors(structures):
 
 
 def compute_energy_shift(structures, num_types):
-    """Per-type energy shift via least squares."""
-    n = len(structures)
-    A = np.zeros((n, num_types))
-    b = np.zeros(n)
-    for i, s in enumerate(structures):
-        for t in s["atom_types"]:
-            A[i, t] += 1
-        b[i] = s["energy"]
+    """Per-type energy shift via least squares (only uses frames with energy)."""
+    rows_A = []
+    rows_b = []
+    for s in structures:
+        if "energy" not in s:
+            continue
+        counts = np.bincount(s["atom_types"], minlength=num_types).astype(np.float64)
+        rows_A.append(counts)
+        rows_b.append(s["energy"])
+    A = np.array(rows_A)
+    b = np.array(rows_b)
     shift, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
     return shift
 
@@ -333,24 +389,27 @@ def compute_q_scaler(model, data_store, batch_size=64, pytorch_only=True):
 # ---------------------------------------------------------------------------
 
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss):
-    """Save training checkpoint (model + optimizer + scheduler state)."""
+    """Save training checkpoint (model + optimizer state)."""
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
-    torch.save({
+    state = {
         "epoch": epoch,
         "best_loss": best_loss,
         "model_state": m.state_dict(),
         "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict(),
-    }, path)
+    }
+    if scheduler is not None:
+        state["scheduler_state"] = scheduler.state_dict()
+    torch.save(state, path)
 
 
 def _load_checkpoint(path, model, optimizer, scheduler, device):
     """Load checkpoint. Returns (start_epoch, best_loss)."""
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    scheduler.load_state_dict(ckpt["scheduler_state"])
+    if scheduler is not None and "scheduler_state" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state"])
     return ckpt["epoch"], ckpt["best_loss"]
 
 
@@ -358,17 +417,31 @@ def train_nep(
     config_file: str,
     data_file: str,
     output_dir: str = ".",
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    device: str = None,
     precision: str = "float32",
     num_epochs: int = 200,
     batch_size: int = 32,
-    lr: float = 1e-2,
+    lr: float = 1e-3,
     print_interval: int = 10,
     use_compile: bool = False,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    seed: int = None,
     pytorch_only: bool = True,
+    use_autograd_forces: bool = False,
+    max_grad_norm: float = 1.0,
+    # Dynamic loss weighting (MatPL-style, lr-dependent).
+    # pref = limit + (start - limit) * (cur_lr / init_lr)
+    # At start: high force weight → descriptors learn atomic environments fast.
+    # At end: balanced weights → energy/virial fine-tuning.
+    start_pref_e: float = 0.02,
+    limit_pref_e: float = 1.0,
+    start_pref_f: float = 1000.0,
+    limit_pref_f: float = 1.0,
+    start_pref_v: float = 50.0,
+    limit_pref_v: float = 0.1,
+    # LR schedule: per-epoch exponential decay.
+    stop_lr: float = 3.51e-8,
+    lr_decay_interval: int = 1,
 ):
     """Train a NEP model.
 
@@ -381,7 +454,7 @@ def train_nep(
     output_dir : str
         Directory for output files.
     device : str
-        'cpu' or 'cuda'.
+        'cuda', 'mps', or 'cpu'. Default: auto-detect (CUDA → MPS → CPU).
     precision : str
         'float32' or 'float64'.
     num_epochs : int
@@ -389,7 +462,7 @@ def train_nep(
     batch_size : int
         Structures per batch.
     lr : float
-        Initial learning rate.
+        Initial learning rate.  Default 1e-3 (MatPL default).
     print_interval : int
         Print every N epochs.
     use_compile : bool
@@ -398,33 +471,33 @@ def train_nep(
         If True and checkpoint.pt exists in output_dir, resume from it.
     checkpoint_interval : int
         Save checkpoint every N epochs (also saves on best loss).
-    seed : int, optional
-        Random seed for reproducibility (model init + batch shuffle).
     pytorch_only : bool
         If True (default), force pure-PyTorch path everywhere — no handwritten
-        CUDA kernels.  Set to False to allow CUDA-kernel acceleration when
-        running on GPU (radial/angular descriptor kernels in cuda_ops.py).
-        The training loop itself (compute_properties_cached + analytical forces)
-        is always pure PyTorch; this flag currently affects only q_scaler
-        descriptor computation.  When comparing pure-torch vs CUDA-kernel
-        correctness, run once with pytorch_only=True and once with False.
+        CUDA kernels.
+    use_autograd_forces : bool
+        If True, compute forces via torch.autograd.grad (create_graph=True)
+        instead of analytical force formulas.  Slower and uses more memory,
+        but is the gold-standard pure-autograd reference for verifying
+        gradient correctness.  Default False (use analytical forces).
+    max_grad_norm : float
+        Clip gradient norm to this value.  0 means no clipping.  Default 1.0.
+    start_pref_e / limit_pref_e : float
+        Energy loss weight at start / end of training.  Default 0.02 → 1.0.
+    start_pref_f / limit_pref_f : float
+        Force loss weight at start / end of training.  Default 1000 → 1.0.
+    start_pref_v / limit_pref_v : float
+        Virial loss weight at start / end of training.  Default 50 → 0.1.
+    stop_lr : float
+        Minimum learning rate.  Default 3.51e-8.
+    lr_decay_interval : int
+        Decay lr every N epochs.  Default 1 (every epoch).
     """
     os.makedirs(output_dir, exist_ok=True)
+    if device is None:
+        device = _default_device()
     dev = torch.device(device)
     dtype = torch.float32 if precision == "float32" else torch.float64
 
-    # Fix random seed for reproducibility (model init + epoch shuffle)
-    if seed is not None:
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        # Make cuDNN deterministic — avoids non-deterministic convolution algorithms.
-        # Does NOT fully eliminate scatter_add non-determinism; use
-        # torch.use_deterministic_algorithms(True) + CUBLAS_WORKSPACE_CONFIG=:4096:8
-        # if exact bit-for-bit reproducibility is required.
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
     # 1. Config
     print("Parsing nep.in...")
@@ -458,11 +531,24 @@ def train_nep(
     if dev.type == "cuda":
         mem = torch.cuda.memory_allocated() / 1e6
         print(f"  GPU memory used: {mem:.0f} MB ({time.time()-t0:.1f}s)")
+    elif dev.type == "mps":
+        print(f"  MPS data loaded ({time.time()-t0:.1f}s)")
+    print(f"  Data: {data_store.n} structures, "
+          f"{data_store.n_energy} with energy, "
+          f"{data_store.n_forces} with forces, "
+          f"{data_store.n_virial} with virial")
 
     # 6. Model
     model = NEPModel(config).to(dtype).to(dev)
+    # Initialize b1 to negative mean energy/atom so initial predictions
+    # are centered near reference values (prevents gradient explosion).
+    mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
+                        for i in range(data_store.n)
+                        if data_store.has_energy_flag[i]])
+    with torch.no_grad():
+        model.b1.fill_(-mean_epa)
     print(f"Model: {sum(p.numel() for p in model.parameters())} params, "
-          f"dim={model.dim}")
+          f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # 7. q_scaler
     print("Computing q_scaler...")
@@ -475,18 +561,34 @@ def train_nep(
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # 9. Optimizer
+    # 9. Optimizer (Adam, MatPL-style)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=lambda_2)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=lr * 0.01)
+
+    # LR schedule: exponential decay every lr_decay_interval epochs.
+    # Total decay steps = num_epochs / lr_decay_interval.
+    # decay_factor chosen so lr reaches stop_lr at num_epochs.
+    n_decays = max(num_epochs // max(lr_decay_interval, 1), 1)
+    if n_decays > 0 and stop_lr < lr:
+        decay_factor = np.exp(np.log(stop_lr / lr) / n_decays)
+    else:
+        decay_factor = 1.0
+
+    def _set_epoch_lr(epoch):
+        """Set learning rate at epoch boundary (step decay)."""
+        n_steps = (epoch - 1) // max(lr_decay_interval, 1)
+        real_lr = lr * (decay_factor ** n_steps)
+        real_lr = max(real_lr, stop_lr)
+        for pg in optimizer.param_groups:
+            pg['lr'] = real_lr
+        return real_lr
 
     # 9b. Restart from checkpoint if available
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
     if restart and os.path.exists(ckpt_path):
-        start_epoch, best_loss = _load_checkpoint(ckpt_path, model, optimizer, scheduler, dev)
-        start_epoch += 1  # resume from next epoch
+        start_epoch, best_loss = _load_checkpoint(ckpt_path, model, optimizer, None, dev)
+        start_epoch += 1
         print(f"Resumed from checkpoint: epoch {start_epoch - 1}, best_loss={best_loss:.4e}")
 
     # 10. Training
@@ -495,17 +597,23 @@ def train_nep(
     has_virial = data_store.has_virial and lambda_v > 0
 
     backend_str = ("pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated")
-    seed_str = f"seed={seed}" if seed is not None else "no seed (non-reproducible)"
+    force_str = ("autograd (create_graph)" if use_autograd_forces
+                 else "analytical")
+    clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
     print(f"\nTraining: epochs {start_epoch}-{num_epochs}, batch={batch_size}, "
           f"device={device}, dtype={precision}")
-    print(f"Backend: {backend_str} | {seed_str}")
-    print(f"Loss: E={lambda_e} F={lambda_f} V={lambda_v} "
-          f"L1={lambda_1} L2={lambda_2}")
+    print(f"Backend: {backend_str} | forces: {force_str} | {clip_str}")
+    print(f"LR: {lr} → {stop_lr} (decay every {lr_decay_interval} epochs, {n_decays} steps)")
+    print(f"Loss weights (start→end): "
+          f"E={start_pref_e}→{limit_pref_e}  "
+          f"F={start_pref_f}→{limit_pref_f}  "
+          f"V={start_pref_v}→{limit_pref_v}")
     print("-" * 72)
 
-    # Open loss.out: append if restarting, otherwise write fresh
+    # Open log files: append if restarting, otherwise write fresh
     loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
     loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
+    grad_log = open(os.path.join(output_dir, "grad_spike.log"), loss_log_mode)
     if loss_log_mode == "w":
         loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  rmse_v(meV/atom)\n")
 
@@ -513,62 +621,79 @@ def train_nep(
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
             model.train()
-            # Per-epoch seeded generator ensures identical batch order across runs
-            # when a seed is provided (independent of CUDA RNG state).
-            if seed is not None:
-                _gen = torch.Generator().manual_seed(seed + epoch)
-                perm = torch.randperm(n_structs, generator=_gen)
-            else:
-                perm = torch.randperm(n_structs)
+            perm = torch.randperm(n_structs)
             sum_loss = 0.0
             sum_le = 0.0
             sum_lf = 0.0
+            max_gn = 0.0
             sum_lv = 0.0
-            sum_atoms = 0
+            sum_e_structs = 0
+            sum_f_atoms = 0
+            sum_v_structs = 0
             sum_structs = 0
             n_batch = 0
+
+            # Set lr for this epoch (per-epoch exponential decay)
+            real_lr = _set_epoch_lr(epoch)
+
+            # MatPL-style dynamic loss weighting:
+            # pref = limit + (start - limit) * (cur_lr / init_lr)
+            lr_ratio = real_lr / lr
+            pref_e = limit_pref_e + (start_pref_e - limit_pref_e) * lr_ratio
+            pref_f = limit_pref_f + (start_pref_f - limit_pref_f) * lr_ratio
+            pref_v = limit_pref_v + (start_pref_v - limit_pref_v) * lr_ratio
 
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size].tolist()
                 batch = data_store.collate(idx)
 
-                # Always use analytical-force cached path:
-                # - Avoids create_graph=True (no second-order gradients)
-                # - Second-order gradients from create_graph=True are numerically
-                #   unstable for high-order descriptors (l_max=4 quartic 5-body,
-                #   n_max=8), causing gradient explosions around epoch ~600.
-                # - Analytical path is fully differentiable through c2/c3 and NN
-                #   weights via explicit chain rule — same gradient quality, stable.
-                result = model.compute_properties_cached(
-                    batch, need_forces=has_forces, need_virial=has_virial)
+                if use_autograd_forces:
+                    result = model.compute_properties(
+                        batch["rij_rad"], batch["rij_ang"],
+                        batch["pair_i_rad"], batch["pair_j_rad"],
+                        batch["pair_i_ang"], batch["pair_j_ang"],
+                        batch["atom_types"], batch["N"],
+                        batch["struct_idx"], batch["num_structures"],
+                        need_forces=has_forces, need_virial=has_virial)
+                else:
+                    result = model.compute_properties_cached(
+                        batch, need_forces=has_forces, need_virial=has_virial,
+                        pytorch_only=pytorch_only)
 
-                # Energy loss (per-atom MSE)
+                # Energy loss (MSE, per-atom)
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                loss_e = torch.mean((e_pa_pred - e_pa_ref) ** 2)
-                loss = lambda_e * loss_e
-                sum_le += loss_e.item() * batch["num_structures"]
+                e_mask = batch["energy_mask"]
+                loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                if e_mask.any():
+                    mse_e = torch.mean((e_pa_pred[e_mask] - e_pa_ref[e_mask]) ** 2)
+                    loss = loss + pref_e * mse_e
+                    sum_le += mse_e.item() * e_mask.sum().item()
 
-                # Force loss
+                # Force loss (MSE)
                 if has_forces:
-                    loss_f = torch.mean(
-                        (result["forces"] - batch["forces"]) ** 2)
-                    loss = loss + lambda_f * loss_f
-                    sum_lf += loss_f.item() * batch["N"]
+                    f_mask = batch["force_mask"]
+                    if f_mask.any():
+                        f_diff = (result["forces"] - batch["forces"])[f_mask]
+                        mse_f = torch.mean(f_diff ** 2)
+                        loss = loss + pref_f * mse_f
+                        sum_lf += mse_f.item() * f_mask.sum().item()
 
-                # Virial loss
+                # Virial loss (MSE, per-atom)
                 if has_virial and "virial" in result:
-                    v_atom = result["virial"]
-                    v_sys = torch.zeros(batch["num_structures"], 9,
-                                        dtype=dtype, device=dev)
-                    si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                    v_sys.scatter_add_(0, si, v_atom)
-                    v_ref = batch["virial"]
-                    if v_ref.shape[1] == 9:
-                        na = batch["natoms"].unsqueeze(-1)
-                        loss_v = torch.mean(((v_sys - v_ref) / na) ** 2)
-                        loss = loss + lambda_v * loss_v
-                        sum_lv += loss_v.item() * batch["num_structures"]
+                    v_mask = batch["virial_mask"]
+                    if v_mask.any():
+                        v_atom = result["virial"]
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
+                        v_sys.scatter_add_(0, si, v_atom)
+                        v_ref = batch["virial"]
+                        if v_ref.shape[1] == 9:
+                            na = batch["natoms"][v_mask].unsqueeze(-1)
+                            mse_v = torch.mean(((v_sys[v_mask] - v_ref[v_mask]) / na) ** 2)
+                            loss = loss + pref_v * mse_v
+                            sum_lv += mse_v.item() * v_mask.sum().item()
 
                 # L1
                 if lambda_1 > 0:
@@ -577,34 +702,51 @@ def train_nep(
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                # Skip step on NaN/inf gradients to prevent parameter corruption
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                if not torch.isfinite(grad_norm):
+
+                # Gradient clipping (MatPL-style: clip norm, then step)
+                m_ = model._orig_mod if hasattr(model, "_orig_mod") else model
+                if max_grad_norm > 0:
+                    gn = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm).item()
+                else:
+                    gn = torch.sqrt(sum(
+                        p.grad.norm()**2 for p in m_.parameters()
+                        if p.grad is not None)).item()
+
+                # Skip only non-finite gradients
+                if not np.isfinite(gn):
                     optimizer.zero_grad(set_to_none=True)
                     continue
+
                 optimizer.step()
 
                 sum_loss += loss.item()
-                sum_atoms += batch["N"]
+                sum_e_structs += batch["energy_mask"].sum().item()
+                sum_f_atoms += batch["force_mask"].sum().item()
+                sum_v_structs += batch["virial_mask"].sum().item()
                 sum_structs += batch["num_structures"]
                 n_batch += 1
+                max_gn = max(max_gn, gn)
 
-            scheduler.step()
             dt = time.time() - t_epoch
 
-            avg_loss = sum_loss / n_batch
-            rmse_e = np.sqrt(sum_le / sum_structs) * 1000  # meV/atom
-            rmse_f = np.sqrt(sum_lf / sum_atoms) if sum_lf > 0 else 0.0  # eV/Å
-            rmse_v = np.sqrt(sum_lv / sum_structs) * 1000 if sum_lv > 0 else 0.0  # meV/atom
+            avg_loss = sum_loss / max(n_batch, 1)
+            rmse_e = np.sqrt(sum_le / max(sum_e_structs, 1)) * 1000  # meV/atom
+            rmse_f = np.sqrt(sum_lf / max(sum_f_atoms, 1)) if sum_lf > 0 else 0.0  # eV/Å
+            rmse_v = np.sqrt(sum_lv / max(sum_v_structs, 1)) * 1000 if sum_lv > 0 else 0.0  # meV/atom
 
-            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} {rmse_f:.4f} {rmse_v:.4f}\n")
+            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} {rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
             loss_log.flush()
 
+            epoch_line = (f"Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+                          f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A")
+            v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
+            cur_lr = optimizer.param_groups[0]['lr']
+            epoch_line += f"{v_str} | gnorm {max_gn:.1f} | lr {cur_lr:.2e} | {dt:.1f}s"
             if epoch % print_interval == 0 or epoch == 1:
-                v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
-                print(f"Epoch {epoch:4d} | loss {avg_loss:.4e} | "
-                      f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A"
-                      f"{v_str} | {dt:.1f}s")
+                print(epoch_line)
+            grad_log.write(epoch_line + "\n")
+            grad_log.flush()
 
             m = model._orig_mod if hasattr(model, "_orig_mod") else model
             if avg_loss < best_loss:
@@ -614,13 +756,14 @@ def train_nep(
                 torch.save(m.state_dict(),
                            os.path.join(output_dir, "best_model.pt"))
 
-            # Periodic checkpoint (model + optimizer + scheduler)
+            # Periodic checkpoint
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
-                _save_checkpoint(ckpt_path, model, optimizer, scheduler,
+                _save_checkpoint(ckpt_path, model, optimizer, None,
                                  epoch, best_loss)
 
     finally:
         loss_log.close()
+        grad_log.close()
 
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     if hasattr(m, "module"):
@@ -629,6 +772,14 @@ def train_nep(
                    max_NN_rad, max_NN_ang)
     print(f"\nDone. Best loss: {best_loss:.6e}")
     print(f"Output: {output_dir}/")
+
+    # Post-training prediction on training set
+    nep_file = os.path.join(output_dir, "nep.txt")
+    if os.path.exists(nep_file):
+        print("\nRunning prediction on training set...")
+        from .predict import predict_dataset
+        predict_dataset(nep_file, data_file, output_dir=output_dir,
+                        dtype="float64", device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -680,9 +831,15 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
     model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     raw_model = model.module
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=lambda_2)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=lr * 0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr,
+                                 weight_decay=lambda_2, eps=1e-4)
+    def _lr_lambda(epoch):
+        warmup = 10
+        if epoch < warmup:
+            return 0.1 + 0.9 * epoch / max(warmup, 1)
+        progress = (epoch - warmup) / max(num_epochs - warmup, 1)
+        return 0.01 + 0.99 * 0.5 * (1.0 + np.cos(np.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     n_structs = data_store.n
     has_forces = data_store.has_forces and lambda_f > 0
@@ -717,7 +874,8 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
 
             if data_store.has_cached_basis:
                 result = raw_model.compute_properties_cached(
-                    batch, need_forces=has_forces, need_virial=has_virial)
+                    batch, need_forces=has_forces, need_virial=has_virial,
+                    pytorch_only=True)
             else:
                 result = raw_model.compute_properties(
                     batch["rij_rad"], batch["rij_ang"],
@@ -728,28 +886,36 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
                     need_forces=has_forces, need_virial=has_virial)
 
             e_pa = result["Etot"] / batch["natoms"]
-            loss_e = torch.mean((e_pa - batch["energy"]/batch["natoms"])**2)
-            loss = lambda_e * loss_e
-            sum_le += loss_e.item() * batch["num_structures"]
+            e_ref = batch["energy"] / batch["natoms"]
+            e_mask = batch["energy_mask"]
+            loss = torch.tensor(0.0, dtype=dtype, device=dev)
+            if e_mask.any():
+                loss_e = torch.mean((e_pa[e_mask] - e_ref[e_mask])**2)
+                loss = loss + lambda_e * loss_e
+                sum_le += loss_e.item() * e_mask.sum().item()
 
             if has_forces:
-                loss_f = torch.mean((result["forces"] - batch["forces"])**2)
-                loss = loss + lambda_f * loss_f
-                sum_lf += loss_f.item() * batch["N"]
+                f_mask = batch["force_mask"]
+                if f_mask.any():
+                    f_diff = (result["forces"] - batch["forces"])[f_mask]
+                    loss_f = torch.mean(f_diff ** 2)
+                    loss = loss + lambda_f * loss_f
+                    sum_lf += loss_f.item() * f_mask.sum().item()
 
             if has_virial and "virial" in result:
-                va = result["virial"]
-                vs = torch.zeros(batch["num_structures"], 9, dtype=dtype, device=dev)
-                si = batch["struct_idx"].unsqueeze(-1).expand_as(va)
-                vs.scatter_add_(0, si, va)
-                vr = batch["virial"]
-                if vr.shape[1] == 9:
-                    na = batch["natoms"].unsqueeze(-1)
-                    loss = loss + lambda_v * torch.mean(((vs-vr)/na)**2)
+                v_mask = batch["virial_mask"]
+                if v_mask.any():
+                    va = result["virial"]
+                    vs = torch.zeros(batch["num_structures"], 9, dtype=dtype, device=dev)
+                    si = batch["struct_idx"].unsqueeze(-1).expand_as(va)
+                    vs.scatter_add_(0, si, va)
+                    vr = batch["virial"]
+                    if vr.shape[1] == 9:
+                        na = batch["natoms"][v_mask].unsqueeze(-1)
+                        loss = loss + lambda_v * torch.mean(((vs[v_mask]-vr[v_mask])/na)**2)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             sum_loss += loss.item()

@@ -46,7 +46,7 @@ class NEPModel(nn.Module):
         Per-type energy shift from training data.
     """
 
-    def __init__(self, config: dict, energy_shift: np.ndarray = None):
+    def __init__(self, config: dict):
         super().__init__()
         self.num_types = config["num_types"]
         self.type_names = config["type_names"]
@@ -150,7 +150,7 @@ class NEPModel(nn.Module):
             mask = atom_types == t
             if mask.any():
                 Ei[mask] = self.fitting_nets[t](q_scaled[mask])
-        return Ei - self.b1  # subtract shared output bias
+        return Ei - self.b1
 
     def compute_properties(self, rij_rad, rij_ang, pi_rad, pj_rad,
                            pi_ang, pj_ang, atom_types, N,
@@ -217,11 +217,15 @@ class NEPModel(nn.Module):
 
         return result
 
-    def compute_properties_cached(self, batch, need_forces=True, need_virial=False):
+    def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
+                                   pytorch_only: bool = True):
         """Compute energy, forces, virial using precomputed basis.
 
         Uses fully analytical force computation — no create_graph=True needed.
         Forces are differentiable through c2, c3 (via Fp→NN weights and via s→c3).
+
+        When pytorch_only=True (default), all computations use pure PyTorch ops.
+        No custom CUDA autograd.Functions are used, ensuring correct gradients.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -240,6 +244,7 @@ class NEPModel(nn.Module):
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
                 return_intermediates=True,
+                pytorch_only=pytorch_only,
             )
         else:
             q = ops.compute_descriptors_cached(
@@ -251,6 +256,7 @@ class NEPModel(nn.Module):
                 self.l_max_3b, self.l_max_4b, self.l_max_5b,
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
+                pytorch_only=pytorch_only,
             )
             s = gn_ang = None
 
@@ -326,6 +332,7 @@ class NEPModel(nn.Module):
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
                 compute_virial=need_virial,
+                pytorch_only=pytorch_only,
             )
             if zbl_forces is not None:
                 forces = forces + zbl_forces

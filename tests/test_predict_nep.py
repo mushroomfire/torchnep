@@ -30,7 +30,7 @@ def test_nep(nepname=None, xyzname=None):
     frames = read_xyz(xyzname)
     frame = frames[0]
 
-    calc = NEPCalculator(nepname)
+    calc = NEPCalculator(nepname, device='cuda')
     result = calc.compute(
         frame['species'], frame['positions'], frame['cell'],
         compute_descriptor=True,
@@ -65,4 +65,4 @@ def test_nep(nepname=None, xyzname=None):
 
 
 if __name__ == '__main__':
-    test_nep('/m/home/home2/22/wuy33/unix/Study/torchnep/example/output/nep.txt')
+    test_nep()

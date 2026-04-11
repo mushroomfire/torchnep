@@ -168,10 +168,6 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_2"] = float(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
-            elif key == "population":
-                params["population"] = int(parts[1])
-            elif key == "generation":
-                params["generation"] = int(parts[1])
             elif key == "save_potential":
                 params["save_interval"] = int(parts[1])
                 if len(parts) > 2:
@@ -194,6 +190,5 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_v", 0.0)
     params.setdefault("lambda_1", 0.0)
     params.setdefault("batch_size", 1000)
-    params.setdefault("generation", 100000)
 
     return params

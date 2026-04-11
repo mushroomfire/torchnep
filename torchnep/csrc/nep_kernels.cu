@@ -6,7 +6,7 @@
  *   Backward: grad_q → grad_c_params + grad_rij (for force via autograd)
  *   Second backward: grad_force → grad_grad_q + grad_c_params (for force training)
  *
- * Architecture follows MatPL's two-level autograd.Function pattern:
+ * Two-level autograd.Function pattern:
  *   Level 1: NEPDescriptor (forward → backward)
  *   Level 2: NEPDescriptorGrad (backward → second-order backward)
  */
@@ -374,20 +374,21 @@ __device__ void dev_accumulate_f12_one(
     scalar_t d12inv, scalar_t fn, scalar_t fnp,
     const scalar_t* s, const scalar_t* r12unit, scalar_t* f12
 ) {
+    scalar_t one = static_cast<scalar_t>(1.0);
     scalar_t dx[3] = {
-        (1.0 - r12unit[0]*r12unit[0])*d12inv,
+        (one - r12unit[0]*r12unit[0])*d12inv,
         -r12unit[0]*r12unit[1]*d12inv,
         -r12unit[0]*r12unit[2]*d12inv
     };
     scalar_t dy[3] = {
         -r12unit[0]*r12unit[1]*d12inv,
-        (1.0 - r12unit[1]*r12unit[1])*d12inv,
+        (one - r12unit[1]*r12unit[1])*d12inv,
         -r12unit[1]*r12unit[2]*d12inv
     };
     scalar_t dz[3] = {
         -r12unit[0]*r12unit[2]*d12inv,
         -r12unit[1]*r12unit[2]*d12inv,
-        (1.0 - r12unit[2]*r12unit[2])*d12inv
+        (one - r12unit[2]*r12unit[2])*d12inv
     };
 
     scalar_t z_pow[L+1]; z_pow[0] = 1.0;

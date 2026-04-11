@@ -13,4 +13,5 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cuda = ["ninja"]
 dev = ["pytest"]
