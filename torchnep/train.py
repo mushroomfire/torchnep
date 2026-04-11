@@ -495,9 +495,23 @@ def train_nep(
     dev = torch.device(device)
     dtype = torch.float32 if precision == "float32" else torch.float64
 
+    # Setup logging — _log prints to screen AND output.log
+    _log_mode = "a" if restart else "w"
+    _out_log_file = open(os.path.join(output_dir, "output.log"), _log_mode)
+
+    def _log(msg=""):
+        print(msg)
+        _out_log_file.write(msg + "\n")
+        _out_log_file.flush()
+
+    from datetime import datetime
+    from . import __version__
+    total_t0 = time.time()
+    _log(f"torchnep v{__version__} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    _log(f"Device: {device} | PyTorch {torch.__version__} | precision: {precision}")
 
     # 1. Config — nep.in provides defaults, function args override.
-    print("Parsing nep.in...")
+    _log("Parsing nep.in...")
     config = parse_nep_in(config_file)
 
     # Regularization (always from nep.in)
@@ -532,34 +546,36 @@ def train_nep(
     use_swa = _cfg(use_swa, "use_swa", True)
 
     # 2. Load data
-    print("Loading training data...")
+    _log("Loading training data...")
     frames = read_xyz(data_file)
-    print(f"  {len(frames)} structures")
+    _log(f"  {len(frames)} structures")
 
     # 3. Preprocess (CPU)
-    print("Building neighbor lists...")
+    _log("Building neighbor lists...")
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
     structures = preprocess_structures(frames, config, np_dtype)
-    print(f"  Done in {time.time() - t0:.1f}s")
+    preprocess_time = time.time() - t0
+    _log(f"  Done in {preprocess_time:.1f}s")
 
     # 4. Max neighbors (for nep.txt cutoff line)
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
 
     # 5. Pre-load to GPU (with precomputed basis for analytical forces)
-    print(f"Pre-loading data to {device} (with cached basis)...")
+    _log(f"Pre-loading data to {device} (with cached basis)...")
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures  # free CPU memory
+    data_load_time = time.time() - t0
     if dev.type == "cuda":
         mem = torch.cuda.memory_allocated() / 1e6
-        print(f"  GPU memory used: {mem:.0f} MB ({time.time()-t0:.1f}s)")
+        _log(f"  GPU memory used: {mem:.0f} MB ({data_load_time:.1f}s)")
     elif dev.type == "mps":
-        print(f"  MPS data loaded ({time.time()-t0:.1f}s)")
-    print(f"  Data: {data_store.n} structures, "
-          f"{data_store.n_energy} with energy, "
-          f"{data_store.n_forces} with forces, "
-          f"{data_store.n_virial} with virial")
+        _log(f"  MPS data loaded ({data_load_time:.1f}s)")
+    _log(f"  Data: {data_store.n} structures, "
+         f"{data_store.n_energy} with energy, "
+         f"{data_store.n_forces} with forces, "
+         f"{data_store.n_virial} with virial")
 
     # 6. Model
     model = NEPModel(config).to(dtype).to(dev)
@@ -570,18 +586,18 @@ def train_nep(
                         if data_store.has_energy_flag[i]])
     with torch.no_grad():
         model.b1.fill_(-mean_epa)
-    print(f"Model: {sum(p.numel() for p in model.parameters())} params, "
-          f"dim={model.dim}, b1 init={model.b1.item():.4f}")
+    _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+         f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # 7. q_scaler
-    print("Computing q_scaler...")
+    _log("Computing q_scaler...")
     q_min, q_max = compute_q_scaler(model, data_store, batch_size,
                                     pytorch_only=pytorch_only)
     model.set_q_scaler(q_min, q_max)
 
     # 8. Compile (PyTorch 2.0+)
     if use_compile and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile...")
+        _log("Compiling model with torch.compile...")
         model = torch.compile(model)
 
     # 9. Optimizer (Adam, MACE-style: amsgrad + small weight_decay)
@@ -608,12 +624,16 @@ def train_nep(
 
     # Stage 2 SWA setup (MACE-inspired)
     swa_model = None
-    if stage2 and use_swa:
-        from torch.optim.swa_utils import AveragedModel, SWALR
-        m_ = model._orig_mod if hasattr(model, "_orig_mod") else model
-        swa_model = AveragedModel(m_)
-        swa_scheduler = SWALR(optimizer, swa_lr=stage2_lr,
-                              anneal_epochs=1, anneal_strategy="linear")
+    stage2_scheduler = None
+    if stage2:
+        # Stage 2 also uses ReduceLROnPlateau, starting from stage2_lr
+        stage2_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=scheduler_factor,
+            patience=scheduler_patience, min_lr=stop_lr)
+        if use_swa:
+            from torch.optim.swa_utils import AveragedModel
+            m_ = model._orig_mod if hasattr(model, "_orig_mod") else model
+            swa_model = AveragedModel(m_)
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
@@ -621,37 +641,37 @@ def train_nep(
     if restart and os.path.exists(ckpt_path):
         start_epoch, best_loss = _load_checkpoint(ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
-        print(f"Resumed from checkpoint: epoch {start_epoch - 1}, best_loss={best_loss:.4e}")
+        _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, best_loss={best_loss:.4e}")
 
     # 10. Training
     n_structs = data_store.n
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
 
+    # Open loss log: append if restarting, otherwise write fresh
+    loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
+    loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
+    if loss_log_mode == "w":
+        loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  rmse_v(meV/atom)\n")
+
     backend_str = ("pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated")
     force_str = ("autograd (create_graph)" if use_autograd_forces
                  else "analytical")
     clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
     loss_type = f"Huber(delta={huber_delta})" if use_huber else "MSE"
-    print(f"\nTraining: epochs {start_epoch}-{num_epochs}, batch={batch_size}, "
-          f"device={device}, dtype={precision}")
-    print(f"Backend: {backend_str} | forces: {force_str} | {clip_str} | loss: {loss_type}")
-    print(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
-          f"factor={scheduler_factor}), stop_lr={stop_lr}")
-    print(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
+    _log(f"\nTraining: epochs {start_epoch}-{num_epochs}, batch={batch_size}, "
+         f"device={device}, dtype={precision}")
+    _log(f"Backend: {backend_str} | forces: {force_str} | {clip_str} | loss: {loss_type}")
+    _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
+         f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
     if stage2:
-        print(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
-              f"lr={stage2_lr}, SWA={'ON' if use_swa else 'OFF'}")
-        print(f"Stage 2 weights: E={stage2_pref_e}  F={stage2_pref_f}  V={stage2_pref_v}")
-    print("-" * 72)
+        _log(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
+             f"lr={stage2_lr}, ReduceLROnPlateau, SWA={'ON' if use_swa else 'OFF'}")
+        _log(f"Stage 2 weights: E={stage2_pref_e}  F={stage2_pref_f}  V={stage2_pref_v}")
+    _log("-" * 72)
 
-    # Open log files: append if restarting, otherwise write fresh
-    loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
-    loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
-    grad_log = open(os.path.join(output_dir, "grad_spike.log"), loss_log_mode)
-    if loss_log_mode == "w":
-        loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  rmse_v(meV/atom)\n")
-
+    train_t0 = time.time()
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
@@ -676,19 +696,15 @@ def train_nep(
                 cur_pref_e = stage2_pref_e
                 cur_pref_f = stage2_pref_f
                 cur_pref_v = stage2_pref_v
-                if use_swa and swa_model is not None:
-                    swa_scheduler.step()
-                else:
+
+                # Print stage transition once & set initial stage2 LR
+                if epoch == start_stage2:
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
-
-                # Print stage transition once
-                if epoch == start_stage2:
-                    real_lr = optimizer.param_groups[0]['lr']
-                    print(f"\n{'='*72}")
-                    print(f"Stage 2 started at epoch {epoch}: "
-                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, V_w={cur_pref_v}, lr={real_lr:.2e}")
-                    print(f"{'='*72}")
+                    _log(f"\n{'='*72}")
+                    _log(f"Stage 2 started at epoch {epoch}: "
+                         f"E_w={cur_pref_e}, F_w={cur_pref_f}, V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                    _log(f"{'='*72}")
                     best_loss = float("inf")
             else:
                 # Stage 1: fixed weights, ReduceLROnPlateau handles LR
@@ -804,12 +820,15 @@ def train_nep(
             cur_lr = optimizer.param_groups[0]['lr']
             epoch_line += f"{v_str} | gnorm {max_gn:.1f} | lr {cur_lr:.2e} | {dt:.1f}s"
             if epoch % print_interval == 0 or epoch == 1:
-                print(epoch_line)
-            grad_log.write(epoch_line + "\n")
-            grad_log.flush()
+                _log(epoch_line)
+            else:
+                _out_log_file.write(epoch_line + "\n")
+                _out_log_file.flush()
 
-            # LR scheduler step (Stage 1 only — Stage 2 uses SWA/fixed LR)
-            if not in_stage2:
+            # LR scheduler step — both stages use ReduceLROnPlateau
+            if in_stage2 and stage2_scheduler is not None:
+                stage2_scheduler.step(avg_loss)
+            elif not in_stage2:
                 lr_scheduler.step(avg_loss)
 
             m = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -827,7 +846,6 @@ def train_nep(
 
     finally:
         loss_log.close()
-        grad_log.close()
 
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     if hasattr(m, "module"):
@@ -843,18 +861,29 @@ def train_nep(
         m.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
                        max_NN_rad, max_NN_ang)
         torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
-        print(f"SWA model saved to nep_swa.txt")
+        _log(f"SWA model saved to nep_swa.txt")
 
-    print(f"\nDone. Best loss: {best_loss:.6e}")
-    print(f"Output: {output_dir}/")
+    train_time = time.time() - train_t0
+    h, rem = divmod(train_time, 3600)
+    m_, s = divmod(rem, 60)
+    _log(f"\nDone. Best loss: {best_loss:.6e}")
+    _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
     # Post-training prediction on training set
     nep_file = os.path.join(output_dir, "nep.txt")
     if os.path.exists(nep_file):
-        print("\nRunning prediction on training set...")
+        _log("\nRunning prediction on training set...")
         from .predict import predict_dataset
         predict_dataset(nep_file, data_file, output_dir=output_dir,
                         dtype="float64", device=device)
+        _log("Prediction done.")
+
+    total_time = time.time() - total_t0
+    h, rem = divmod(total_time, 3600)
+    m_, s = divmod(rem, 60)
+    _log(f"\nTotal time (data + train + predict): {int(h):02d}:{int(m_):02d}:{s:04.1f}")
+    _log(f"Output: {output_dir}/")
+    _out_log_file.close()
 
 
 # ---------------------------------------------------------------------------

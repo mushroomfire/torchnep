@@ -14,18 +14,18 @@ lambda_f   100.0
 lambda_v   1.0
 
 # Training parameters
-epoch      1000          # number of epochs
+epoch      500           # number of epochs
 batch      32            # batch size
-lr         0.01          # initial learning rate
+lr         0.005         # initial learning rate
 stop_lr    1e-6          # minimum learning rate
-scheduler_patience 50    # epochs without improvement before LR reduction
+scheduler_patience 15    # epochs without improvement before LR reduction
 scheduler_factor   0.8   # LR reduction factor
 max_grad_norm      10.0  # gradient clipping
 
 # Stage 2: energy-focused fine-tuning (MACE-style)
 stage2           1       # 1=enable, 0=disable
-start_stage2     750     # epoch to start Stage 2
-stage2_lr        1e-3    # Stage 2 learning rate
+start_stage2     300     # epoch to start Stage 2
+stage2_lr        1e-4    # Stage 2 learning rate
 stage2_lambda_e  1000.0  # Stage 2 energy weight
 stage2_lambda_f  100.0   # Stage 2 force weight
 stage2_lambda_v  10.0    # Stage 2 virial weight

@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .nep import NEPCalculator
 from .model import NEPModel
 from .data import read_xyz, parse_nep_in

@@ -12,4 +12,5 @@ train_nep(
     data_file="train.xyz",
     output_dir="output",
     device="cuda",
+    pytorch_only=False,
 )
