@@ -197,6 +197,15 @@ def compute_descriptors(
     n_ap1 = n_max_angular + 1
     num_L_total = l_max_3b + (1 if l_max_4b > 0 else 0) + (1 if l_max_5b > 0 else 0)
 
+    if l_max_3b > 0 and rij_ang.shape[0] == 0:
+        # No angular neighbors (e.g. isolated atom / dimer). Emit zero-filled
+        # angular blocks so output dim still matches q_scaler.
+        parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
+        if l_max_4b > 0:
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
+        if l_max_5b > 0:
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
+
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
         # Try CUDA angular descriptor (autograd.Function with CUDA forward+backward)
         use_cuda_ang = (not pytorch_only and rij_ang.is_cuda and c3 is not None

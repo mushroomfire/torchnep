@@ -963,6 +963,25 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
         os.makedirs(output_dir, exist_ok=True)
     dist.barrier()
 
+    # ---- Pre-compile CUDA kernels on rank 0 only -------------------------
+    # torch.utils.cpp_extension.load writes to ~/.cache/torch_extensions/;
+    # if all ranks JIT-compile simultaneously they fight for the same lock
+    # and appear to hang (GPU idle, no error). Let rank 0 build, then barrier.
+    if not pytorch_only:
+        if is_main:
+            print(f"[rank 0] Pre-compiling CUDA kernels "
+                  f"(first run may take a few minutes)...")
+            from . import cuda_ops
+            cuda_ops._load_kernels()
+            cuda_ops._load_cached_kernels()
+            print(f"[rank 0] CUDA kernels ready.")
+        dist.barrier()
+        if not is_main:
+            from . import cuda_ops
+            cuda_ops._load_kernels()
+            cuda_ops._load_cached_kernels()
+        dist.barrier()
+
     # ---- Logging (mirror single-GPU _log) --------------------------------
     _out_log_file = open(os.path.join(output_dir, "output.log"), "w") if is_main else None
 

@@ -24,31 +24,41 @@ def _load_kernels():
     """JIT-compile CUDA kernels on first use.
 
     Set TORCHNEP_NO_CUDA_KERNELS=1 to force pure-PyTorch fallback.
+    Set TORCHNEP_VERBOSE_BUILD=1 to see nvcc output during JIT compile.
     """
     global _kernels
     if _kernels is not None:
         return _kernels
     if os.environ.get("TORCHNEP_NO_CUDA_KERNELS", "0") == "1":
+        print("[torchnep] TORCHNEP_NO_CUDA_KERNELS=1, CUDA kernels disabled.")
         return None
     if not torch.cuda.is_available():
+        print("[torchnep] CUDA not available, falling back to PyTorch.")
         return None
+    verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import load, _get_build_directory
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_kernels.cu")
         if not os.path.exists(src):
+            print(f"[torchnep] Kernel source not found: {src}")
             return None
+        build_dir = _get_build_directory("nep_kernels", verbose=False)
+        print(f"[torchnep] Compiling nep_kernels → {build_dir}")
         extra_cflags = []
         extra_cuda = ["-O3", "--use_fast_math"]
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")
         _kernels = load(
-            name="nep_kernels", sources=[src], verbose=False,
+            name="nep_kernels", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
+        print(f"[torchnep] nep_kernels OK.")
         return _kernels
-    except Exception as e:
-        print(f"Warning: CUDA kernel compilation failed: {e}")
+    except Exception:
+        import traceback
+        print("[torchnep] nep_kernels compilation FAILED:")
+        traceback.print_exc()
         return None
 
 
@@ -296,23 +306,30 @@ def _load_cached_kernels():
         return None
     if not torch.cuda.is_available():
         return None
+    verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load
+        from torch.utils.cpp_extension import load, _get_build_directory
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
         if not os.path.exists(src):
+            print(f"[torchnep] Kernel source not found: {src}")
             return None
+        build_dir = _get_build_directory("nep_cached", verbose=False)
+        print(f"[torchnep] Compiling nep_cached → {build_dir}")
         extra_cflags = []
         extra_cuda = ["-O3"]
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")
         _cached_kernels = load(
-            name="nep_cached", sources=[src], verbose=False,
+            name="nep_cached", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
+        print(f"[torchnep] nep_cached OK.")
         return _cached_kernels
-    except Exception as e:
-        print(f"Warning: cached CUDA kernel compilation failed: {e}")
+    except Exception:
+        import traceback
+        print("[torchnep] nep_cached compilation FAILED:")
+        traceback.print_exc()
         return None
 
 
