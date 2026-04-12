@@ -87,6 +87,35 @@ def build_neighbor_list_np(positions, cell, cutoff):
 # GPU data store — all data pre-loaded to device
 # ---------------------------------------------------------------------------
 
+def _breakdown_datastore_memory(ds) -> str:
+    """Return a per-tensor breakdown of DataStore GPU memory usage."""
+    groups = {
+        "pairs (rij+i+j rad/ang)": ["rij_rad", "pi_rad", "pj_rad",
+                                     "rij_ang", "pi_ang", "pj_ang"],
+        "basis cache (fk,fkp,d12inv)": ["fk_rad", "fkp_rad", "d12inv_rad",
+                                         "fk_ang", "fkp_ang", "d12inv_ang"],
+        "angular basis (blm)": ["blm"],
+        "labels (E/F/V)": ["forces", "virial"],
+        "atom types": ["atom_types"],
+    }
+    lines = ["  DataStore breakdown:"]
+    total = 0.0
+    for label, keys in groups.items():
+        b = 0
+        for k in keys:
+            lst = getattr(ds, k, None)
+            if lst is None:
+                continue
+            for t in lst:
+                b += t.element_size() * t.nelement()
+        gb = b / 1e9
+        total += gb
+        if b > 0:
+            lines.append(f"    {label:<32s} {gb:6.2f} GB")
+    lines.append(f"    {'total (DataStore)':<32s} {total:6.2f} GB")
+    return "\n".join(lines)
+
+
 class GPUDataStore:
     """Pre-loads all structure data to GPU for zero-copy batch collation.
 
@@ -606,8 +635,11 @@ def train_nep(
     del structures  # free CPU memory
     data_load_time = time.time() - t0
     if dev.type == "cuda":
-        mem = torch.cuda.memory_allocated() / 1e6
-        _log(f"  GPU memory used: {mem:.0f} MB ({data_load_time:.1f}s)")
+        alloc = torch.cuda.memory_allocated() / 1e9
+        rsvd = torch.cuda.memory_reserved() / 1e9
+        _log(f"  GPU memory: alloc {alloc:.2f} GB | reserved {rsvd:.2f} GB "
+             f"({data_load_time:.1f}s)")
+        _log(_breakdown_datastore_memory(data_store))
     elif dev.type == "mps":
         _log(f"  MPS data loaded ({data_load_time:.1f}s)")
     _log(f"  Data: {data_store.n} structures, "
@@ -710,6 +742,8 @@ def train_nep(
     _log("-" * 72)
 
     train_t0 = time.time()
+    if dev.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
@@ -862,6 +896,13 @@ def train_nep(
             else:
                 _out_log_file.write(epoch_line + "\n")
                 _out_log_file.flush()
+
+            if epoch == 1 and dev.type == "cuda":
+                peak = torch.cuda.max_memory_allocated() / 1e9
+                alloc = torch.cuda.memory_allocated() / 1e9
+                rsvd = torch.cuda.memory_reserved() / 1e9
+                _log(f"  GPU memory after epoch 1: alloc {alloc:.2f} GB | "
+                     f"peak {peak:.2f} GB | reserved {rsvd:.2f} GB")
 
             # LR scheduler step — both stages use ReduceLROnPlateau
             if in_stage2 and stage2_scheduler is not None:
@@ -1046,8 +1087,11 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
     torch.cuda.synchronize()
-    mem = torch.cuda.memory_allocated() / 1e6
-    _log(f"  GPU memory used: {mem:.0f} MB ({time.time() - t0:.1f}s)")
+    alloc = torch.cuda.memory_allocated() / 1e9
+    rsvd = torch.cuda.memory_reserved() / 1e9
+    _log(f"  GPU memory: alloc {alloc:.2f} GB | reserved {rsvd:.2f} GB "
+         f"({time.time() - t0:.1f}s)")
+    _log(_breakdown_datastore_memory(data_store))
     _log(f"  Data: {data_store.n} structures, "
          f"{data_store.n_energy} with energy, "
          f"{data_store.n_forces} with forces, "
@@ -1144,6 +1188,7 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
     best_loss = float("inf")
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     train_t0 = time.time()
+    torch.cuda.reset_peak_memory_stats()
 
     try:
         for epoch in range(1, num_epochs + 1):
@@ -1297,6 +1342,14 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
                 else:
                     _out_log_file.write(epoch_line + "\n")
                     _out_log_file.flush()
+
+                if epoch == 1:
+                    peak = torch.cuda.max_memory_allocated() / 1e9
+                    alloc = torch.cuda.memory_allocated() / 1e9
+                    rsvd = torch.cuda.memory_reserved() / 1e9
+                    _log(f"  GPU memory after epoch 1 (rank 0): "
+                         f"alloc {alloc:.2f} GB | peak {peak:.2f} GB | "
+                         f"reserved {rsvd:.2f} GB")
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
