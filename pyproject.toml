@@ -15,3 +15,9 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["ninja"]
 dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["torchnep*"]
+
+[tool.setuptools.package-data]
+torchnep = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
