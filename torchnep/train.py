@@ -1389,7 +1389,7 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
             from .predict import predict_dataset
             try:
                 predict_dataset(nep_file, data_file, output_dir,
-                                device=f"cuda:{rank}", precision=precision)
+                                device=f"cuda:{rank}", dtype=precision)
             except Exception as e:
                 _log(f"  Prediction failed: {e}")
 
