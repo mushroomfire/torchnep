@@ -54,36 +54,14 @@ def _split_frames(lines):
     return blocks
 
 
-def read_xyz(filename: str, num_workers: int = None) -> List[Dict]:
-    """Read extended XYZ file (GPUMD format). Parses frames in parallel.
-
-    Parameters
-    ----------
-    filename : str
-        Path to XYZ file.
-    num_workers : int or None
-        Number of parallel parser workers. None → auto (os.cpu_count()).
-        1 disables multiprocessing.
-    """
-    import os
+def read_xyz(filename: str) -> List[Dict]:
+    """Read extended XYZ file (GPUMD format)."""
     with open(filename) as f:
         lines = f.readlines()
 
     blocks = _split_frames(lines)
     del lines
-
-    if num_workers is None:
-        num_workers = os.cpu_count() or 1
-    num_workers = min(num_workers, len(blocks))
-
-    if num_workers <= 1 or len(blocks) < 64:
-        return [_parse_frame_block(b) for b in blocks]
-
-    from multiprocessing import Pool
-    chunksize = max(1, len(blocks) // (num_workers * 8))
-    with Pool(num_workers) as pool:
-        frames = pool.map(_parse_frame_block, blocks, chunksize=chunksize)
-    return frames
+    return [_parse_frame_block(b) for b in blocks]
 
 
 def _parse_comment(comment: str, natoms: int) -> Dict:

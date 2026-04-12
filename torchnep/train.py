@@ -319,81 +319,44 @@ class GPUDataStore:
 # Preprocessing
 # ---------------------------------------------------------------------------
 
-def _preprocess_one(args):
-    """Worker: build neighbor list + package one structure. Must be top-level
-    for multiprocessing pickling."""
-    frame, rc_rad, rc_ang, max_rc, type_names, dtype_str = args
-    dtype = np.dtype(dtype_str)
-
-    positions = frame["positions"].astype(dtype)
-    cell = frame["cell"].astype(dtype)
-    atom_types = np.array([type_names.index(s) for s in frame["species"]],
-                          dtype=np.int64)
-
-    pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
-    dij = np.linalg.norm(rij, axis=1)
-    rad_mask = dij < rc_rad
-    ang_mask = dij < rc_ang
-
-    s = {
-        "natoms": frame["natoms"],
-        "atom_types": atom_types,
-        "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
-        "rij_rad": rij[rad_mask].astype(dtype),
-        "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
-        "rij_ang": rij[ang_mask].astype(dtype),
-    }
-    if "energy" in frame:
-        s["energy"] = frame["energy"]
-    if "forces" in frame:
-        s["forces"] = frame["forces"].astype(dtype)
-    if "virial" in frame:
-        s["virial"] = frame["virial"].astype(dtype)
-    return s
-
-
-def preprocess_structures(frames, config, dtype=np.float32, num_workers=None):
-    """Build neighbor lists for all frames in parallel across CPU cores.
-
-    Parameters
-    ----------
-    num_workers : int or None
-        Number of worker processes. None → auto (os.cpu_count()).
-        Set to 1 to disable multiprocessing (useful for debugging).
-    """
+def preprocess_structures(frames, config, dtype=np.float32):
+    """Build neighbor lists for all frames (CPU, serial)."""
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
-    dtype_str = np.dtype(dtype).name
 
-    if num_workers is None:
-        num_workers = os.cpu_count() or 1
-    num_workers = min(num_workers, len(frames))
+    structures = []
+    for idx, frame in enumerate(frames):
+        positions = frame["positions"].astype(dtype)
+        cell = frame["cell"].astype(dtype)
+        atom_types = np.array([type_names.index(s) for s in frame["species"]],
+                              dtype=np.int64)
 
-    tasks = [(f, rc_rad, rc_ang, max_rc, type_names, dtype_str) for f in frames]
+        pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
+        dij = np.linalg.norm(rij, axis=1)
+        rad_mask = dij < rc_rad
+        ang_mask = dij < rc_ang
 
-    # Small dataset or explicit serial: in-process loop
-    if num_workers <= 1 or len(frames) < 16:
-        structures = []
-        for idx, a in enumerate(tasks):
-            structures.append(_preprocess_one(a))
-            if (idx + 1) % 500 == 0:
-                print(f"  Preprocessed {idx + 1}/{len(frames)}")
-        return structures
+        s = {
+            "natoms": frame["natoms"],
+            "atom_types": atom_types,
+            "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
+            "rij_rad": rij[rad_mask].astype(dtype),
+            "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
+            "rij_ang": rij[ang_mask].astype(dtype),
+        }
+        if "energy" in frame:
+            s["energy"] = frame["energy"]
+        if "forces" in frame:
+            s["forces"] = frame["forces"].astype(dtype)
+        if "virial" in frame:
+            s["virial"] = frame["virial"].astype(dtype)
+        structures.append(s)
 
-    # Parallel: chunksize to amortize IPC overhead
-    from multiprocessing import Pool
-    chunksize = max(1, len(frames) // (num_workers * 8))
-    structures = [None] * len(frames)
-    print(f"  Building neighbor lists with {num_workers} workers "
-          f"(chunksize={chunksize})...")
-    with Pool(num_workers) as pool:
-        for idx, s in enumerate(pool.imap(_preprocess_one, tasks,
-                                          chunksize=chunksize)):
-            structures[idx] = s
-            if (idx + 1) % 500 == 0:
-                print(f"  Preprocessed {idx + 1}/{len(frames)}")
+        if (idx + 1) % 500 == 0:
+            print(f"  Preprocessed {idx + 1}/{len(frames)}")
+
     return structures
 
 
@@ -1138,8 +1101,17 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
     backend_str = ("pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated")
     clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
     loss_type = f"Huber(delta={huber_delta})" if use_huber else "MSE"
-    _log(f"\nTraining: epochs 1-{num_epochs}, batch={batch_size} per rank x "
-         f"{world_size} ranks, dtype={precision}")
+    # Batch sharding preview (round-robin over batch index)
+    n_batches_total = (n_structs + batch_size - 1) // batch_size
+    per_rank = [sum(1 for bi in range(n_batches_total) if bi % world_size == r)
+                for r in range(world_size)]
+    _log(f"\nTraining: epochs 1-{num_epochs}, batch_size={batch_size}, "
+         f"dtype={precision}")
+    _log(f"Data sharding: {n_structs} structures → {n_batches_total} batches, "
+         f"round-robin across {world_size} ranks "
+         f"(rank-batches: {per_rank})")
+    _log(f"  e.g. rank 0 processes batches [0, {world_size}, "
+         f"{2*world_size}, ...]; rank 1 → [1, {1+world_size}, ...]; etc.")
     _log(f"Backend: {backend_str} | {clip_str} | loss: {loss_type}")
     _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
          f"factor={scheduler_factor}), stop_lr={stop_lr}")
@@ -1185,6 +1157,13 @@ def _ddp_worker(rank, world_size, config_file, data_file, output_dir,
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
             batch_starts = list(range(0, n_structs, batch_size))
+            # First-epoch sharding proof: every rank prints its own batch list
+            if epoch == 1:
+                my_bis = [bi for bi in range(len(batch_starts))
+                          if bi % world_size == rank]
+                preview = my_bis[:6] + (["..."] if len(my_bis) > 6 else [])
+                print(f"  [rank {rank}/{world_size}] epoch 1: "
+                      f"got {len(my_bis)} batches, indices={preview}")
             for bi, start in enumerate(batch_starts):
                 if bi % world_size != rank:
                     continue
