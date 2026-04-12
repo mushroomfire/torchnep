@@ -115,16 +115,10 @@ def predict_dataset(
                 "  ".join(f"{x}" for x in vr6) + "\n"
             )
 
-            if (i + 1) % 100 == 0:
-                print(f"Predicted {i + 1}/{len(frames)} frames")
-
     finally:
         energy_file.close()
         force_file.close()
         virial_file.close()
 
-    print(f"Prediction complete. {len(frames)} frames processed.")
-    print(f"Results saved to {output_dir}/")
-    print("  energy_predict.out : pred  target")
-    print("  force_predict.out  : fx fy fz (pred)  fx fy fz (target)")
-    print("  virial_predict.out : xx yy zz xy yz zx (pred)  ... (target)")
+    print(f"  {len(frames)} frames predicted → {output_dir}/"
+          "{energy,force,virial}_predict.out")

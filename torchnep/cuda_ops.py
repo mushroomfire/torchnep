@@ -30,20 +30,15 @@ def _load_kernels():
     if _kernels is not None:
         return _kernels
     if os.environ.get("TORCHNEP_NO_CUDA_KERNELS", "0") == "1":
-        print("[torchnep] TORCHNEP_NO_CUDA_KERNELS=1, CUDA kernels disabled.")
         return None
     if not torch.cuda.is_available():
-        print("[torchnep] CUDA not available, falling back to PyTorch.")
         return None
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load, _get_build_directory
+        from torch.utils.cpp_extension import load
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_kernels.cu")
         if not os.path.exists(src):
-            print(f"[torchnep] Kernel source not found: {src}")
             return None
-        build_dir = _get_build_directory("nep_kernels", verbose=False)
-        print(f"[torchnep] Compiling nep_kernels → {build_dir}")
         extra_cflags = []
         extra_cuda = ["-O3", "--use_fast_math"]
         if sys.platform == "win32":
@@ -53,12 +48,11 @@ def _load_kernels():
             name="nep_kernels", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
-        print(f"[torchnep] nep_kernels OK.")
         return _kernels
     except Exception:
-        import traceback
-        print("[torchnep] nep_kernels compilation FAILED:")
-        traceback.print_exc()
+        if verbose:
+            import traceback
+            traceback.print_exc()
         return None
 
 
@@ -248,49 +242,6 @@ def angular_descriptor_cuda(rij, pair_i, pair_j, atom_types, c3,
 
 
 # ---------------------------------------------------------------------------
-# Angular force helpers (still CUDA-accelerated — used in old compute_properties path)
-# ---------------------------------------------------------------------------
-
-def angular_force_cuda(rij, pair_i, pair_j, atom_types, c3,
-                       Fp_ang, sum_fxyz,
-                       N, n_ap1, basis_a, ntypes, L_max, num_L, rc,
-                       compute_virial=False):
-    """CUDA angular force: per-pair grad_rij → per-atom forces/virial."""
-    k = _load_kernels()
-    if k is None or not rij.is_cuda:
-        return None, None
-    try:
-        result = k.angular_backward(
-            rij.contiguous(), pair_i, pair_j, atom_types,
-            c3.contiguous(), Fp_ang.contiguous(),
-            sum_fxyz.contiguous(),
-            N, n_ap1, basis_a, ntypes, L_max, num_L, rc, compute_virial)
-        grad_rij = result[0]  # (P, 3)
-
-        dtype, device = rij.dtype, rij.device
-        forces = torch.zeros(N, 3, dtype=dtype, device=device)
-        idx3 = pair_i.unsqueeze(-1).expand_as(grad_rij)
-        forces.scatter_add_(0, idx3, grad_rij)
-        forces.scatter_add_(0, pair_j.unsqueeze(-1).expand_as(grad_rij), -grad_rij)
-
-        virial = None
-        if compute_virial:
-            virial = torch.zeros(N, 9, dtype=dtype, device=device)
-            v9 = -(rij.unsqueeze(-1) * grad_rij.unsqueeze(-2)).reshape(-1, 9)
-            virial.scatter_add_(0, pair_j.unsqueeze(-1).expand_as(v9), v9)
-
-        return forces, virial
-    except Exception as e:
-        print(f"Warning: angular_force_cuda failed: {e}")
-        return None, None
-
-
-def is_cuda_available():
-    """Check if CUDA kernels are available."""
-    return _load_kernels() is not None
-
-
-# ---------------------------------------------------------------------------
 # Cached type-pair contraction: CUDA-accelerated for training path
 # ---------------------------------------------------------------------------
 
@@ -308,13 +259,10 @@ def _load_cached_kernels():
         return None
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load, _get_build_directory
+        from torch.utils.cpp_extension import load
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
         if not os.path.exists(src):
-            print(f"[torchnep] Kernel source not found: {src}")
             return None
-        build_dir = _get_build_directory("nep_cached", verbose=False)
-        print(f"[torchnep] Compiling nep_cached → {build_dir}")
         extra_cflags = []
         extra_cuda = ["-O3"]
         if sys.platform == "win32":
@@ -324,12 +272,11 @@ def _load_cached_kernels():
             name="nep_cached", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
-        print(f"[torchnep] nep_cached OK.")
         return _cached_kernels
     except Exception:
-        import traceback
-        print("[torchnep] nep_cached compilation FAILED:")
-        traceback.print_exc()
+        if verbose:
+            import traceback
+            traceback.print_exc()
         return None
 
 

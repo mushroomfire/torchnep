@@ -802,108 +802,32 @@ def accumulate_forces_virial(
 # ---------------------------------------------------------------------------
 
 _cuda_ops = None
-_cuda_desc_ops = None
-
-
-def _get_platform_flags():
-    """Get platform-specific compiler flags for CUDA JIT compilation."""
-    import sys
-    extra_cflags = []
-    extra_cuda = ["-O3", "--use_fast_math"]
-    if sys.platform == "win32":
-        extra_cflags = ["/permissive-"]
-        extra_cuda.append("-Xcompiler=/permissive-")
-    return extra_cflags, extra_cuda
 
 
 def _load_cuda_ops():
-    """JIT-compile CUDA kernels on first use."""
+    """JIT-compile the force/virial scatter CUDA kernel on first use."""
     global _cuda_ops
     if _cuda_ops is not None:
         return _cuda_ops
     if not torch.cuda.is_available():
         return None
     try:
+        import sys
         from torch.utils.cpp_extension import load
         csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_ops.cu")
         if not os.path.exists(csrc):
             return None
-        extra_cflags, extra_cuda = _get_platform_flags()
+        extra_cflags = []
+        extra_cuda = ["-O3", "--use_fast_math"]
+        if sys.platform == "win32":
+            extra_cflags = ["/permissive-"]
+            extra_cuda.append("-Xcompiler=/permissive-")
         _cuda_ops = load(name="nep_cuda_ops", sources=[csrc], verbose=False,
                          extra_cflags=extra_cflags,
                          extra_cuda_cflags=extra_cuda)
         return _cuda_ops
     except Exception:
         return None
-
-
-def _load_cuda_desc_ops():
-    """JIT-compile descriptor+force CUDA kernels."""
-    global _cuda_desc_ops
-    if _cuda_desc_ops is not None:
-        return _cuda_desc_ops
-    if not torch.cuda.is_available():
-        return None
-    try:
-        from torch.utils.cpp_extension import load
-        csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_descriptor.cu")
-        if not os.path.exists(csrc):
-            return None
-        extra_cflags, extra_cuda = _get_platform_flags()
-        _cuda_desc_ops = load(name="nep_cuda_desc", sources=[csrc], verbose=False,
-                              extra_cflags=extra_cflags,
-                              extra_cuda_cflags=extra_cuda)
-        return _cuda_desc_ops
-    except Exception:
-        return None
-
-
-def compute_radial_force_cuda(
-    rij_rad, pair_i, pair_j, atom_types, c2,
-    Fp_rad, N, dim_r, bs1, num_types, rc_radial,
-    compute_virial=False,
-):
-    """CUDA-accelerated radial force computation. Falls back to PyTorch."""
-    cuda = _load_cuda_desc_ops()
-    if cuda is not None and rij_rad.is_cuda:
-        # c2 needs to be (nt, nt, dim_r, bs1) contiguous
-        c2_c = c2.contiguous()
-        return cuda.radial_force(
-            rij_rad.contiguous(), pair_i, pair_j, atom_types,
-            c2_c, Fp_rad.contiguous(), N, dim_r, bs1, num_types,
-            rc_radial, compute_virial)
-    # PyTorch fallback
-    return _radial_force_pytorch(
-        rij_rad, pair_i, pair_j, atom_types, c2,
-        Fp_rad, N, dim_r, bs1, num_types, rc_radial, compute_virial)
-
-
-def _radial_force_pytorch(
-    rij_rad, pair_i, pair_j, atom_types, c2,
-    Fp_rad, N, dim_r, bs1, num_types, rc_radial, compute_virial,
-):
-    """Pure PyTorch radial force (fallback for CPU/Mac)."""
-    dtype, device = rij_rad.dtype, rij_rad.device
-    dij = torch.norm(rij_rad, dim=-1)
-    _, fkp = chebyshev_basis_and_deriv(dij, rc_radial, bs1 - 1)
-    t1, t2 = atom_types[pair_i], atom_types[pair_j]
-    c2_p = c2[t1, t2] if c2.shape[0] != dim_r else c2[:, :, t1, t2].permute(2, 0, 1)
-    gnp = (c2_p * fkp.unsqueeze(1)).sum(-1)
-    d12inv = 1.0 / dij
-    Fp_i = Fp_rad[pair_i]
-    tmp = (Fp_i * gnp).sum(-1, keepdim=True) * d12inv.unsqueeze(-1)
-    f12 = tmp * rij_rad
-    forces = torch.zeros(N, 3, dtype=dtype, device=device)
-    virial = torch.zeros(N, 9, dtype=dtype, device=device) if compute_virial else None
-
-    def _e(idx, t):
-        return idx.unsqueeze(-1).expand_as(t)
-    forces.scatter_add_(0, _e(pair_i, f12), f12)
-    forces.scatter_add_(0, _e(pair_j, f12), -f12)
-    if compute_virial:
-        v9 = -(rij_rad.unsqueeze(-1) * f12.unsqueeze(-2)).reshape(-1, 9)
-        virial.scatter_add_(0, pair_j.unsqueeze(-1).expand_as(v9), v9)
-    return forces, virial
 
 
 def accumulate_forces_virial_cuda(
