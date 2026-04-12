@@ -5,3 +5,4 @@
 /example/output*/*
 /example/valid*/*
 /example/run_test*
+/example/bench*

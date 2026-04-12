@@ -8,68 +8,81 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 
-def read_xyz(filename: str) -> List[Dict]:
-    """Read extended XYZ file (GPUMD format).
+def _parse_frame_block(block):
+    """Parse one frame from a list of text lines (picklable for mp.Pool)."""
+    natoms = int(block[0].strip())
+    comment = block[1].strip()
+    frame = _parse_comment(comment, natoms)
 
-    Each frame contains:
-        - natoms: number of atoms
-        - cell: (3, 3) lattice vectors
-        - species: list of element symbols
-        - positions: (N, 3) atomic positions
-        - energy: total energy (if available)
-        - forces: (N, 3) forces (if available)
-        - virial: (6,) or (9,) virial tensor (if available)
+    # Vectorized parse: whitespace split, then fromstring for the numeric cols.
+    # Avoids Python-level float() per atom.
+    atoms = block[2:2 + natoms]
+    # Fast path: concatenate and use np.fromstring on the numeric tail
+    species = [None] * natoms
+    # First column = species (string). Numeric part = everything after first token.
+    numeric_parts = []
+    ncol_numeric = None
+    for j, line in enumerate(atoms):
+        sp, _, rest = line.strip().partition(" ")
+        species[j] = sp
+        numeric_parts.append(rest)
+        if ncol_numeric is None:
+            ncol_numeric = len(rest.split())
+
+    flat = " ".join(numeric_parts)
+    arr = np.fromstring(flat, sep=" ", dtype=np.float64)
+    arr = arr.reshape(natoms, ncol_numeric)
+
+    frame["natoms"] = natoms
+    frame["species"] = species
+    frame["positions"] = arr[:, :3].copy()
+    if ncol_numeric >= 6:
+        frame["forces"] = arr[:, 3:6].copy()
+    return frame
+
+
+def _split_frames(lines):
+    """Split an XYZ text into per-frame line blocks."""
+    blocks = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        natoms = int(lines[i].strip())
+        end = i + 2 + natoms
+        blocks.append(lines[i:end])
+        i = end
+    return blocks
+
+
+def read_xyz(filename: str, num_workers: int = None) -> List[Dict]:
+    """Read extended XYZ file (GPUMD format). Parses frames in parallel.
 
     Parameters
     ----------
     filename : str
         Path to XYZ file.
-
-    Returns
-    -------
-    list of dict
-        List of frame dictionaries.
+    num_workers : int or None
+        Number of parallel parser workers. None → auto (os.cpu_count()).
+        1 disables multiprocessing.
     """
-    frames = []
+    import os
     with open(filename) as f:
         lines = f.readlines()
 
-    i = 0
-    while i < len(lines):
-        # Number of atoms
-        natoms = int(lines[i].strip())
-        i += 1
+    blocks = _split_frames(lines)
+    del lines
 
-        # Comment line with properties
-        comment = lines[i].strip()
-        i += 1
+    if num_workers is None:
+        num_workers = os.cpu_count() or 1
+    num_workers = min(num_workers, len(blocks))
 
-        # Parse comment line
-        frame = _parse_comment(comment, natoms)
+    if num_workers <= 1 or len(blocks) < 64:
+        return [_parse_frame_block(b) for b in blocks]
 
-        # Read atom data
-        species = []
-        positions = []
-        forces = []
-        has_forces = False
-
-        for j in range(natoms):
-            parts = lines[i].split()
-            i += 1
-            species.append(parts[0])
-            positions.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            if len(parts) >= 7:
-                forces.append([float(parts[4]), float(parts[5]), float(parts[6])])
-                has_forces = True
-
-        frame["natoms"] = natoms
-        frame["species"] = species
-        frame["positions"] = np.array(positions)
-        if has_forces:
-            frame["forces"] = np.array(forces)
-
-        frames.append(frame)
-
+    from multiprocessing import Pool
+    chunksize = max(1, len(blocks) // (num_workers * 8))
+    with Pool(num_workers) as pool:
+        frames = pool.map(_parse_frame_block, blocks, chunksize=chunksize)
     return frames
 
 
