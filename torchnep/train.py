@@ -29,6 +29,7 @@ from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_dataset
+from .cuda_ops import _load_kernels, _load_cached_kernels
 
 
 # ---------------------------------------------------------------------------
@@ -82,35 +83,6 @@ def _default_device() -> str:
 # ---------------------------------------------------------------------------
 # GPU data store — all data pre-loaded to device
 # ---------------------------------------------------------------------------
-
-def _breakdown_datastore_memory(ds) -> str:
-    """Return a per-tensor breakdown of DataStore GPU memory usage."""
-    groups = {
-        "pairs (rij+i+j rad/ang)": ["rij_rad", "pi_rad", "pj_rad",
-                                     "rij_ang", "pi_ang", "pj_ang"],
-        "basis cache (fk,fkp,d12inv)": ["fk_rad", "fkp_rad", "d12inv_rad",
-                                         "fk_ang", "fkp_ang", "d12inv_ang"],
-        "angular basis (blm)": ["blm"],
-        "labels (E/F/V)": ["forces", "virial"],
-        "atom types": ["atom_types"],
-    }
-    lines = ["  DataStore breakdown:"]
-    total = 0.0
-    for label, keys in groups.items():
-        b = 0
-        for k in keys:
-            lst = getattr(ds, k, None)
-            if lst is None:
-                continue
-            for t in lst:
-                b += t.element_size() * t.nelement()
-        gb = b / 1e9
-        total += gb
-        if b > 0:
-            lines.append(f"    {label:<32s} {gb:6.2f} GB")
-    lines.append(f"    {'total (DataStore)':<32s} {total:6.2f} GB")
-    return "\n".join(lines)
-
 
 class GPUDataStore:
     """Pre-loads all structure data to GPU for zero-copy batch collation.
@@ -524,6 +496,23 @@ def train_nep(
     _log(f"Precision: {precision}")
     _log("")
 
+    # ---- CUDA kernels -------------------------------------------------------
+    # Compile/load CUDA extension kernels before data loading so any
+    # first-time compilation is logged clearly and not confused with
+    # training time. Cached .so files load instantly on subsequent runs.
+    if dev.type == "cuda" and not pytorch_only:
+        for name, loader in [
+            ("nep_kernels", _load_kernels),
+            ("nep_cached", _load_cached_kernels),
+            ("nep_cuda_ops", ops._load_cuda_ops),
+        ]:
+            t0_k = time.time()
+            k = loader()
+            dt_k = time.time() - t0_k
+            status = "OK" if k is not None else "unavailable (PyTorch fallback)"
+            if dt_k > 1.0:  # only log if compilation actually happened
+                _log(f"  CUDA kernel {name}: compiled ({dt_k:.0f}s) → {status}")
+
     # ---- Config ----------------------------------------------------------
     config = parse_nep_in(config_file)
     lambda_1 = config.get("lambda_1", 0.0)
@@ -570,12 +559,7 @@ def train_nep(
     del structures
     if dev.type == "cuda":
         torch.cuda.synchronize()
-        alloc = torch.cuda.memory_allocated() / 1e9
-        _log(f"  GPU memory (data): {alloc:.2f} GB allocated "
-             f"({time.time() - t0:.1f}s)")
-        _log(_breakdown_datastore_memory(data_store))
-    else:
-        _log(f"  Loaded ({time.time() - t0:.1f}s)")
+    _log(f"  Loaded ({time.time() - t0:.1f}s)")
     _log(f"  Data: {data_store.n} structures, "
          f"{data_store.n_energy} with energy, "
          f"{data_store.n_forces} with forces, "
@@ -682,8 +666,6 @@ def train_nep(
     _log("-" * 72)
 
     train_t0 = time.time()
-    if dev.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
 
     try:
         for epoch in range(start_epoch, num_epochs + 1):
@@ -849,12 +831,6 @@ def train_nep(
                     _out_log_file.write(line + "\n")
                     _out_log_file.flush()
 
-                if epoch == 1 and dev.type == "cuda":
-                    peak = torch.cuda.max_memory_allocated() / 1e9
-                    alloc = torch.cuda.memory_allocated() / 1e9
-                    _log(f"  GPU memory after epoch 1: "
-                         f"alloc {alloc:.2f} GB | peak {peak:.2f} GB")
-
                 if avg_loss < best_loss:
                     best_loss = avg_loss
                     raw_model.save_nep_txt(
@@ -890,8 +866,10 @@ def train_nep(
         nep_file = os.path.join(output_dir, "nep.txt")
         if os.path.exists(nep_file):
             _log("\nRunning prediction on training set...")
+            pred_t0 = time.time()
             predict_dataset(nep_file, data_file, output_dir=output_dir,
                             dtype="float64", device=str(dev))
+            _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
         total_time = time.time() - total_t0
         h, rem = divmod(total_time, 3600)

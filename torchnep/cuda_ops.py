@@ -24,11 +24,19 @@ from .ops import chebyshev_basis, chebyshev_basis_and_deriv, angular_basis
 _kernels = None
 
 
+def _ensure_ninja_in_path():
+    """Add the current Python env's bin dir to PATH so ninja is found."""
+    python_bin = os.path.dirname(sys.executable)
+    path = os.environ.get("PATH", "")
+    if python_bin not in path.split(os.pathsep):
+        os.environ["PATH"] = python_bin + os.pathsep + path
+
+
 def _load_kernels():
-    """JIT-compile CUDA kernels on first use.
+    """Compile CUDA kernels (cached after first compilation).
 
     Set TORCHNEP_NO_CUDA_KERNELS=1 to force pure-PyTorch fallback.
-    Set TORCHNEP_VERBOSE_BUILD=1 to see nvcc output during JIT compile.
+    Set TORCHNEP_VERBOSE_BUILD=1 to see nvcc output during compilation.
     """
     global _kernels
     if _kernels is not None:
@@ -37,6 +45,7 @@ def _load_kernels():
         return None
     if not torch.cuda.is_available():
         return None
+    _ensure_ninja_in_path()
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_kernels.cu")
@@ -247,7 +256,7 @@ _cached_kernels = None
 
 
 def _load_cached_kernels():
-    """JIT-compile cached contraction CUDA kernels."""
+    """Compile cached contraction CUDA kernels (cached after first compilation)."""
     global _cached_kernels
     if _cached_kernels is not None:
         return _cached_kernels
@@ -255,6 +264,7 @@ def _load_cached_kernels():
         return None
     if not torch.cuda.is_available():
         return None
+    _ensure_ninja_in_path()
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
@@ -410,3 +420,5 @@ def scatter_contraction(basis, pair_i, pair_j, atom_types, c, N):
 def type_contraction(basis, pair_i, pair_j, atom_types, c):
     """Type-pair contraction without scatter. Differentiable w.r.t. c."""
     return TypeContraction.apply(basis, pair_i, pair_j, atom_types, c)
+
+

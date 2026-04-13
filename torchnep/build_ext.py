@@ -31,13 +31,6 @@ def build_kernels(verbose: bool = True) -> bool:
         return True
 
     os.environ["TORCHNEP_VERBOSE_BUILD"] = "1" if verbose else "0"
-
-    # Ensure the Python environment's bin directory is in PATH so that
-    # ninja (installed via pip) is found by torch.utils.cpp_extension.
-    python_bin = os.path.dirname(sys.executable)
-    if python_bin not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = python_bin + os.pathsep + os.environ.get("PATH", "")
-
     success = True
 
     print("Building torchnep CUDA kernels...")

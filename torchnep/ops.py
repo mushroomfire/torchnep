@@ -802,12 +802,13 @@ _cuda_ops = None
 
 
 def _load_cuda_ops():
-    """JIT-compile the force/virial scatter CUDA kernel on first use."""
+    """Compile the force/virial scatter CUDA kernel (cached after first compilation)."""
     global _cuda_ops
     if _cuda_ops is not None:
         return _cuda_ops
     if not torch.cuda.is_available():
         return None
+    # ninja PATH is set by cuda_ops._ensure_ninja_in_path() at import time
     try:
         csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_ops.cu")
         if not os.path.exists(csrc):
@@ -864,3 +865,4 @@ except Exception:
     angular_descriptor_cuda = None  # type: ignore[assignment]
     scatter_contraction = None      # type: ignore[assignment]
     type_contraction = None         # type: ignore[assignment]
+
