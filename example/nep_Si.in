@@ -1,0 +1,20 @@
+version    4
+type       1 Si
+cutoff     5 5
+n_max      8 8
+l_max      4 0
+neuron     50
+
+# Stage 1 loss weights (same as GPUMD lambda_e/f/v)
+lambda_e   10.0
+lambda_f   100.0
+lambda_v   0.0
+
+# Training parameters
+epoch      5           # number of epochs
+batch      8            # batch size
+lr         1e-2         # initial learning rate
+stop_lr    1e-6          # minimum learning rate
+scheduler_patience 15    # epochs without improvement before LR reduction
+scheduler_factor   0.8   # LR reduction factor
+max_grad_norm      20.0  # gradient clipping
