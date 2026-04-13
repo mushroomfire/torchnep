@@ -13,6 +13,7 @@ import os
 import sys
 import torch
 from typing import List, Optional, Tuple
+from torch.utils.cpp_extension import load as _cpp_extension_load
 
 from .constants import PI, K_C_SP, ZBL_PARA
 
@@ -169,7 +170,6 @@ def compute_descriptors(
                     and c2.shape[0] != n_max_radial + 1)
     if use_cuda_rad:
         try:
-            from .cuda_ops import radial_descriptor_cuda
             q_rad = radial_descriptor_cuda(
                 rij_rad, pi_rad, pj_rad, atom_types, c2,
                 N, n_max_radial, basis_size_radial, ntypes, rc_radial)
@@ -212,7 +212,6 @@ def compute_descriptors(
                         and c3.shape[0] == ntypes)
         if use_cuda_ang:
             try:
-                from .cuda_ops import angular_descriptor_cuda
                 q_ang = angular_descriptor_cuda(
                     rij_ang, pi_ang, pj_ang, atom_types, c3,
                     N, n_ap1, basis_size_angular, ntypes, num_lm,
@@ -461,7 +460,6 @@ def compute_descriptors_cached(
         _scatter_fn = _scatter_contraction_pytorch
         _type_fn = _type_contraction_pytorch
     else:
-        from .cuda_ops import scatter_contraction, type_contraction
         _scatter_fn = scatter_contraction
         _type_fn = type_contraction
 
@@ -613,7 +611,6 @@ def compute_analytical_forces(
     if pytorch_only:
         _type_fn = _type_contraction_pytorch
     else:
-        from .cuda_ops import type_contraction
         _type_fn = type_contraction
 
     forces = torch.zeros(N, 3, dtype=dtype, device=device)
@@ -812,8 +809,6 @@ def _load_cuda_ops():
     if not torch.cuda.is_available():
         return None
     try:
-        import sys
-        from torch.utils.cpp_extension import load
         csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_ops.cu")
         if not os.path.exists(csrc):
             return None
@@ -822,7 +817,7 @@ def _load_cuda_ops():
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")
-        _cuda_ops = load(name="nep_cuda_ops", sources=[csrc], verbose=False,
+        _cuda_ops = _cpp_extension_load(name="nep_cuda_ops", sources=[csrc], verbose=False,
                          extra_cflags=extra_cflags,
                          extra_cuda_cflags=extra_cuda)
         return _cuda_ops
@@ -850,3 +845,22 @@ def accumulate_forces_virial_cuda(
 
     forces, virial = cuda.force_virial(rij_all, g_all, pi_all, pj_all, N)
     return forces, virial
+
+
+# ---------------------------------------------------------------------------
+# Optional CUDA descriptor ops — imported after all function definitions to
+# break the circular dependency: cuda_ops.py imports from ops.py.
+# ---------------------------------------------------------------------------
+
+try:
+    from .cuda_ops import (  # noqa: E402
+        radial_descriptor_cuda,
+        angular_descriptor_cuda,
+        scatter_contraction,
+        type_contraction,
+    )
+except Exception:
+    radial_descriptor_cuda = None   # type: ignore[assignment]
+    angular_descriptor_cuda = None  # type: ignore[assignment]
+    scatter_contraction = None      # type: ignore[assignment]
+    type_contraction = None         # type: ignore[assignment]

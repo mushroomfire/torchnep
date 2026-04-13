@@ -14,15 +14,21 @@ switches into DDP mode. Parameters and outputs are identical in both cases.
 """
 
 import os
+import platform
 import time
 import torch
+import torch.distributed as dist
 import numpy as np
+from datetime import datetime
 from typing import List, Dict
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel
-from .data import read_xyz, parse_nep_in
+from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
+from .predict import predict_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +44,7 @@ _BANNER = r"""
    ╚═╝    ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝
 """
 
-_AUTHOR = "herrwu"
+_AUTHOR = "Yongchao Wu, yongchao.wu@aalto.fi"
 
 
 def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
@@ -58,7 +64,6 @@ def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
     elif dev.type == "mps":
         lines.append("Backend  : MPS (Apple Silicon)")
     else:
-        import platform
         lines.append(f"Backend  : CPU ({platform.processor() or platform.machine()})")
     lines.append(f"PyTorch  : {torch.__version__}")
     return lines
@@ -72,55 +77,6 @@ def _default_device() -> str:
         return "mps"
     return "cpu"
 
-
-# ---------------------------------------------------------------------------
-# Neighbor list construction (numpy, CPU, runs once at startup)
-# ---------------------------------------------------------------------------
-
-def build_neighbor_list_np(positions, cell, cutoff):
-    """Build neighbor list using numpy (for preprocessing). Returns arrays."""
-    N = positions.shape[0]
-    inv_cell = np.linalg.inv(cell)
-
-    n_rep = [int(np.ceil(cutoff / (1.0 / np.linalg.norm(inv_cell[i])))) for i in range(3)]
-
-    a_r = np.arange(-n_rep[0], n_rep[0] + 1)
-    b_r = np.arange(-n_rep[1], n_rep[1] + 1)
-    c_r = np.arange(-n_rep[2], n_rep[2] + 1)
-    shifts_frac = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"), axis=-1)
-    shifts_frac = shifts_frac.reshape(-1, 3).astype(positions.dtype)
-    shifts_cart = shifts_frac @ cell
-    S = shifts_cart.shape[0]
-
-    if N * N * S < 8_000_000:
-        disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
-                - positions[:, None, None, :])
-        dist = np.linalg.norm(disp, axis=-1)
-        zero_shift = np.all(shifts_frac == 0, axis=1)
-        self_mask = np.eye(N, dtype=bool)[:, :, None] & zero_shift[None, None, :]
-        valid = (dist < cutoff) & (dist > 1e-10) & ~self_mask
-        idx_i, idx_j, idx_s = np.where(valid)
-        return idx_i.astype(np.int64), idx_j.astype(np.int64), disp[idx_i, idx_j, idx_s]
-
-    zero_shift = np.all(shifts_frac == 0, axis=1)
-    all_i, all_j, all_rij = [], [], []
-    for si in range(S):
-        shifted = positions + shifts_cart[si]
-        disp = shifted[None, :, :] - positions[:, None, :]
-        dist = np.linalg.norm(disp, axis=-1)
-        valid = (dist < cutoff) & (dist > 1e-10)
-        if zero_shift[si]:
-            np.fill_diagonal(valid, False)
-        ii, jj = np.where(valid)
-        if len(ii) > 0:
-            all_i.append(ii)
-            all_j.append(jj)
-            all_rij.append(disp[ii, jj])
-    if not all_i:
-        return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 3), positions.dtype)
-    return (np.concatenate(all_i).astype(np.int64),
-            np.concatenate(all_j).astype(np.int64),
-            np.concatenate(all_rij))
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +480,6 @@ def train_nep(
     # ---- Distributed detection -------------------------------------------
     is_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_ddp:
-        import torch.distributed as dist
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
@@ -545,7 +500,6 @@ def train_nep(
     if is_main:
         os.makedirs(output_dir, exist_ok=True)
     if is_ddp:
-        import torch.distributed as dist
         dist.barrier()
 
     _out_log_file = (open(os.path.join(output_dir, "output.log"),
@@ -560,7 +514,6 @@ def train_nep(
         _out_log_file.flush()
 
     # ---- Banner ----------------------------------------------------------
-    from datetime import datetime
     total_t0 = time.time()
     _log(_BANNER.rstrip())
     _log(f"   torchnep  v{__version__}   author: {_AUTHOR}")
@@ -618,8 +571,7 @@ def train_nep(
     if dev.type == "cuda":
         torch.cuda.synchronize()
         alloc = torch.cuda.memory_allocated() / 1e9
-        rsvd = torch.cuda.memory_reserved() / 1e9
-        _log(f"  GPU memory: alloc {alloc:.2f} GB | reserved {rsvd:.2f} GB "
+        _log(f"  GPU memory (data): {alloc:.2f} GB allocated "
              f"({time.time() - t0:.1f}s)")
         _log(_breakdown_datastore_memory(data_store))
     else:
@@ -648,7 +600,6 @@ def train_nep(
         q_min, q_max = compute_q_scaler(model, data_store, batch_size,
                                         pytorch_only=pytorch_only)
     if is_ddp:
-        import torch.distributed as dist
         dist.broadcast(q_min, 0)
         dist.broadcast(q_max, 0)
     model.set_q_scaler(q_min, q_max)
@@ -658,7 +609,6 @@ def train_nep(
         model = torch.compile(model)
 
     if is_ddp:
-        from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     raw_model = (model.module if is_ddp
                  else (model._orig_mod if hasattr(model, "_orig_mod") else model))
@@ -687,7 +637,6 @@ def train_nep(
             optimizer, mode="min", factor=scheduler_factor,
             patience=scheduler_patience, min_lr=stop_lr)
         if use_swa and is_main:
-            from torch.optim.swa_utils import AveragedModel
             swa_model = AveragedModel(raw_model)
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
@@ -856,7 +805,6 @@ def train_nep(
 
             # DDP: aggregate metrics across ranks
             if is_ddp:
-                import torch.distributed as dist
                 metrics = torch.tensor(
                     [sum_loss, sum_le, sum_lf, sum_lv,
                      float(sum_e_structs), float(sum_f_atoms),
@@ -904,10 +852,8 @@ def train_nep(
                 if epoch == 1 and dev.type == "cuda":
                     peak = torch.cuda.max_memory_allocated() / 1e9
                     alloc = torch.cuda.memory_allocated() / 1e9
-                    rsvd = torch.cuda.memory_reserved() / 1e9
                     _log(f"  GPU memory after epoch 1: "
-                         f"alloc {alloc:.2f} GB | peak {peak:.2f} GB | "
-                         f"reserved {rsvd:.2f} GB")
+                         f"alloc {alloc:.2f} GB | peak {peak:.2f} GB")
 
                 if avg_loss < best_loss:
                     best_loss = avg_loss
@@ -944,7 +890,6 @@ def train_nep(
         nep_file = os.path.join(output_dir, "nep.txt")
         if os.path.exists(nep_file):
             _log("\nRunning prediction on training set...")
-            from .predict import predict_dataset
             predict_dataset(nep_file, data_file, output_dir=output_dir,
                             dtype="float64", device=str(dev))
 
@@ -957,5 +902,4 @@ def train_nep(
         _out_log_file.close()
 
     if is_ddp:
-        import torch.distributed as dist
         dist.destroy_process_group()

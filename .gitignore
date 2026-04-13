@@ -6,3 +6,5 @@
 /example/valid*/*
 /example/run_test*
 /example/bench*
+/build/*
+/profile*

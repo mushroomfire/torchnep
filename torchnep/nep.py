@@ -253,6 +253,89 @@ class NEPCalculator:
             result["descriptor"] = descriptor
         return result
 
+    def compute_batch(self, batch: Dict) -> Dict:
+        """Compute energy, forces, virial for a pre-built batch dict.
+
+        The batch dict must contain pre-cached basis tensors on the device:
+        fk_rad, fkp_rad, d12inv_rad, fk_ang, fkp_ang, d12inv_ang, blm,
+        pair_i_rad, pair_j_rad, rij_rad, pair_i_ang, pair_j_ang, rij_ang,
+        atom_types, struct_idx, N, num_structures.
+        """
+        dtype, device = self.dtype, self.device
+        N = batch["N"]
+
+        # Descriptors from pre-cached basis
+        q, s, gn_ang = ops.compute_descriptors_cached(
+            batch["fk_rad"], batch["fk_ang"], batch["blm"],
+            batch["pair_i_rad"], batch["pair_j_rad"],
+            batch["pair_i_ang"], batch["pair_j_ang"],
+            batch["atom_types"], N,
+            self.c2, getattr(self, "c3", None),
+            self.n_max_radial, self.n_max_angular,
+            self.l_max_3b, self.l_max_4b, self.l_max_5b,
+            self.num_lm, self._c3b, self._c4b, self._c5b,
+            dtype, device,
+            return_intermediates=True,
+            pytorch_only=True,
+        )
+
+        q_scaled = q * self.q_scaler
+
+        # NN forward: compute Ei and Fp = dEi/dq_scaled
+        Ei = torch.zeros(N, dtype=dtype, device=device)
+        Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
+        for t in range(self.num_types):
+            mask = batch["atom_types"] == t
+            if not mask.any():
+                continue
+            qt = q_scaled[mask]
+            # w0[t]: (neurons, dim), b0[t]: (neurons,), w1[t]: (neurons,)
+            z = qt @ self.w0[t].T - self.b0[t]
+            h = torch.tanh(z)
+            Ei[mask] = h @ self.w1[t]
+            tanh_der = 1.0 - h * h
+            Fp[mask] = (self.w1[t] * tanh_der) @ self.w0[t]
+
+        Fp = Fp * self.q_scaler
+        Ei = Ei - self.b1
+
+        # ZBL correction
+        if self.has_zbl:
+            Ei_zbl = ops.compute_zbl(
+                batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
+                batch["rij_ang"], N,
+                self.atomic_numbers, self.zbl_rc_inner, self.zbl_rc_outer,
+                self.zbl_typewise_factor,
+                getattr(self, "zbl_rc_inner_per_type", None),
+                getattr(self, "zbl_rc_outer_per_type", None),
+                dtype, device,
+            )
+            Ei = Ei + Ei_zbl.detach()
+
+        # Per-structure totals
+        Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
+        Etot.scatter_add_(0, batch["struct_idx"], Ei)
+
+        # Analytical forces + virial
+        forces, virial = ops.compute_analytical_forces(
+            Fp, batch["atom_types"], N,
+            self.c2, getattr(self, "c3", None),
+            batch["fkp_rad"], batch["fkp_ang"], batch["blm"],
+            batch["pair_i_rad"], batch["pair_j_rad"],
+            batch["rij_rad"], batch["d12inv_rad"],
+            batch["pair_i_ang"], batch["pair_j_ang"],
+            batch["rij_ang"], batch["d12inv_ang"],
+            s, gn_ang,
+            self.n_max_radial, self.n_max_angular,
+            self.l_max_3b, self.l_max_4b, self.l_max_5b,
+            self.num_lm, self._c3b, self._c4b, self._c5b,
+            dtype, device,
+            compute_virial=True,
+            pytorch_only=True,
+        )
+
+        return {"Ei": Ei, "Etot": Etot, "forces": forces, "virial": virial}
+
     def get_descriptor(self, species, positions, cell):
         """Compute scaled descriptors. Returns (N, dim) numpy."""
         return self.compute(species, positions, cell,

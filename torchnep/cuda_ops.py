@@ -13,8 +13,12 @@ the q_scaler computation path (pytorch_only=False).
 
 import os
 import sys
+import traceback
 import torch
 from typing import Optional
+from torch.utils.cpp_extension import load as _cpp_extension_load
+
+from .ops import chebyshev_basis, chebyshev_basis_and_deriv, angular_basis
 
 
 _kernels = None
@@ -35,7 +39,6 @@ def _load_kernels():
         return None
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_kernels.cu")
         if not os.path.exists(src):
             return None
@@ -44,14 +47,13 @@ def _load_kernels():
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")
-        _kernels = load(
+        _kernels = _cpp_extension_load(
             name="nep_kernels", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
         return _kernels
     except Exception:
         if verbose:
-            import traceback
             traceback.print_exc()
         return None
 
@@ -63,7 +65,6 @@ def _load_kernels():
 def _radial_forward_pytorch(rij, pair_i, pair_j, atom_types, c2,
                             N, n_max_r, basis_r, ntypes, rc):
     """PyTorch radial forward. Returns (q, gnp) where gnp = dfeat_2b."""
-    from .ops import chebyshev_basis_and_deriv
     dim_r = n_max_r + 1
     dtype, device = rij.dtype, rij.device
 
@@ -130,7 +131,6 @@ class NEPRadialDescriptor(torch.autograd.Function):
         # --- grad_c2: recompute fk (basis values) from rij ---
         # d(loss)/d(c2[t1,t2,n,k]) = sum_{p:t1p=t1,t2p=t2} grad_q[pair_i[p],n] * fk[p,k]
         # Recomputing fk ensures exact match with the PyTorch compute_descriptors path.
-        from .ops import chebyshev_basis
         fk = chebyshev_basis(torch.norm(rij, dim=-1), rc, basis_r)  # (P, bs1)
         t1_pairs = atom_types[pair_i]
         t2_pairs = atom_types[pair_j]
@@ -169,8 +169,6 @@ def angular_descriptor_cuda(rij, pair_i, pair_j, atom_types, c3,
     accumulates sum_fxyz without tracking c3 through the computation graph,
     so c3.grad would always be None/zero if we used that kernel here.)
     """
-    from .ops import chebyshev_basis, angular_basis
-
     dij = torch.norm(rij, dim=-1)
     fk = chebyshev_basis(dij, rc, basis_a)                  # (P, bs1)
     t1_pairs = atom_types[pair_i]
@@ -259,7 +257,6 @@ def _load_cached_kernels():
         return None
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
     try:
-        from torch.utils.cpp_extension import load
         src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
         if not os.path.exists(src):
             return None
@@ -268,14 +265,13 @@ def _load_cached_kernels():
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")
-        _cached_kernels = load(
+        _cached_kernels = _cpp_extension_load(
             name="nep_cached", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
         return _cached_kernels
     except Exception:
         if verbose:
-            import traceback
             traceback.print_exc()
         return None
 
@@ -352,7 +348,11 @@ class TypeContraction(torch.autograd.Function):
     """Type-lookup + contraction (no scatter) for cached angular path.
 
     Forward:  CUDA kernel for gn[p,n] = Σ_k c[t1,t2,n,k] * basis[p,k].
-    Backward: CUDA kernel for grad_c[t1,t2,n,k] += grad_gn[p,n] * basis[p,k].
+    Backward: Type-grouped cuBLAS matmul for grad_c (NO atomicAdd).
+              grad_c[t1,t2] = grad_gn[mask].T @ basis[mask]
+              With large P (>100k pairs) atomicAdd to a small grad_c tensor
+              (ntypes²×N_out×K) creates extreme serialization; matmul is
+              10–40x faster in that regime.
 
     Only differentiable w.r.t. c.
     """
@@ -385,25 +385,19 @@ class TypeContraction(torch.autograd.Function):
     def backward(ctx, grad_gn):
         basis, pair_i, pair_j, atom_types = ctx.saved_tensors
         ntypes = ctx.ntypes
-        N_out = ctx.N_out
-        K = ctx.K
 
-        k = _load_cached_kernels()
-        if k is not None and grad_gn.is_cuda:
-            grad_c = k.type_contraction_backward(
-                grad_gn.contiguous(), basis.contiguous(),
-                pair_i, pair_j, atom_types,
-                N_out, K, ntypes)
-        else:
-            # PyTorch fallback: loop-based matmul
-            t1 = atom_types[pair_i]
-            t2 = atom_types[pair_j]
-            grad_c = torch.zeros(ctx.c_shape, dtype=basis.dtype, device=basis.device)
-            for _t1 in range(ntypes):
-                for _t2 in range(ntypes):
-                    _m = (t1 == _t1) & (t2 == _t2)
-                    if _m.any():
-                        grad_c[_t1, _t2] = grad_gn[_m].T @ basis[_m]
+        # Always use type-grouped matmul: grad_c[t1,t2] = grad_gn[mask].T @ basis[mask]
+        # This is O(ntypes²) cuBLAS SGEMM calls — perfectly parallel, no atomicAdd.
+        # The CUDA atomicAdd kernel serializes badly when P >> ntypes²*N_out*K
+        # (e.g. P=500k writing to 1053 locations → ~500 concurrent writes each).
+        t1 = atom_types[pair_i]
+        t2 = atom_types[pair_j]
+        grad_c = torch.zeros(ctx.c_shape, dtype=basis.dtype, device=basis.device)
+        for _t1 in range(ntypes):
+            for _t2 in range(ntypes):
+                _m = (t1 == _t1) & (t2 == _t2)
+                if _m.any():
+                    grad_c[_t1, _t2] = grad_gn[_m].T @ basis[_m]
 
         return None, None, None, None, grad_c
 

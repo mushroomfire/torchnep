@@ -9,7 +9,7 @@ from torchnep import train_nep
 train_nep(
     config_file="nep.in",
     data_file="train.xyz",
-    output_dir="output",
+    output_dir="output_cuda",
     device="cuda",
     pytorch_only=False,
     print_interval=1
@@ -18,7 +18,7 @@ train_nep(
 # train_nep(
 #     config_file="nep.in",
 #     data_file="train.xyz",
-#     output_dir="output",
+#     output_dir="output_analytical",
 #     device="cuda",
 #     pytorch_only=True,
 #     use_autograd_forces=False,
@@ -28,7 +28,7 @@ train_nep(
 # train_nep(
 #     config_file="nep.in",
 #     data_file="train.xyz",
-#     output_dir="output",
+#     output_dir="output_autograd",
 #     device="cuda",
 #     pytorch_only=True,
 #     use_autograd_forces=True,

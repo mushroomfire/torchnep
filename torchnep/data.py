@@ -212,3 +212,54 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("batch_size", 1000)
 
     return params
+
+
+# ---------------------------------------------------------------------------
+# Neighbor list construction (numpy, CPU — shared by training and prediction)
+# ---------------------------------------------------------------------------
+
+def build_neighbor_list_np(positions, cell, cutoff):
+    """Build neighbor list using numpy (for preprocessing). Returns arrays."""
+    N = positions.shape[0]
+    inv_cell = np.linalg.inv(cell)
+
+    n_rep = [int(np.ceil(cutoff / (1.0 / np.linalg.norm(inv_cell[i])))) for i in range(3)]
+
+    a_r = np.arange(-n_rep[0], n_rep[0] + 1)
+    b_r = np.arange(-n_rep[1], n_rep[1] + 1)
+    c_r = np.arange(-n_rep[2], n_rep[2] + 1)
+    shifts_frac = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"), axis=-1)
+    shifts_frac = shifts_frac.reshape(-1, 3).astype(positions.dtype)
+    shifts_cart = shifts_frac @ cell
+    S = shifts_cart.shape[0]
+
+    if N * N * S < 8_000_000:
+        disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
+                - positions[:, None, None, :])
+        dist = np.linalg.norm(disp, axis=-1)
+        zero_shift = np.all(shifts_frac == 0, axis=1)
+        self_mask = np.eye(N, dtype=bool)[:, :, None] & zero_shift[None, None, :]
+        valid = (dist < cutoff) & (dist > 1e-10) & ~self_mask
+        idx_i, idx_j, idx_s = np.where(valid)
+        return idx_i.astype(np.int64), idx_j.astype(np.int64), disp[idx_i, idx_j, idx_s]
+
+    zero_shift = np.all(shifts_frac == 0, axis=1)
+    all_i, all_j, all_rij = [], [], []
+    for si in range(S):
+        shifted = positions + shifts_cart[si]
+        disp = shifted[None, :, :] - positions[:, None, :]
+        dist = np.linalg.norm(disp, axis=-1)
+        valid = (dist < cutoff) & (dist > 1e-10)
+        if zero_shift[si]:
+            np.fill_diagonal(valid, False)
+        ii, jj = np.where(valid)
+        if len(ii) > 0:
+            all_i.append(ii)
+            all_j.append(jj)
+            all_rij.append(disp[ii, jj])
+    if not all_i:
+        return (np.zeros(0, np.int64), np.zeros(0, np.int64),
+                np.zeros((0, 3), positions.dtype))
+    return (np.concatenate(all_i).astype(np.int64),
+            np.concatenate(all_j).astype(np.int64),
+            np.concatenate(all_rij))
