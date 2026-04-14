@@ -438,6 +438,8 @@ def train_nep(
     stage2_pref_f: float = None,
     stage2_pref_v: float = None,
     use_swa: bool = None,
+    finetune_from: str = None,
+    reset_lr: float = None,
 ):
     """Train a NEP model. Single-GPU or multi-GPU (via torchrun).
 
@@ -567,13 +569,31 @@ def train_nep(
 
     # ---- Model -----------------------------------------------------------
     model = NEPModel(config).to(dtype).to(dev)
-    mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
-                        for i in range(data_store.n)
-                        if data_store.has_energy_flag[i]])
-    with torch.no_grad():
-        model.b1.fill_(-mean_epa)
-    _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
-         f"dim={model.dim}, b1 init={model.b1.item():.4f}")
+
+    if finetune_from is not None:
+        # Load pre-trained weights; skip random b1 init from mean_epa.
+        # q_scaler will be recomputed below on the new dataset.
+        ft_path = finetune_from
+        if ft_path.endswith(".pt"):
+            state = torch.load(ft_path, map_location=dev, weights_only=False)
+            # accept either a raw state dict or a checkpoint dict
+            if "model_state" in state:
+                state = state["model_state"]
+            model.load_state_dict(state, strict=True)
+        else:
+            # assume nep.txt
+            model.load_weights_from_nep_txt(ft_path)
+        _log(f"Fine-tuning from: {ft_path}")
+        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+             f"dim={model.dim}, b1 loaded={model.b1.item():.4f}")
+    else:
+        mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
+                            for i in range(data_store.n)
+                            if data_store.has_energy_flag[i]])
+        with torch.no_grad():
+            model.b1.fill_(-mean_epa)
+        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+             f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # q_scaler: compute on rank 0, broadcast in DDP
     _log("Computing q_scaler...")
@@ -626,12 +646,18 @@ def train_nep(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
-    if restart and os.path.exists(ckpt_path):
+    if restart and os.path.exists(ckpt_path) and finetune_from is None:
         start_epoch, best_loss = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
         _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}")
+
+    # Override LR after checkpoint load (useful when resuming with a new lr)
+    if reset_lr is not None:
+        for pg in optimizer.param_groups:
+            pg["lr"] = reset_lr
+        _log(f"LR reset to {reset_lr:.2e}")
 
     n_structs = data_store.n
     has_forces = data_store.has_forces and pref_f > 0

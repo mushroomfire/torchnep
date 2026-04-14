@@ -344,6 +344,79 @@ class NEPModel(nn.Module):
 
         return result
 
+    def load_weights_from_nep_txt(self, path: str):
+        """Load trainable weights from a GPUMD nep.txt file into this model.
+
+        The model architecture (num_types, neuron, n_max, basis_size, l_max)
+        must match the nep.txt file exactly.  The q_scaler is loaded too but
+        will be replaced when ``compute_q_scaler`` runs on the new dataset.
+
+        Typical usage (fine-tuning):
+
+            model = NEPModel(config)          # build from nep.in (same arch)
+            model.load_weights_from_nep_txt("pretrained/nep.txt")
+            # then call train_nep(..., finetune_from="pretrained/nep.txt")
+        """
+        with open(path) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+
+        # Count header lines (non-numeric lines at the top)
+        header_lines = 0
+        for ln in lines:
+            try:
+                float(ln)
+                break
+            except ValueError:
+                header_lines += 1
+
+        vals = [float(ln) for ln in lines[header_lines:]]
+        idx = 0
+        dim = self.dim
+        neurons = self.num_neurons
+
+        for t in range(self.num_types):
+            # w0 stored as (neurons, dim) row-major; model keeps (dim, neurons)
+            n_w0 = neurons * dim
+            w0 = np.array(vals[idx:idx + n_w0]).reshape(neurons, dim).T
+            self.fitting_nets[t].w0.data.copy_(
+                torch.from_numpy(w0.astype(np.float32)))
+            idx += n_w0
+
+            b0 = np.array(vals[idx:idx + neurons])
+            self.fitting_nets[t].b0.data.copy_(
+                torch.from_numpy(b0.astype(np.float32)))
+            idx += neurons
+
+            w1 = np.array(vals[idx:idx + neurons])
+            self.fitting_nets[t].w1.data.copy_(
+                torch.from_numpy(w1.astype(np.float32)))
+            idx += neurons
+
+        # Shared output bias
+        self.b1.data.fill_(vals[idx])
+        idx += 1
+
+        # c_param_2: saved as (n_rad+1, bs_rad+1, nt, nt), model: (nt, nt, n+1, b+1)
+        nt = self.num_types
+        n_c2 = (self.n_max_radial + 1) * (self.basis_size_radial + 1) * nt * nt
+        c2 = np.array(vals[idx:idx + n_c2]).reshape(
+            self.n_max_radial + 1, self.basis_size_radial + 1, nt, nt)
+        self.c_param_2.data.copy_(
+            torch.from_numpy(np.transpose(c2, (2, 3, 0, 1)).astype(np.float32)))
+        idx += n_c2
+
+        if self.c_param_3 is not None:
+            n_c3 = (self.n_max_angular + 1) * (self.basis_size_angular + 1) * nt * nt
+            c3 = np.array(vals[idx:idx + n_c3]).reshape(
+                self.n_max_angular + 1, self.basis_size_angular + 1, nt, nt)
+            self.c_param_3.data.copy_(
+                torch.from_numpy(np.transpose(c3, (2, 3, 0, 1)).astype(np.float32)))
+            idx += n_c3
+
+        # q_scaler (buffer — will be overwritten by compute_q_scaler on new data)
+        q_scaler = np.array(vals[idx:idx + dim])
+        self.q_scaler.copy_(torch.from_numpy(q_scaler.astype(np.float32)))
+
     def save_nep_txt(self, path: str, max_NN_radial: int = 0,
                      max_NN_angular: int = 0):
         """Save model to GPUMD nep4 nep.txt format."""

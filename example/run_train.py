@@ -16,24 +16,24 @@ from torchnep import train_nep
 #     use_compile=True
 # )
 
-train_nep(
-    config_file="nep_AlO.in",
-    data_file="train_AlO.xyz",
-    output_dir="output_analytical_AlO",
-    device="cuda",
-    pytorch_only=True,
-    use_autograd_forces=False,
-    print_interval=1,
-    use_compile=True
-)
-
 # train_nep(
-#     config_file="nep.in",
-#     data_file="train.xyz",
-#     output_dir="output_autograd",
+#     config_file="nep_AlO.in",
+#     data_file="train_AlO.xyz",
+#     output_dir="output_analytical_AlO",
 #     device="cuda",
 #     pytorch_only=True,
-#     use_autograd_forces=True,
+#     use_autograd_forces=False,
 #     print_interval=1,
 #     use_compile=True
 # )
+
+train_nep(
+    config_file="nep_AlO.in",
+    data_file="train_AlO.xyz",
+    output_dir="output_autograd_AlO",
+    device="cuda",
+    pytorch_only=True,
+    use_autograd_forces=True,
+    print_interval=1,
+    use_compile=True
+)

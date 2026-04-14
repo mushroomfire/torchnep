@@ -156,6 +156,124 @@ stage2_lambda_f  100.0
 stage2_lambda_v  10.0
 ```
 
+## Output Files
+
+| File | Contents |
+|------|---------|
+| `nep.txt` | Best-loss model weights (GPUMD-compatible text format) |
+| `nep_final.txt` | Weights at final epoch |
+| `nep_swa.txt` | SWA-averaged model (only when Stage 2 + `use_swa=True`) |
+| `best_model.pt` | Best-loss model as PyTorch state dict |
+| `checkpoint.pt` | Full training state for restart (weights + optimizer + scheduler + epoch) |
+| `loss.out` | Per-epoch metrics: loss, RMSE_E, RMSE_F, RMSE_V, gnorm |
+| `output.log` | Console log saved to file |
+| `energy_predict.out` | Per-structure energy predictions (written at end of training) |
+| `force_predict.out` | Per-atom force predictions |
+| `virial_predict.out` | Per-structure virial predictions |
+
+### Inspecting checkpoints
+
+```python
+import torch
+
+# Best model weights only
+state = torch.load("output/best_model.pt", map_location="cpu")
+print(list(state.keys()))
+# ['c_param_2', 'c_param_3', 'fitting_nets.0.w0', 'fitting_nets.0.b0', ...]
+
+# Full checkpoint (weights + optimizer + epoch)
+ckpt = torch.load("output/checkpoint.pt", map_location="cpu")
+print(ckpt["epoch"], ckpt["best_loss"])
+print(list(ckpt["model_state"].keys()))
+```
+
+## Restart and Fine-tuning
+
+### Restarting a stopped run
+
+Set `restart=True` (the default).  torchnep looks for `checkpoint.pt` in
+`output_dir` and resumes from exactly where training stopped — epoch number,
+learning rate, optimizer momentum, and scheduler state are all restored.
+
+```python
+train_nep("nep.in", "train.xyz", output_dir="output")  # restart=True by default
+```
+
+Works correctly regardless of which stage was active when training stopped.
+
+**What you can change on restart:**
+
+| Parameter | Effect |
+|-----------|--------|
+| `pref_e/f/v`, `lambda_1/2` | Takes effect immediately — loss weights change next epoch |
+| `num_epochs` | Extend training: set higher than original |
+| `batch_size` | Safe to change |
+| `stage2`, `start_stage2` | Can add Stage 2 to a run that didn't have it originally |
+| `lr` | **Ignored** — overridden by checkpoint's optimizer state |
+| Architecture params | **Cannot change** — model dimensions are fixed |
+
+To **force a new learning rate** when restarting (e.g., after LR has decayed to near `stop_lr`):
+
+```python
+train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
+```
+
+### Fine-tuning from a pre-trained model
+
+Load weights from a previous `nep.txt` or `best_model.pt` and train on new data.
+The model architecture (element types, cutoffs, `neuron`, `n_max`, etc.) must be
+identical — use the same `nep.in`.  Element types in the new dataset can be a
+subset of the original types.
+
+```python
+# From nep.txt (GPUMD format)
+train_nep(
+    "nep.in", "new_data.xyz",
+    output_dir="finetune_output",
+    finetune_from="pretrained/nep.txt",
+    lr=1e-3,          # lower LR for fine-tuning
+    num_epochs=200,
+)
+
+# From best_model.pt (PyTorch format)
+train_nep(
+    "nep.in", "new_data.xyz",
+    output_dir="finetune_output",
+    finetune_from="pretrained/best_model.pt",
+    lr=1e-3,
+)
+```
+
+**What happens during fine-tuning:**
+- All trainable weights (`c_param`, fitting net weights, `b1`) are loaded from the pre-trained model
+- `q_scaler` (descriptor normalization) is **recomputed** from the new dataset — this is important because descriptor statistics change with new data
+- A fresh optimizer is created (no momentum carryover from the original training)
+- `checkpoint.pt` from a previous run in `output_dir` is **ignored** when `finetune_from` is set
+
+### nep.txt format
+
+`nep.txt` is a plain-text file readable by GPUMD.  The structure is:
+
+```
+nep4 3 Cr Co Ni          # architecture header
+cutoff 6 4               # hyperparameter lines (several)
+...
+ANN 80 0
+  -1.2345678901e-01      # from here: one float per line
+  ...                    # order: per-type w0/b0/w1, b1, c_param_2, c_param_3, q_scaler
+```
+
+You can load weights from `nep.txt` directly into a model for custom use:
+
+```python
+from torchnep.model import NEPModel
+from torchnep.data import parse_nep_in
+
+config = parse_nep_in("nep.in")
+model = NEPModel(config)
+model.load_weights_from_nep_txt("nep.txt")
+```
+
 ## Training Strategy
 
 Training follows a MACE-inspired two-stage approach:
