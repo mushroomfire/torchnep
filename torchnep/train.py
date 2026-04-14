@@ -24,7 +24,7 @@ from typing import List, Dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
-from .model import NEPModel
+from .model import NEPModel, slim_model
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
@@ -440,6 +440,7 @@ def train_nep(
     use_swa: bool = None,
     finetune_from: str = None,
     reset_lr: float = None,
+    slim_types: bool = False,
 ):
     """Train a NEP model. Single-GPU or multi-GPU (via torchrun).
 
@@ -516,7 +517,8 @@ def train_nep(
                 _log(f"  CUDA kernel {name}: compiled ({dt_k:.0f}s) → {status}")
 
     # ---- Config ----------------------------------------------------------
-    config = parse_nep_in(config_file)
+    orig_config = parse_nep_in(config_file)
+    config = orig_config
     lambda_1 = config.get("lambda_1", 0.0)
     lambda_2 = config.get("lambda_2", 0.0)
 
@@ -547,6 +549,24 @@ def train_nep(
     frames = read_xyz(data_file)
     _log(f"  {len(frames)} structures")
 
+    # slim_types: detect which element types actually appear in the data and
+    # narrow config before building neighbor lists / GPUDataStore / model.
+    # This makes the entire training run faster, not just the output file.
+    _slim_keep = None  # None = no slimming; list = types to keep
+    if slim_types:
+        seen_species = set(s for f in frames for s in f["species"])
+        keep = [t for t in orig_config["type_names"] if t in seen_species]
+        removed = [t for t in orig_config["type_names"] if t not in keep]
+        if removed:
+            _slim_keep = keep
+            config = dict(orig_config)
+            config["type_names"] = keep
+            config["num_types"] = len(keep)
+            _log(f"  slim_types: {orig_config['type_names']} → {keep} "
+                 f"(removing: {removed})")
+        else:
+            _log("  slim_types: all types present in data, nothing to remove")
+
     _log("Building neighbor lists...")
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
@@ -574,18 +594,30 @@ def train_nep(
         # Load pre-trained weights; skip random b1 init from mean_epa.
         # q_scaler will be recomputed below on the new dataset.
         ft_path = finetune_from
-        if ft_path.endswith(".pt"):
-            state = torch.load(ft_path, map_location=dev, weights_only=False)
-            # accept either a raw state dict or a checkpoint dict
-            if "model_state" in state:
-                state = state["model_state"]
-            model.load_state_dict(state, strict=True)
+
+        def _load_weights(target, path):
+            if path.endswith(".pt"):
+                state = torch.load(path, map_location=dev, weights_only=False)
+                if "model_state" in state:
+                    state = state["model_state"]
+                target.load_state_dict(state, strict=True)
+            else:
+                target.load_weights_from_nep_txt(path)
+
+        if _slim_keep is not None:
+            # Load full pre-trained model (orig arch), then slim to current config
+            full_model = NEPModel(orig_config).to(dtype).to(dev)
+            _load_weights(full_model, ft_path)
+            slimmed = slim_model(full_model, config["type_names"])
+            model.load_state_dict(slimmed.state_dict())
+            del full_model, slimmed
+            _log(f"Fine-tuning from: {ft_path}  "
+                 f"[{orig_config['num_types']} → {config['num_types']} types]")
         else:
-            # assume nep.txt
-            model.load_weights_from_nep_txt(ft_path)
-        _log(f"Fine-tuning from: {ft_path}")
+            _load_weights(model, ft_path)
+            _log(f"Fine-tuning from: {ft_path}")
         _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
-             f"dim={model.dim}, b1 loaded={model.b1.item():.4f}")
+             f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
         mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
                             for i in range(data_store.n)

@@ -8,6 +8,7 @@ Uses ops module for core computations (pure PyTorch or CUDA).
 import torch
 import torch.nn as nn
 import numpy as np
+from typing import List
 
 from .constants import (
     ELEMENTS, PI, C3B, C4B, C5B, K_C_SP, ZBL_PARA, COVALENT_RADIUS,
@@ -475,3 +476,75 @@ class NEPModel(nn.Module):
 
         with open(path, "w") as f:
             f.write("\n".join(lines) + "\n")
+
+
+def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
+    """Return a new NEPModel containing only the specified element types.
+
+    Mathematically equivalent to the original for structures that contain
+    only the kept element types.  Parameters for removed types are discarded:
+
+    - ``fitting_nets``: only the nets for kept types are copied
+    - ``c_param_2 / c_param_3``: rows and columns for removed types are dropped
+    - ``b1``, ``q_scaler``: copied unchanged (independent of num_types)
+
+    Parameters
+    ----------
+    model : NEPModel
+        Source model (any number of types).
+    keep_type_names : list[str]
+        Subset of ``model.type_names`` to retain, in any order.
+        The output model uses this order.
+
+    Returns
+    -------
+    NEPModel
+        Smaller model on the same device/dtype as the source.
+    """
+    unknown = [t for t in keep_type_names if t not in model.type_names]
+    if unknown:
+        raise ValueError(f"Types not in source model: {unknown}")
+
+    keep_idx = [model.type_names.index(t) for t in keep_type_names]
+
+    new_config = {
+        "num_types":          len(keep_type_names),
+        "type_names":         list(keep_type_names),
+        "cutoff_radial":      model.rc_radial,
+        "cutoff_angular":     model.rc_angular,
+        "n_max_radial":       model.n_max_radial,
+        "n_max_angular":      model.n_max_angular,
+        "basis_size_radial":  model.basis_size_radial,
+        "basis_size_angular": model.basis_size_angular,
+        "l_max":              [model.l_max_3b, model.l_max_4b, model.l_max_5b],
+        "neuron":             model.num_neurons,
+    }
+    if model.zbl is not None:
+        new_config["zbl"] = model.zbl
+        if getattr(model, "zbl_typewise_factor", None) is not None:
+            new_config["typewise_cutoff_zbl_factor"] = model.zbl_typewise_factor
+
+    dev = model.b1.device
+    dtype = model.b1.dtype
+    new_model = NEPModel(new_config).to(dtype).to(dev)
+
+    # Fitting networks
+    for new_i, old_i in enumerate(keep_idx):
+        src = model.fitting_nets[old_i]
+        dst = new_model.fitting_nets[new_i]
+        dst.w0.data.copy_(src.w0.data)
+        dst.b0.data.copy_(src.b0.data)
+        dst.w1.data.copy_(src.w1.data)
+
+    # Shared bias and q_scaler (independent of num_types)
+    new_model.b1.data.copy_(model.b1.data)
+    new_model.q_scaler.copy_(model.q_scaler)
+
+    # c_param: slice rows and columns for kept types
+    with torch.no_grad():
+        ix = torch.tensor(keep_idx, device=dev)
+        new_model.c_param_2.data.copy_(model.c_param_2.data[ix][:, ix])
+        if new_model.c_param_3 is not None:
+            new_model.c_param_3.data.copy_(model.c_param_3.data[ix][:, ix])
+
+    return new_model

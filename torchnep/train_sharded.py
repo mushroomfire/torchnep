@@ -33,6 +33,7 @@ from . import ops
 from . import __version__
 from .predict import predict_dataset
 from .cuda_ops import _load_kernels, _load_cached_kernels
+from .model import slim_model
 from .train import (
     _BANNER, _AUTHOR,
     _backend_info, _default_device,
@@ -114,6 +115,8 @@ def train_nep_sharded(
     stage2_pref_f: float = None,
     stage2_pref_v: float = None,
     use_swa: bool = None,
+    finetune_from: str = None,
+    slim_types: bool = False,
 ):
     """Data-sharded NEP training.  Must be launched via torchrun.
 
@@ -180,7 +183,8 @@ def train_nep_sharded(
                 _log(f"  CUDA kernel {name}: compiled ({dt_k:.0f}s) → {status}")
 
     # ---- Config ----------------------------------------------------------
-    config = parse_nep_in(config_file)
+    orig_config = parse_nep_in(config_file)
+    config = orig_config
     lambda_1 = config.get("lambda_1", 0.0)
     lambda_2 = config.get("lambda_2", 0.0)
 
@@ -210,6 +214,23 @@ def train_nep_sharded(
     _log("Loading training data...")
     frames = read_xyz(data_file)
     n_total = len(frames)
+
+    # slim_types: all ranks agree on which types to keep (deterministic scan)
+    _slim_keep = None
+    if slim_types:
+        seen_species = set(s for f in frames for s in f["species"])
+        keep = [t for t in orig_config["type_names"] if t in seen_species]
+        removed = [t for t in orig_config["type_names"] if t not in keep]
+        if removed:
+            _slim_keep = keep
+            config = dict(orig_config)
+            config["type_names"] = keep
+            config["num_types"] = len(keep)
+            _log(f"  slim_types: {orig_config['type_names']} → {keep} "
+                 f"(removing: {removed})")
+        else:
+            _log("  slim_types: all types present in data, nothing to remove")
+
     _log(f"  {n_total} structures total → "
          f"rank {rank} loads {len(frames[rank::world_size])}")
 
@@ -259,19 +280,43 @@ def train_nep_sharded(
     # ---- Model -----------------------------------------------------------
     model = NEPModel(config).to(dtype).to(dev)
 
-    # mean_epa: weighted average across all ranks
-    local_epa_sum = sum(
-        data_store.energy[i] / data_store.natoms[i]
-        for i in range(data_store.n) if data_store.has_energy_flag[i]
-    )
-    local_n_e = float(data_store.n_energy)
-    epa_t = torch.tensor([local_epa_sum, local_n_e], device=dev, dtype=torch.float64)
-    dist.all_reduce(epa_t)
-    mean_epa = float(epa_t[0] / epa_t[1]) if epa_t[1] > 0 else 0.0
-    with torch.no_grad():
-        model.b1.fill_(-mean_epa)
-    _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
-         f"dim={model.dim}, b1 init={model.b1.item():.4f}")
+    if finetune_from is not None:
+        def _load_weights(target, path):
+            if path.endswith(".pt"):
+                state = torch.load(path, map_location=dev, weights_only=False)
+                if "model_state" in state:
+                    state = state["model_state"]
+                target.load_state_dict(state, strict=True)
+            else:
+                target.load_weights_from_nep_txt(path)
+
+        if _slim_keep is not None:
+            full_model = NEPModel(orig_config).to(dtype).to(dev)
+            _load_weights(full_model, finetune_from)
+            slimmed = slim_model(full_model, config["type_names"])
+            model.load_state_dict(slimmed.state_dict())
+            del full_model, slimmed
+            _log(f"Fine-tuning from: {finetune_from}  "
+                 f"[{orig_config['num_types']} → {config['num_types']} types]")
+        else:
+            _load_weights(model, finetune_from)
+            _log(f"Fine-tuning from: {finetune_from}")
+        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+             f"dim={model.dim}, b1={model.b1.item():.4f}")
+    else:
+        # mean_epa: weighted average across all ranks
+        local_epa_sum = sum(
+            data_store.energy[i] / data_store.natoms[i]
+            for i in range(data_store.n) if data_store.has_energy_flag[i]
+        )
+        local_n_e = float(data_store.n_energy)
+        epa_t = torch.tensor([local_epa_sum, local_n_e], device=dev, dtype=torch.float64)
+        dist.all_reduce(epa_t)
+        mean_epa = float(epa_t[0] / epa_t[1]) if epa_t[1] > 0 else 0.0
+        with torch.no_grad():
+            model.b1.fill_(-mean_epa)
+        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+             f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # has_forces / has_virial: OR across ranks
     flags_t = torch.tensor(
