@@ -29,7 +29,7 @@ from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_dataset
-from .cuda_ops import _load_kernels, _load_cached_kernels
+from .cuda_ops import _load_cached_kernels
 
 
 # ---------------------------------------------------------------------------
@@ -102,23 +102,18 @@ class GPUDataStore:
         n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
         self.natoms = [int(s["natoms"]) for s in structures]
 
-        at_cat = np.concatenate([np.asarray(s["atom_types"]).astype(np.int64)
-                                 for s in structures])
-        at_all = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
+        # preprocess_structures already returns arrays with the right dtype
+        # (int64 for indices, float32 for rij). Skip the defensive astype —
+        # it was creating an extra copy of every per-frame array.
+        at_cat   = np.concatenate([s["atom_types"]  for s in structures])
+        pi_r_cat = np.concatenate([s["pair_i_rad"]  for s in structures])
+        pj_r_cat = np.concatenate([s["pair_j_rad"]  for s in structures])
+        rij_r_cat = np.concatenate([s["rij_rad"]    for s in structures])
+        pi_a_cat = np.concatenate([s["pair_i_ang"]  for s in structures])
+        pj_a_cat = np.concatenate([s["pair_j_ang"]  for s in structures])
+        rij_a_cat = np.concatenate([s["rij_ang"]    for s in structures])
 
-        pi_r_cat = np.concatenate([np.asarray(s["pair_i_rad"]).astype(np.int64)
-                                   for s in structures])
-        pj_r_cat = np.concatenate([np.asarray(s["pair_j_rad"]).astype(np.int64)
-                                   for s in structures])
-        rij_r_cat = np.concatenate([np.asarray(s["rij_rad"])
-                                    for s in structures]).reshape(-1, 3)
-
-        pi_a_cat = np.concatenate([np.asarray(s["pair_i_ang"]).astype(np.int64)
-                                   for s in structures])
-        pj_a_cat = np.concatenate([np.asarray(s["pair_j_ang"]).astype(np.int64)
-                                   for s in structures])
-        rij_a_cat = np.concatenate([np.asarray(s["rij_ang"])
-                                    for s in structures]).reshape(-1, 3)
+        at_all   = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
 
         pi_r_all = torch.from_numpy(pi_r_cat).to(device=device, non_blocking=True)
         pj_r_all = torch.from_numpy(pj_r_cat).to(device=device, non_blocking=True)
@@ -292,42 +287,78 @@ class GPUDataStore:
 # Preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess_structures(frames, config, dtype=np.float32):
-    """Build neighbor lists for all frames (CPU, serial)."""
+def _preprocess_one_frame(args):
+    """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
+    frame, rc_rad, rc_ang, max_rc, type_names, dtype = args
+    positions = frame["positions"].astype(dtype)
+    cell = frame["cell"].astype(dtype)
+    atom_types = np.array([type_names.index(s) for s in frame["species"]],
+                          dtype=np.int64)
+    pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
+    dij = np.linalg.norm(rij, axis=1)
+    rad_mask = dij < rc_rad
+    ang_mask = dij < rc_ang
+    s = {
+        "natoms": frame["natoms"],
+        "atom_types": atom_types,
+        "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
+        "rij_rad": rij[rad_mask].astype(dtype),
+        "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
+        "rij_ang": rij[ang_mask].astype(dtype),
+    }
+    if "energy" in frame:
+        s["energy"] = frame["energy"]
+    if "forces" in frame:
+        s["forces"] = frame["forces"].astype(dtype)
+    if "virial" in frame:
+        s["virial"] = frame["virial"].astype(dtype)
+    return s
+
+
+def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
+    """Build neighbor lists for all frames, parallelized across CPU cores.
+
+    Per-frame work is embarrassingly parallel. Worker behavior:
+
+    - **Worker count** defaults to ``cpu_count() // LOCAL_WORLD_SIZE`` so
+      DDP ranks on the same node don't oversubscribe CPU cores. Override
+      with ``TORCHNEP_PREPROC_WORKERS`` env var.
+
+    - **Start method** defaults to ``fork`` (fastest). Workers do pure numpy
+      (neighbor list + type lookup) and never touch CUDA, so fork is safe
+      even after the parent has initialized CUDA — same pattern used by
+      PyTorch's ``DataLoader(num_workers>0)``. Override with
+      ``TORCHNEP_MP_START_METHOD=spawn`` on systems where fork-after-CUDA
+      behaves pathologically (rare).
+
+    Disable pooling entirely with ``n_workers=1`` (useful for debugging).
+    """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
 
-    structures = []
-    for frame in frames:
-        positions = frame["positions"].astype(dtype)
-        cell = frame["cell"].astype(dtype)
-        atom_types = np.array([type_names.index(s) for s in frame["species"]],
-                              dtype=np.int64)
+    if n_workers is None:
+        cpu_total = os.cpu_count() or 1
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        n_workers = max(1, cpu_total // local_world)
+        n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
 
-        pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
-        dij = np.linalg.norm(rij, axis=1)
-        rad_mask = dij < rc_rad
-        ang_mask = dij < rc_ang
+    if n_workers <= 1 or len(frames) < 64:
+        return [_preprocess_one_frame((f, rc_rad, rc_ang, max_rc, type_names, dtype))
+                for f in frames]
 
-        s = {
-            "natoms": frame["natoms"],
-            "atom_types": atom_types,
-            "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
-            "rij_rad": rij[rad_mask].astype(dtype),
-            "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
-            "rij_ang": rij[ang_mask].astype(dtype),
-        }
-        if "energy" in frame:
-            s["energy"] = frame["energy"]
-        if "forces" in frame:
-            s["forces"] = frame["forces"].astype(dtype)
-        if "virial" in frame:
-            s["virial"] = frame["virial"].astype(dtype)
-        structures.append(s)
+    import multiprocessing as mp
+    method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
+    try:
+        ctx = mp.get_context(method)
+    except ValueError:
+        ctx = mp.get_context("spawn")
 
-    return structures
+    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
+    chunksize = max(1, len(frames) // (n_workers * 4))
+    with ctx.Pool(n_workers) as pool:
+        return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
 
 
 def compute_max_neighbors(structures):
@@ -504,17 +535,12 @@ def train_nep(
     # first-time compilation is logged clearly and not confused with
     # training time. Cached .so files load instantly on subsequent runs.
     if dev.type == "cuda" and not pytorch_only:
-        for name, loader in [
-            ("nep_kernels", _load_kernels),
-            ("nep_cached", _load_cached_kernels),
-            ("nep_cuda_ops", ops._load_cuda_ops),
-        ]:
-            t0_k = time.time()
-            k = loader()
-            dt_k = time.time() - t0_k
-            status = "OK" if k is not None else "unavailable (PyTorch fallback)"
-            if dt_k > 1.0:  # only log if compilation actually happened
-                _log(f"  CUDA kernel {name}: compiled ({dt_k:.0f}s) → {status}")
+        t0_k = time.time()
+        k = _load_cached_kernels()
+        dt_k = time.time() - t0_k
+        status = "OK" if k is not None else "unavailable (PyTorch fallback)"
+        if dt_k > 1.0:  # only log if compilation actually happened
+            _log(f"  CUDA kernel nep_cached: compiled ({dt_k:.0f}s) → {status}")
 
     # ---- Config ----------------------------------------------------------
     orig_config = parse_nep_in(config_file)

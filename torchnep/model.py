@@ -201,17 +201,9 @@ class NEPModel(nn.Module):
             gr = g_rad
             ga = g_ang
 
-            if self.training:
-                # Must use PyTorch scatter_add (differentiable) during training.
-                # CUDA kernel breaks the autograd graph: forces would have no
-                # gradient, so force/virial loss would give zero gradients.
-                forces, virial = ops.accumulate_forces_virial(
-                    N, pi_rad, pj_rad, rr, gr,
-                    pi_ang, pj_ang, ra, ga, dtype, device)
-            else:
-                forces, virial = ops.accumulate_forces_virial_cuda(
-                    N, pi_rad, pj_rad, rr, gr,
-                    pi_ang, pj_ang, ra, ga, dtype, device)
+            forces, virial = ops.accumulate_forces_virial(
+                N, pi_rad, pj_rad, rr, gr,
+                pi_ang, pj_ang, ra, ga, dtype, device)
             result["forces"] = forces
             if need_virial:
                 result["virial"] = virial

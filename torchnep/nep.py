@@ -242,7 +242,7 @@ class NEPCalculator:
         g_rad = grads[0] if grads[0] is not None else torch.zeros_like(rij_rad)
         g_ang = grads[1] if grads[1] is not None else torch.zeros_like(rij_ang)
 
-        forces, virial = ops.accumulate_forces_virial_cuda(
+        forces, virial = ops.accumulate_forces_virial(
             N, pi_rad, pj_rad, rij_rad.detach(), g_rad.detach(),
             pi_ang, pj_ang, rij_ang.detach(), g_ang.detach(),
             self.dtype, self.device,

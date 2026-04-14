@@ -16,8 +16,7 @@ import os
 import argparse
 import torch
 
-from .cuda_ops import _load_kernels, _load_cached_kernels
-from .ops import _load_cuda_ops
+from .cuda_ops import _load_cached_kernels
 
 
 def build_kernels(verbose: bool = True) -> bool:
@@ -39,20 +38,14 @@ def build_kernels(verbose: bool = True) -> bool:
     print(f"  Device   : {torch.cuda.get_device_name(0)}")
     print()
 
-    kernels = [
-        ("nep_kernels   (radial descriptor forward)", _load_kernels),
-        ("nep_cached    (ScatterContraction + TypeContraction)", _load_cached_kernels),
-        ("nep_cuda_ops  (force/virial accumulation)", _load_cuda_ops),
-    ]
-
-    for name, loader in kernels:
-        print(f"  Compiling {name}...", flush=True)
-        result = loader()
-        if result is not None:
-            print(f"    OK")
-        else:
-            print(f"    FAILED (will fall back to PyTorch at runtime)")
-            success = False
+    print("  Compiling nep_cached (ScatterContraction + TypeContraction)...",
+          flush=True)
+    result = _load_cached_kernels()
+    if result is not None:
+        print("    OK")
+    else:
+        print("    FAILED (will fall back to PyTorch at runtime)")
+        success = False
 
     print()
     if success:

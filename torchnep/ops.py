@@ -1,21 +1,15 @@
 """
 Core NEP operations.
 
-Pure PyTorch implementations with optional CUDA kernel acceleration.
-On CUDA-capable systems, fused kernels are JIT-compiled on first use
-for force/virial accumulation. The descriptor computation uses the
-PyTorch implementation (supports autograd for training).
-
-Falls back to pure PyTorch on CPU/Mac — no CUDA required.
+Pure PyTorch implementations. The cached training path can optionally
+dispatch to CUDA contraction kernels from ``cuda_ops`` — everything else
+is pure PyTorch on both CPU and CUDA.
 """
 
-import os
-import sys
 import torch
 from typing import List, Optional, Tuple
-from torch.utils.cpp_extension import load as _cpp_extension_load
 
-from .constants import PI, K_C_SP, ZBL_PARA
+from .constants import PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B
 
 
 # ---------------------------------------------------------------------------
@@ -85,63 +79,132 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
 
     Returns: fk (P, basis_size+1), fkp (P, basis_size+1).
     fkp[k] = d(fk[k])/d(rij).
+
+    Writes directly into a preallocated (P, basis_size+1) output buffer and
+    keeps only 4 sliding-window scalars (T_{k-2}, T_{k-1}, U_{k-2}, U_{k-1})
+    in memory, instead of materializing all 2*(basis_size+1) intermediate
+    tensors + a final torch.stack copy. On 19M pairs this avoids ~2 GB of
+    GPU→GPU traffic per call.
     """
     rcinv = 1.0 / rc
-    fc = 0.5 * torch.cos(PI * dij * rcinv) + 0.5
-    fcp = -0.5 * PI * rcinv * torch.sin(PI * dij * rcinv)
-    x = 2.0 * (dij * rcinv - 1.0) ** 2 - 1.0
-    dxdr = 4.0 * (dij * rcinv - 1.0) * rcinv  # dx/dr
+    arg = PI * dij * rcinv
+    fc = 0.5 * torch.cos(arg) + 0.5
+    fcp = -0.5 * PI * rcinv * torch.sin(arg)
+    dij_m1 = dij * rcinv - 1.0
+    x = 2.0 * dij_m1 * dij_m1 - 1.0
+    dxdr = 4.0 * dij_m1 * rcinv
 
-    # Chebyshev T and U (second kind for derivatives)
-    T = [torch.ones_like(dij)]
-    U = [torch.ones_like(dij)]  # U_{-1} = 1, but we use U for derivative
-    T.append(x)
-    U.append(2.0 * x)
-    for k in range(2, basis_size + 1):
-        T.append(2.0 * x * T[-1] - T[-2])
-        U.append(2.0 * x * U[-1] - U[-2])
+    P = dij.shape[0]
+    B = basis_size + 1
+    fk  = torch.empty(P, B, dtype=dij.dtype, device=dij.device)
+    fkp = torch.empty(P, B, dtype=dij.dtype, device=dij.device)
 
-    fk_list, fkp_list = [], []
-    for k in range(basis_size + 1):
-        fn_core = 0.5 * (T[k] + 1.0)
-        fk_list.append(fn_core * fc)
-        if k == 0:
-            fkp_list.append(fcp)  # d(fc)/dr
-        elif k == 1:
-            # d/dr [0.5*(x+1)*fc] = 0.5*dx/dr*fc + 0.5*(x+1)*fcp
-            fkp_list.append(0.5 * dxdr * fc + fn_core * fcp)
-        else:
-            # d/dr [fn_core * fc] = dT/dx * dx/dr * 0.5 * fc + fn_core * fcp
-            # dT_k/dx = k * U_{k-1} (Chebyshev derivative formula)
-            dTdx = k * U[k - 1]
-            fkp_list.append(0.5 * dTdx * dxdr * fc + fn_core * fcp)
+    # k = 0: T_0 = 1, so fn_core = 1 → fk[..,0] = fc; fkp[..,0] = fcp
+    fk[:, 0] = fc
+    fkp[:, 0] = fcp
 
-    return torch.stack(fk_list, dim=-1), torch.stack(fkp_list, dim=-1)
+    if B >= 2:
+        # k = 1: T_1 = x, U_0 = 1 → dT_1/dx = 1
+        fn_core1 = 0.5 * (x + 1.0)
+        fk[:, 1] = fn_core1 * fc
+        fkp[:, 1] = 0.5 * dxdr * fc + fn_core1 * fcp
+
+    # Sliding window: T_prev2 = T_{k-2}, T_prev1 = T_{k-1},
+    #                 U_prev2 = U_{k-2}, U_prev1 = U_{k-1}
+    T_prev2 = None  # T_0 = 1 (not needed as tensor; reuse ones trick below)
+    T_prev1 = x     # T_1
+    U_prev2 = None  # U_0 = 1
+    U_prev1 = 2.0 * x   # U_1
+
+    # We need tensors for T_prev2 / U_prev2. Use explicit ones_like just once.
+    T_prev2 = torch.ones_like(dij)   # T_0
+    U_prev2 = torch.ones_like(dij)   # U_0
+
+    for k in range(2, B):
+        T_next = 2.0 * x * T_prev1 - T_prev2     # T_k
+        U_next = 2.0 * x * U_prev1 - U_prev2     # U_k
+        fn_core = 0.5 * (T_next + 1.0)
+        fk[:, k] = fn_core * fc
+        # dT_k/dx = k * U_{k-1} = k * U_prev1  (before we shift)
+        fkp[:, k] = 0.5 * (k * U_prev1) * dxdr * fc + fn_core * fcp
+        T_prev2, T_prev1 = T_prev1, T_next
+        U_prev2, U_prev1 = U_prev1, U_next
+
+    return fk, fkp
+
+
+def _build_xy_powers(x: torch.Tensor, y: torch.Tensor, n_max: int):
+    """Real and imaginary parts of (x + iy)^n for n = 0..n_max.
+
+    Returns two lists of tensors (each shape (P,)): Re[n], Im[n].
+    """
+    Re = [torch.ones_like(x)]
+    Im = [torch.zeros_like(x)]
+    for _ in range(n_max):
+        r_prev, i_prev = Re[-1], Im[-1]
+        # (x + iy) * (r + ii) = (xr - yi) + i(xi + yr)
+        Re.append(x * r_prev - y * i_prev)
+        Im.append(x * i_prev + y * r_prev)
+    return Re, Im
+
+
+def _build_z_powers(z: torch.Tensor, n_max: int):
+    """z^0..z^n_max as a list of tensors."""
+    zp = [torch.ones_like(z)]
+    for _ in range(n_max):
+        zp.append(zp[-1] * z)
+    return zp
+
+
+def _z_factor(z_pow, coeff_row, start, stop):
+    """Sum_{n2 = start, start+2, ..., stop-1} coeff_row[n2] * z^n2.
+
+    Skips zero coefficients to save ops. ``start`` matches (L+n1) parity.
+    """
+    out = None
+    n2 = start
+    while n2 < stop:
+        c = coeff_row[n2]
+        if c != 0.0:
+            term = z_pow[n2] if c == 1.0 else (c * z_pow[n2])
+            out = term if out is None else out + term
+        n2 += 2
+    if out is None:
+        return torch.zeros_like(z_pow[0])
+    return out
 
 
 def angular_basis(x: torch.Tensor, y: torch.Tensor,
                   z: torch.Tensor, l_max_3b: int) -> torch.Tensor:
-    """Solid harmonics basis Y_{lm}. Returns: (P, num_lm)."""
-    x2, y2, z2 = x * x, y * y, z * z
-    x2my2 = x2 - y2
+    """Solid-harmonics-style angular basis Y_{Ln1} for L = 1..l_max_3b.
+
+    Each basis element is z_factor(z) · {Re or Im}[(x + iy)^n1], using the
+    polynomial coefficients in ``Z_COEFFICIENT``. Bit-identical to the
+    previous hand-coded formulas for l_max_3b ≤ 4.
+
+    Returns: (P, num_lm) with num_lm = sum_{L=1}^{l_max_3b}(2L + 1).
+    """
+    if l_max_3b < 1:
+        return torch.zeros(x.shape[0], 0, dtype=x.dtype, device=x.device)
+    if l_max_3b > MAX_L3B:
+        raise ValueError(f"l_max_3b={l_max_3b} exceeds MAX_L3B={MAX_L3B}")
+
+    z_pow = _build_z_powers(z, l_max_3b)
+    Re, Im = _build_xy_powers(x, y, l_max_3b)
+
     blm = []
-    if l_max_3b >= 1:
-        blm.extend([z, x, y])
-    if l_max_3b >= 2:
-        blm.extend([3.0*z2 - 1.0, x*z, y*z, x2my2, 2.0*x*y])
-    if l_max_3b >= 3:
-        blm.extend([
-            (5.0*z2 - 3.0)*z, (5.0*z2 - 1.0)*x, (5.0*z2 - 1.0)*y,
-            x2my2*z, 2.0*x*y*z, x*(x2 - 3.0*y2), y*(3.0*x2 - y2),
-        ])
-    if l_max_3b >= 4:
-        blm.extend([
-            (35.0*z2 - 30.0)*z2 + 3.0, (7.0*z2 - 3.0)*x*z,
-            (7.0*z2 - 3.0)*y*z, (7.0*z2 - 1.0)*x2my2,
-            (7.0*z2 - 1.0)*2.0*x*y, z*x*(x2 - 3.0*y2),
-            z*y*(3.0*x2 - y2), x2my2*x2my2 - 4.0*x2*y2,
-            4.0*x*y*x2my2,
-        ])
+    for L in range(1, l_max_3b + 1):
+        Z = Z_COEFFICIENT[L]
+        for n1 in range(L + 1):
+            parity = (L + n1) % 2
+            start = parity               # 0 if L+n1 even, 1 if odd
+            stop = L - n1 + 1
+            zf = _z_factor(z_pow, Z[n1], start, stop)
+            if n1 == 0:
+                blm.append(zf)
+            else:
+                blm.append(zf * Re[n1])
+                blm.append(zf * Im[n1])
     return torch.stack(blm, dim=-1)
 
 
@@ -165,31 +228,20 @@ def compute_descriptors(
     """
     ntypes = int(c2.shape[0]) if c2.shape[0] != n_max_radial + 1 else int(c2.shape[2])
 
-    # --- Radial (CUDA-accelerated when available) ---
-    use_cuda_rad = (not pytorch_only and rij_rad.is_cuda and c2.shape[0] == ntypes
-                    and c2.shape[0] != n_max_radial + 1)
-    if use_cuda_rad:
-        try:
-            q_rad = radial_descriptor_cuda(
-                rij_rad, pi_rad, pj_rad, atom_types, c2,
-                N, n_max_radial, basis_size_radial, ntypes, rc_radial)
-        except Exception:
-            use_cuda_rad = False
-
-    if not use_cuda_rad:
-        dij_rad = torch.norm(rij_rad, dim=-1)
-        fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
-        t1r = atom_types[pi_rad]
-        t2r = atom_types[pj_rad]
-        # Type-pair matmul loop: avoids atomic scatter in backward (38x faster)
-        q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
-        for _t1 in range(ntypes):
-            for _t2 in range(ntypes):
-                _m = (t1r == _t1) & (t2r == _t2)
-                if not _m.any():
-                    continue
-                _gn = fk_rad[_m] @ c2[_t1, _t2].T
-                q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
+    # --- Radial ---
+    dij_rad = torch.norm(rij_rad, dim=-1)
+    fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
+    t1r = atom_types[pi_rad]
+    t2r = atom_types[pj_rad]
+    # Type-pair matmul loop: avoids atomic scatter in backward (38x faster)
+    q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
+    for _t1 in range(ntypes):
+        for _t2 in range(ntypes):
+            _m = (t1r == _t1) & (t2r == _t2)
+            if not _m.any():
+                continue
+            _gn = fk_rad[_m] @ c2[_t1, _t2].T
+            q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
 
     parts = [q_rad]
 
@@ -207,77 +259,60 @@ def compute_descriptors(
             parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
-        # Try CUDA angular descriptor (autograd.Function with CUDA forward+backward)
-        use_cuda_ang = (not pytorch_only and rij_ang.is_cuda and c3 is not None
-                        and c3.shape[0] == ntypes)
-        if use_cuda_ang:
-            try:
-                q_ang = angular_descriptor_cuda(
-                    rij_ang, pi_ang, pj_ang, atom_types, c3,
-                    N, n_ap1, basis_size_angular, ntypes, num_lm,
-                    l_max_3b, num_L_total, rc_angular,
-                    c3b_coeffs, c4b_coeffs, c5b_coeffs)
-                parts.append(q_ang)
-                use_cuda_ang = True
-            except Exception:
-                use_cuda_ang = False
+        dij_ang = torch.norm(rij_ang, dim=-1)
+        fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
+        t1a = atom_types[pi_ang]
+        t2a = atom_types[pj_ang]
+        # Type-pair matmul loop (same optimization as radial)
+        gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
+        for _t1 in range(ntypes):
+            for _t2 in range(ntypes):
+                _m = (t1a == _t1) & (t2a == _t2)
+                if not _m.any():
+                    continue
+                gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
+        d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
+        blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,
+                            rij_ang[:, 2]*d12inv, l_max_3b)
+        gn_blm = gn_ang.unsqueeze(-1) * blm.unsqueeze(1)
+        s = torch.zeros(N, n_ap1, num_lm, dtype=dtype, device=device)
+        s.scatter_add_(0, pi_ang.unsqueeze(-1).unsqueeze(-1).expand_as(gn_blm),
+                       gn_blm)
 
-        if not use_cuda_ang:
-            # PyTorch fallback
-            dij_ang = torch.norm(rij_ang, dim=-1)
-            fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
-            t1a = atom_types[pi_ang]
-            t2a = atom_types[pj_ang]
-            # Type-pair matmul loop (same optimization as radial)
-            gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
-            for _t1 in range(ntypes):
-                for _t2 in range(ntypes):
-                    _m = (t1a == _t1) & (t2a == _t2)
-                    if not _m.any():
-                        continue
-                    gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
-            d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
-            blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,
-                                rij_ang[:, 2]*d12inv, l_max_3b)
-            gn_blm = gn_ang.unsqueeze(-1) * blm.unsqueeze(1)
-            s = torch.zeros(N, n_ap1, num_lm, dtype=dtype, device=device)
-            s.scatter_add_(0, pi_ang.unsqueeze(-1).unsqueeze(-1).expand_as(gn_blm),
-                           gn_blm)
+        # 3-body q
+        q_3b_list = []
+        for li in range(l_max_3b):
+            L = li + 1
+            nt = 2 * L + 1
+            st = L * L - 1
+            c = c3b_coeffs[st:st + nt]
+            sb2 = s[:, :, st:st + nt] ** 2
+            ql = c[0] * sb2[:, :, 0]
+            if nt > 1:
+                ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
+            q_3b_list.append(ql)
+        q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
+        parts.append(q_3b)
 
-            # 3-body q (PyTorch fallback path)
-            q_3b_list = []
-            for li in range(l_max_3b):
-                L = li + 1
-                nt = 2 * L + 1
-                st = L * L - 1
-                c = c3b_coeffs[st:st + nt]
-                sb2 = s[:, :, st:st + nt] ** 2
-                ql = c[0] * sb2[:, :, 0]
-                if nt > 1:
-                    ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
-                q_3b_list.append(ql)
-            q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
-            parts.append(q_3b)
+        # 4-body
+        if l_max_4b > 0:
+            s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
+            s22r, s22i = s[:, :, 6], s[:, :, 7]
+            cb = c4b_coeffs
+            q4 = (cb[0]*s20**3
+                  + cb[1]*s20*(s21r**2 + s21i**2)
+                  + cb[2]*s20*(s22r**2 + s22i**2)
+                  + cb[3]*s22r*(s21i**2 - s21r**2)
+                  + cb[4]*s21r*s21i*s22i)
+            parts.append(q4)
 
-            # 4-body
-            if l_max_4b > 0:
-                s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
-                s22r, s22i = s[:, :, 6], s[:, :, 7]
-                cb = c4b_coeffs
-                q4 = (cb[0]*s20**3
-                      + cb[1]*s20*(s21r**2 + s21i**2)
-                      + cb[2]*s20*(s22r**2 + s22i**2)
-                      + cb[3]*s22r*(s21i**2 - s21r**2)
-                      + cb[4]*s21r*s21i*s22i)
-                parts.append(q4)
-
-            # 5-body
-            if l_max_5b > 0:
-                s0sq = s[:, :, 0] ** 2
-                s1sq = s[:, :, 1] ** 2 + s[:, :, 2] ** 2
-                cb = c5b_coeffs
-                q5 = cb[0]*s0sq**2 + cb[1]*s0sq*s1sq + cb[2]*s1sq**2
-                parts.append(q5)
+        # 5-body
+        if l_max_5b > 0:
+            s0sq = s[:, :, 0] ** 2
+            s1sq = s[:, :, 1] ** 2 + s[:, :, 2] ** 2
+            cb = c5b_coeffs
+            q5 = cb[0]*s0sq**2 + cb[1]*s0sq*s1sq + cb[2]*s1sq**2
+            parts.append(q5)
 
     return torch.cat(parts, dim=-1)
 
@@ -685,82 +720,69 @@ def compute_analytical_forces(
 
 
 def _compute_dblm_dhat(x, y, z, l_max_3b):
-    """Compute derivatives of angular basis wrt unit direction (x_hat,y_hat,z_hat).
+    """Derivatives of ``angular_basis`` wrt unit direction (x̂, ŷ, ẑ).
 
-    Returns: (P, num_lm, 3) where [..., 0/1/2] = d/d(x_hat/y_hat/z_hat).
+    For a basis element blm = z_factor(z) · C(x, y) where
+      C = 1              (n1 = 0)
+      C = Re[(x+iy)^n1]  (n1 > 0, real  component)
+      C = Im[(x+iy)^n1]  (n1 > 0, imag component)
+    the gradients are:
+      ∂blm/∂x = z_factor(z)        · ∂C/∂x
+      ∂blm/∂y = z_factor(z)        · ∂C/∂y
+      ∂blm/∂z = z_factor'(z)       · C
+    with ∂Re_n/∂x =  n·Re_{n-1},  ∂Im_n/∂x =  n·Im_{n-1},
+         ∂Re_n/∂y = -n·Im_{n-1},  ∂Im_n/∂y =  n·Re_{n-1}.
+
+    Returns: (P, num_lm, 3) where [..., 0/1/2] = d/d(x̂, ŷ, ẑ).
+    Bit-identical to the old hand-coded implementation for l_max_3b ≤ 4.
     """
-    P = x.shape[0]
-    device, dtype = x.device, x.dtype
-    x2, y2, z2 = x*x, y*y, z*z
+    if l_max_3b < 1:
+        return torch.zeros(x.shape[0], 0, 3, dtype=x.dtype, device=x.device)
+    if l_max_3b > MAX_L3B:
+        raise ValueError(f"l_max_3b={l_max_3b} exceeds MAX_L3B={MAX_L3B}")
 
-    derivs = []  # list of (P, 3) tensors
+    z_pow = _build_z_powers(z, l_max_3b)
+    # Need (x+iy)^n for n = 0..l_max_3b-1 (max n1-1) + (x+iy)^n1 for n1 up to l_max_3b
+    Re, Im = _build_xy_powers(x, y, l_max_3b)
 
-    if l_max_3b >= 1:
-        # blm[0] = z  → dz/d(x,y,z) = (0,0,1)
-        derivs.append(torch.stack([torch.zeros(P,device=device,dtype=dtype),
-                                   torch.zeros(P,device=device,dtype=dtype),
-                                   torch.ones(P,device=device,dtype=dtype)], -1))
-        # blm[1] = x  → (1,0,0)
-        derivs.append(torch.stack([torch.ones(P,device=device,dtype=dtype),
-                                   torch.zeros(P,device=device,dtype=dtype),
-                                   torch.zeros(P,device=device,dtype=dtype)], -1))
-        # blm[2] = y  → (0,1,0)
-        derivs.append(torch.stack([torch.zeros(P,device=device,dtype=dtype),
-                                   torch.ones(P,device=device,dtype=dtype),
-                                   torch.zeros(P,device=device,dtype=dtype)], -1))
+    zeros = torch.zeros_like(x)
+    derivs = []  # list of (P, 3)
 
-    if l_max_3b >= 2:
-        # 3z²-1 → (0, 0, 6z)
-        derivs.append(torch.stack([torch.zeros(P,device=device,dtype=dtype),
-                                   torch.zeros(P,device=device,dtype=dtype),
-                                   6*z], -1))
-        # xz → (z, 0, x)
-        derivs.append(torch.stack([z, torch.zeros(P,device=device,dtype=dtype), x], -1))
-        # yz → (0, z, y)
-        derivs.append(torch.stack([torch.zeros(P,device=device,dtype=dtype), z, y], -1))
-        # x²-y² → (2x, -2y, 0)
-        derivs.append(torch.stack([2*x, -2*y, torch.zeros(P,device=device,dtype=dtype)], -1))
-        # 2xy → (2y, 2x, 0)
-        derivs.append(torch.stack([2*y, 2*x, torch.zeros(P,device=device,dtype=dtype)], -1))
+    for L in range(1, l_max_3b + 1):
+        Z = Z_COEFFICIENT[L]
+        for n1 in range(L + 1):
+            parity = (L + n1) % 2
+            start = parity
+            stop = L - n1 + 1
+            zf = _z_factor(z_pow, Z[n1], start, stop)
+            # z_factor'(z) = sum n2 * coeff[n2] * z^{n2-1}, iterating the same
+            # parity as z_factor (start, start+2, ...); only n2>=1 contributes.
+            zfp = None
+            n2 = start
+            while n2 < stop:
+                if n2 >= 1:
+                    c = Z[n1][n2]
+                    if c != 0.0:
+                        term = (n2 * c) * z_pow[n2 - 1]
+                        zfp = term if zfp is None else zfp + term
+                n2 += 2
+            if zfp is None:
+                zfp = zeros
 
-    if l_max_3b >= 3:
-        z0 = torch.zeros(P, device=device, dtype=dtype)
-        # (5z²-3)z → (0, 0, 15z²-3)
-        derivs.append(torch.stack([z0, z0, 15*z2-3], -1))
-        # (5z²-1)x → (5z²-1, 0, 10xz)
-        derivs.append(torch.stack([5*z2-1, z0, 10*x*z], -1))
-        # (5z²-1)y → (0, 5z²-1, 10yz)
-        derivs.append(torch.stack([z0, 5*z2-1, 10*y*z], -1))
-        # (x²-y²)z → (2xz, -2yz, x²-y²)
-        derivs.append(torch.stack([2*x*z, -2*y*z, x2-y2], -1))
-        # 2xyz → (2yz, 2xz, 2xy)
-        derivs.append(torch.stack([2*y*z, 2*x*z, 2*x*y], -1))
-        # x(x²-3y²) → (3x²-3y², -6xy, 0)
-        derivs.append(torch.stack([3*x2-3*y2, -6*x*y, z0], -1))
-        # y(3x²-y²) → (6xy, 3x²-3y², 0)
-        derivs.append(torch.stack([6*x*y, 3*x2-3*y2, z0], -1))
-
-    if l_max_3b >= 4:
-        z0 = torch.zeros(P, device=device, dtype=dtype)
-        # (35z⁴-30z²+3) → (0, 0, 140z³-60z)
-        derivs.append(torch.stack([z0, z0, 140*z2*z-60*z], -1))
-        # (7z²-3)xz → ((7z²-3)z, 0, x(21z²-3))
-        derivs.append(torch.stack([(7*z2-3)*z, z0, x*(21*z2-3)], -1))
-        # (7z²-3)yz → (0, (7z²-3)z, y(21z²-3))
-        derivs.append(torch.stack([z0, (7*z2-3)*z, y*(21*z2-3)], -1))
-        # (7z²-1)(x²-y²) → (2x(7z²-1), -2y(7z²-1), 14z(x²-y²))
-        derivs.append(torch.stack([2*x*(7*z2-1), -2*y*(7*z2-1), 14*z*(x2-y2)], -1))
-        # (7z²-1)*2xy → (2y(7z²-1), 2x(7z²-1), 28xyz)
-        derivs.append(torch.stack([2*y*(7*z2-1), 2*x*(7*z2-1), 28*x*y*z], -1))
-        # zx(x²-3y²) → (z(3x²-3y²), -6xyz, x(x²-3y²))
-        derivs.append(torch.stack([z*(3*x2-3*y2), -6*x*y*z, x*(x2-3*y2)], -1))
-        # zy(3x²-y²) → (6xyz, z*(3x²-3y²), y*(3*x2-y2))
-        derivs.append(torch.stack([6*x*y*z, z*(3*x2-3*y2), y*(3*x2-y2)], -1))
-        # (x²-y²)²-4x²y² → (4x(x²-y²)-8xy², -4y(x²-y²)-8x²y, 0)
-        #  = (4x³-4xy²-8xy², -4x²y+4y³-8x²y, 0) = (4x³-12xy², 4y³-12x²y, 0)
-        derivs.append(torch.stack([4*x*(x2-3*y2), 4*y*(y2-3*x2), z0], -1))
-        # 4xy(x²-y²) → (4y(3x²-y²), 4x(x²-3y²), 0)
-        derivs.append(torch.stack([4*y*(3*x2-y2), 4*x*(x2-3*y2), z0], -1))
+            if n1 == 0:
+                # blm = zf(z). dx=0, dy=0, dz=zf'(z)
+                derivs.append(torch.stack([zeros, zeros, zfp], dim=-1))
+            else:
+                # real component
+                dRe_dx = n1 * Re[n1 - 1]
+                dRe_dy = -n1 * Im[n1 - 1]
+                derivs.append(torch.stack(
+                    [zf * dRe_dx, zf * dRe_dy, zfp * Re[n1]], dim=-1))
+                # imag component
+                dIm_dx = n1 * Im[n1 - 1]
+                dIm_dy = n1 * Re[n1 - 1]
+                derivs.append(torch.stack(
+                    [zf * dIm_dx, zf * dIm_dy, zfp * Im[n1]], dim=-1))
 
     return torch.stack(derivs, dim=1)  # (P, num_lm, 3)
 
@@ -795,74 +817,13 @@ def accumulate_forces_virial(
 
 
 # ---------------------------------------------------------------------------
-# CUDA kernel loading (optional — falls back to PyTorch on CPU/Mac)
-# ---------------------------------------------------------------------------
-
-_cuda_ops = None
-
-
-def _load_cuda_ops():
-    """Compile the force/virial scatter CUDA kernel (cached after first compilation)."""
-    global _cuda_ops
-    if _cuda_ops is not None:
-        return _cuda_ops
-    if not torch.cuda.is_available():
-        return None
-    # ninja PATH is set by cuda_ops._ensure_ninja_in_path() at import time
-    try:
-        csrc = os.path.join(os.path.dirname(__file__), "csrc", "nep_ops.cu")
-        if not os.path.exists(csrc):
-            return None
-        extra_cflags = []
-        extra_cuda = ["-O3", "--use_fast_math"]
-        if sys.platform == "win32":
-            extra_cflags = ["/permissive-"]
-            extra_cuda.append("-Xcompiler=/permissive-")
-        _cuda_ops = _cpp_extension_load(name="nep_cuda_ops", sources=[csrc], verbose=False,
-                         extra_cflags=extra_cflags,
-                         extra_cuda_cflags=extra_cuda)
-        return _cuda_ops
-    except Exception:
-        return None
-
-
-def accumulate_forces_virial_cuda(
-    N, pi_rad, pj_rad, rij_rad, g_rad,
-    pi_ang, pj_ang, rij_ang, g_ang,
-    dtype, device,
-):
-    """CUDA-accelerated force/virial accumulation."""
-    cuda = _load_cuda_ops()
-    if cuda is None or device.type != "cuda":
-        return accumulate_forces_virial(
-            N, pi_rad, pj_rad, rij_rad, g_rad,
-            pi_ang, pj_ang, rij_ang, g_ang, dtype, device)
-
-    # Concatenate radial + angular pairs
-    rij_all = torch.cat([rij_rad, rij_ang], dim=0)
-    g_all = torch.cat([g_rad, g_ang], dim=0)
-    pi_all = torch.cat([pi_rad, pi_ang], dim=0)
-    pj_all = torch.cat([pj_rad, pj_ang], dim=0)
-
-    forces, virial = cuda.force_virial(rij_all, g_all, pi_all, pj_all, N)
-    return forces, virial
-
-
-# ---------------------------------------------------------------------------
-# Optional CUDA descriptor ops — imported after all function definitions to
-# break the circular dependency: cuda_ops.py imports from ops.py.
+# Optional CUDA contraction ops (cached training path).
+# Imported at the bottom to break circular dependency (cuda_ops imports ops).
 # ---------------------------------------------------------------------------
 
 try:
-    from .cuda_ops import (  # noqa: E402
-        radial_descriptor_cuda,
-        angular_descriptor_cuda,
-        scatter_contraction,
-        type_contraction,
-    )
+    from .cuda_ops import scatter_contraction, type_contraction  # noqa: E402
 except Exception:
-    radial_descriptor_cuda = None   # type: ignore[assignment]
-    angular_descriptor_cuda = None  # type: ignore[assignment]
     scatter_contraction = None      # type: ignore[assignment]
     type_contraction = None         # type: ignore[assignment]
 

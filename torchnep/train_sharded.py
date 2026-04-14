@@ -32,7 +32,7 @@ from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_dataset
-from .cuda_ops import _load_kernels, _load_cached_kernels
+from .cuda_ops import _load_cached_kernels
 from .model import slim_model
 from .train import (
     _BANNER, _AUTHOR,
@@ -170,17 +170,12 @@ def train_nep_sharded(
 
     # ---- CUDA kernels ----------------------------------------------------
     if not pytorch_only:
-        for name, loader in [
-            ("nep_kernels",  _load_kernels),
-            ("nep_cached",   _load_cached_kernels),
-            ("nep_cuda_ops", ops._load_cuda_ops),
-        ]:
-            t0_k = time.time()
-            k = loader()
-            dt_k = time.time() - t0_k
-            status = "OK" if k is not None else "unavailable (PyTorch fallback)"
-            if dt_k > 1.0:
-                _log(f"  CUDA kernel {name}: compiled ({dt_k:.0f}s) → {status}")
+        t0_k = time.time()
+        k = _load_cached_kernels()
+        dt_k = time.time() - t0_k
+        status = "OK" if k is not None else "unavailable (PyTorch fallback)"
+        if dt_k > 1.0:
+            _log(f"  CUDA kernel nep_cached: compiled ({dt_k:.0f}s) → {status}")
 
     # ---- Config ----------------------------------------------------------
     orig_config = parse_nep_in(config_file)
