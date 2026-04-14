@@ -52,7 +52,7 @@ def _load_kernels():
         if not os.path.exists(src):
             return None
         extra_cflags = []
-        extra_cuda = ["-O3", "--use_fast_math"]
+        extra_cuda = ["-O3", "--use_fast_math", "-diag-suppress=177"]
         if sys.platform == "win32":
             extra_cflags = ["/permissive-"]
             extra_cuda.append("-Xcompiler=/permissive-")

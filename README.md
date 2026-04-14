@@ -356,15 +356,9 @@ predict_dataset(
 | Analytical PyTorch | default (`pytorch_only=True`) | CPU / CUDA / MPS | Fast |
 | CUDA kernels | `pytorch_only=False` | CUDA only | Fastest |
 
-The CUDA kernel backend uses four hand-written `.cu` files (~1 500 lines) for fused descriptor computation, type contraction, and force/virial accumulation.  It falls back to analytical PyTorch automatically on non-CUDA devices.
+The CUDA kernel backend uses three hand-written `.cu` files for fused descriptor computation, type contraction, and force/virial accumulation.  It falls back to analytical PyTorch automatically on non-CUDA devices.
 
-Benchmark (3 564 atoms, 252 000 radial pairs):
-
-| Backend | Time/epoch | Throughput |
-|---------|-----------|------------|
-| Pure PyTorch | 9 690 ms | 3 structures/s |
-| CUDA kernels | 26.6 ms | 1 126 structures/s |
-| **Speedup** | **363×** | |
+In practice the CUDA kernel backend is **10–20% faster** than analytical PyTorch on typical training workloads — the bottleneck is the MLP forward/backward pass, not the descriptor computation.  The main benefit of `pytorch_only=False` is reduced descriptor memory traffic, not raw throughput.
 
 ---
 
@@ -415,5 +409,4 @@ torchnep/
     nep_kernels.cu      — fused radial+angular descriptor forward+backward
     nep_cached.cu       — type/scatter contraction kernels
     nep_ops.cu          — force/virial accumulation
-    nep_descriptor.cu   — fused radial descriptor + force kernel
 ```
