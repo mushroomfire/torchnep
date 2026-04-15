@@ -518,16 +518,10 @@ def train_nep(
     _log("")
 
     # ---- CUDA kernels -------------------------------------------------------
-    # Compile/load CUDA extension kernels before data loading so any
-    # first-time compilation is logged clearly and not confused with
-    # training time. Cached .so files load instantly on subsequent runs.
+    # First call JIT-compiles nep_cached.cu (~30–90s, one-time); later calls
+    # load from torch's extensions cache instantly.
     if dev.type == "cuda" and not pytorch_only:
-        t0_k = time.time()
-        k = _load_cached_kernels()
-        dt_k = time.time() - t0_k
-        status = "OK" if k is not None else "unavailable (PyTorch fallback)"
-        if dt_k > 1.0:  # only log if compilation actually happened
-            _log(f"  CUDA kernel nep_cached: compiled ({dt_k:.0f}s) → {status}")
+        _load_cached_kernels()
 
     # ---- Config ----------------------------------------------------------
     orig_config = parse_nep_in(config_file)

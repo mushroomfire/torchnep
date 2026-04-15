@@ -31,10 +31,14 @@ def _ensure_ninja_in_path():
 
 
 def _load_cached_kernels():
-    """Compile scatter_/type_contraction CUDA kernels (cached after first use).
+    """Compile (first call) or load (cached) the CUDA contraction kernels.
 
-    Set TORCHNEP_NO_CUDA_KERNELS=1 to force pure-PyTorch fallback.
-    Set TORCHNEP_VERBOSE_BUILD=1 to see nvcc output during compilation.
+    In DDP / torchrun setups, ONLY rank 0 should call this first. Other ranks
+    must wait on a ``dist.barrier()`` and then call afterwards so they pick
+    up the cached ``.so`` without racing on the torch-extensions cache.
+
+    Set ``TORCHNEP_NO_CUDA_KERNELS=1`` to force pure-PyTorch fallback.
+    Set ``TORCHNEP_VERBOSE_BUILD=1`` to stream nvcc output during compilation.
     """
     global _cached_kernels
     if _cached_kernels is not None:
@@ -43,21 +47,39 @@ def _load_cached_kernels():
         return None
     if not torch.cuda.is_available():
         return None
+
+    src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
+    if not os.path.exists(src):
+        return None
+
     _ensure_ninja_in_path()
     verbose = os.environ.get("TORCHNEP_VERBOSE_BUILD", "0") == "1"
+
+    # Detect whether a JIT compile will actually happen, so we only emit the
+    # "compiling" message on a cold cache. torch's extension dir layout:
+    #   <cache>/nep_cached/nep_cached.so
+    from torch.utils.cpp_extension import _get_build_directory
+    build_dir = _get_build_directory("nep_cached", verbose=False)
+    will_compile = not any(f.endswith(".so") for f in os.listdir(build_dir)) \
+                   if os.path.isdir(build_dir) else True
+    if will_compile:
+        print("Compiling torchnep CUDA kernels (nep_cached.cu) — "
+              "this takes ~30–90 s the first time, then cached forever.",
+              flush=True)
+
+    extra_cflags = []
+    extra_cuda = ["-O3"]
+    if sys.platform == "win32":
+        extra_cflags = ["/permissive-"]
+        extra_cuda.append("-Xcompiler=/permissive-")
+
     try:
-        src = os.path.join(os.path.dirname(__file__), "csrc", "nep_cached.cu")
-        if not os.path.exists(src):
-            return None
-        extra_cflags = []
-        extra_cuda = ["-O3"]
-        if sys.platform == "win32":
-            extra_cflags = ["/permissive-"]
-            extra_cuda.append("-Xcompiler=/permissive-")
         _cached_kernels = _cpp_extension_load(
             name="nep_cached", sources=[src], verbose=verbose,
             extra_cflags=extra_cflags,
             extra_cuda_cflags=extra_cuda)
+        if will_compile:
+            print("  → nep_cached compiled and cached.", flush=True)
         return _cached_kernels
     except Exception:
         if verbose:

@@ -169,13 +169,14 @@ def train_nep_sharded(
     _log("")
 
     # ---- CUDA kernels ----------------------------------------------------
+    # Rank 0 JIT-compiles (if cache is cold) while others wait. After the
+    # barrier all ranks load the same cached .so — no torch-extensions race.
     if not pytorch_only:
-        t0_k = time.time()
-        k = _load_cached_kernels()
-        dt_k = time.time() - t0_k
-        status = "OK" if k is not None else "unavailable (PyTorch fallback)"
-        if dt_k > 1.0:
-            _log(f"  CUDA kernel nep_cached: compiled ({dt_k:.0f}s) → {status}")
+        if is_main:
+            _load_cached_kernels()
+        dist.barrier()
+        if not is_main:
+            _load_cached_kernels()
 
     # ---- Config ----------------------------------------------------------
     orig_config = parse_nep_in(config_file)

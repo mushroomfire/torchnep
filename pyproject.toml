@@ -16,9 +16,6 @@ dependencies = [
 cuda = ["ninja"]
 dev = ["pytest"]
 
-[project.scripts]
-torchnep-build = "torchnep.build_ext:main"
-
 [tool.setuptools.packages.find]
 include = ["torchnep*"]
 

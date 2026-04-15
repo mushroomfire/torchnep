@@ -29,11 +29,8 @@ Optional — `ninja` speeds up CUDA kernel compilation:
 pip install ninja
 ```
 
-Pre-compile CUDA kernels so the first training run starts immediately:
-
-```bash
-torchnep-build
-```
+CUDA kernels (`nep_cached.cu`) are JIT-compiled on the first training run
+(~30–90 s) and cached to `~/.cache/torch_extensions/` for all subsequent runs.
 
 ---
 
@@ -452,7 +449,6 @@ torchnep/
   data.py         — read_xyz, parse_nep_in, build_neighbor_list_np
   ops.py          — basis functions, descriptors, analytical forces (PyTorch)
   cuda_ops.py     — CUDA kernel wrappers (torch.autograd.Function)
-  build_ext.py    — torchnep-build CLI for pre-compiling CUDA kernels
   constants.py    — physical constants, element data, C3B/C4B/C5B, Z_COEFFICIENT
   csrc/
     nep_cached.cu       — type/scatter contraction kernels (only .cu file kept)
