@@ -127,14 +127,14 @@ def train_nep_sharded(
         torchrun --nproc_per_node=N run_train.py
     """
     # ---- Distributed init ------------------------------------------------
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dev = torch.device(f"cuda:{local_rank}")
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", device_id=dev)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
-    dev = torch.device(f"cuda:{local_rank}")
 
     is_main = rank == 0
     dtype = torch.float32 if precision == "float32" else torch.float64
