@@ -459,10 +459,14 @@ def train_nep_sharded(
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                # sum_l* always accumulates the true MSE so rmse_* columns in the
+                # log are real RMSE regardless of huber_delta. The optimizer sees
+                # _loss_fn (Huber or MSE) as the gradient source.
                 if e_mask.any():
+                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
                     loss = loss + cur_pref_e * loss_e
-                    sum_le += loss_e.item() * e_mask.sum().item()
+                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
 
                 if has_forces:
                     f_mask = batch["force_mask"]
@@ -471,7 +475,7 @@ def train_nep_sharded(
                         f_ref = batch["forces"][f_mask]
                         loss_f = _loss_fn(f_pred, f_ref)
                         loss = loss + cur_pref_f * loss_f
-                        sum_lf += loss_f.item() * f_mask.sum().item()
+                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
 
                 if has_virial and "virial" in result:
                     v_mask = batch["virial_mask"]
@@ -484,10 +488,11 @@ def train_nep_sharded(
                         v_ref = batch["virial"]
                         if v_ref.shape[1] == 9:
                             na = batch["natoms"][v_mask].unsqueeze(-1)
-                            loss_v = _loss_fn(v_sys[v_mask] / na,
-                                              v_ref[v_mask] / na)
+                            v_pred_pa = v_sys[v_mask] / na
+                            v_ref_pa = v_ref[v_mask] / na
+                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
-                            sum_lv += loss_v.item() * v_mask.sum().item()
+                            sum_lv += ((v_pred_pa - v_ref_pa) ** 2).mean().item() * v_mask.sum().item()
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())

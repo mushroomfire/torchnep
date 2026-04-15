@@ -1,27 +1,29 @@
 """
-NEP training with PyTorch.
+NEP training with PyTorch — single-GPU / CPU entry point.
 
-Single-GPU and multi-GPU share a single entry point: ``train_nep``.
-Multi-GPU runs are launched via ``torchrun``; the function auto-detects
-the torchrun environment (``WORLD_SIZE``, ``RANK``, ``LOCAL_RANK``) and
-switches into DDP mode. Parameters and outputs are identical in both cases.
+Use ``train_nep`` launched with plain ``python`` for one-GPU, CPU, or Mac
+workloads. For multi-GPU training, use ``train_nep_sharded`` launched with
+``torchrun`` — it shards the dataset across ranks so each GPU only holds
+1/world_size of the structures, enabling datasets much larger than any one
+card's memory.
 
-    # single GPU
-    python run_train.py
+    # single GPU / CPU / Mac
+    python run_train.py                        # calls train_nep(...)
 
-    # multi-GPU (N cards)
-    torchrun --nproc_per_node=N run_train.py
+    # multi-GPU, single node
+    torchrun --standalone --nproc_per_node=N run_train.py   # train_nep_sharded
+
+    # multi-node (via SLURM)
+    see example/run_multi_node.sbatch
 """
 
 import os
 import platform
 import time
 import torch
-import torch.distributed as dist
 import numpy as np
 from datetime import datetime
 from typing import List, Dict
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model
@@ -49,7 +51,11 @@ _AUTHOR = "Yongchao Wu, yongchao.wu@aalto.fi"
 
 
 def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
-    """Describe compute backend for the startup banner."""
+    """Describe compute backend for the startup banner.
+
+    ``world_size`` is used by ``train_nep_sharded`` to surface DDP info;
+    single-GPU ``train_nep`` keeps the default of 1.
+    """
     lines = []
     if dev.type == "cuda":
         n_visible = torch.cuda.device_count()
@@ -473,7 +479,9 @@ def train_nep(
     reset_lr: float = None,
     slim_types: bool = False,
 ):
-    """Train a NEP model. Single-GPU or multi-GPU (via torchrun).
+    """Train a NEP model on a single device (GPU / CPU / MPS).
+
+    For multi-GPU training use ``train_nep_sharded`` launched with torchrun.
 
     Training strategy follows MACE (Batatia et al.):
     - Stage 1: Fixed loss weights + ReduceLROnPlateau (patience=50, factor=0.8).
@@ -481,40 +489,19 @@ def train_nep(
 
     Launch:
         python run_train.py                               # single GPU / CPU
-        torchrun --nproc_per_node=N run_train.py          # N GPUs, DDP
     """
-    # ---- Distributed detection -------------------------------------------
-    is_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
-    if is_ddp:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
-        dev = torch.device(f"cuda:{local_rank}")
-    else:
-        rank, world_size, local_rank = 0, 1, 0
-        if device is None:
-            device = _default_device()
-        dev = torch.device(device)
-
-    is_main = rank == 0
+    # ---- Device ----------------------------------------------------------
+    if device is None:
+        device = _default_device()
+    dev = torch.device(device)
     dtype = torch.float32 if precision == "float32" else torch.float64
 
-    # ---- Logging (rank 0 only) -------------------------------------------
-    if is_main:
-        os.makedirs(output_dir, exist_ok=True)
-    if is_ddp:
-        dist.barrier()
-
-    _out_log_file = (open(os.path.join(output_dir, "output.log"),
-                          "a" if restart else "w")
-                     if is_main else None)
+    # ---- Logging ---------------------------------------------------------
+    os.makedirs(output_dir, exist_ok=True)
+    _out_log_file = open(os.path.join(output_dir, "output.log"),
+                         "a" if restart else "w")
 
     def _log(msg=""):
-        if not is_main:
-            return
         print(msg)
         _out_log_file.write(msg + "\n")
         _out_log_file.flush()
@@ -525,7 +512,7 @@ def train_nep(
     _log(f"   torchnep  v{__version__}   author: {_AUTHOR}")
     _log(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     _log("")
-    for line in _backend_info(dev, world_size):
+    for line in _backend_info(dev):
         _log(line)
     _log(f"Precision: {precision}")
     _log("")
@@ -653,27 +640,16 @@ def train_nep(
         _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
-    # q_scaler: compute on rank 0, broadcast in DDP
     _log("Computing q_scaler...")
-    if is_ddp and not is_main:
-        q_min = torch.zeros(model.dim, dtype=dtype, device=dev)
-        q_max = torch.zeros(model.dim, dtype=dtype, device=dev)
-    else:
-        q_min, q_max = compute_q_scaler(model, data_store, batch_size,
-                                        pytorch_only=pytorch_only)
-    if is_ddp:
-        dist.broadcast(q_min, 0)
-        dist.broadcast(q_max, 0)
+    q_min, q_max = compute_q_scaler(model, data_store, batch_size,
+                                    pytorch_only=pytorch_only)
     model.set_q_scaler(q_min, q_max)
 
     if use_compile and hasattr(torch, "compile"):
         _log("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
-    raw_model = (model.module if is_ddp
-                 else (model._orig_mod if hasattr(model, "_orig_mod") else model))
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=lambda_2, amsgrad=True)
@@ -698,7 +674,7 @@ def train_nep(
         stage2_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=scheduler_factor,
             patience=scheduler_patience, min_lr=stop_lr)
-        if use_swa and is_main:
+        if use_swa:
             swa_model = AveragedModel(raw_model)
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
@@ -721,13 +697,11 @@ def train_nep(
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
 
-    loss_log = None
-    if is_main:
-        loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
-        loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
-        if loss_log_mode == "w":
-            loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
-                           "rmse_v(meV/atom)  gnorm\n")
+    loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
+    loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
+    if loss_log_mode == "w":
+        loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
+                       "rmse_v(meV/atom)  gnorm\n")
 
     backend_str = "pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated"
     force_str = ("autograd (create_graph)" if use_autograd_forces
@@ -756,7 +730,6 @@ def train_nep(
             t_epoch = time.time()
             model.train()
 
-            # Deterministic permutation — same on all ranks in DDP
             g = torch.Generator()
             g.manual_seed(epoch)
             perm = torch.randperm(n_structs, generator=g)
@@ -784,10 +757,6 @@ def train_nep(
 
             batch_starts = list(range(0, n_structs, batch_size))
             for bi, start in enumerate(batch_starts):
-                # DDP: round-robin shard batches across ranks
-                if is_ddp and bi % world_size != rank:
-                    continue
-
                 idx = perm[start:start + batch_size].tolist()
                 batch = data_store.collate(idx)
 
@@ -808,10 +777,14 @@ def train_nep(
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                # sum_l* always accumulates the true MSE so rmse_* columns in the
+                # log are real RMSE regardless of huber_delta. The optimizer sees
+                # _loss_fn (Huber or MSE) as the gradient source.
                 if e_mask.any():
+                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
                     loss = loss + cur_pref_e * loss_e
-                    sum_le += loss_e.item() * e_mask.sum().item()
+                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
 
                 if has_forces:
                     f_mask = batch["force_mask"]
@@ -820,7 +793,7 @@ def train_nep(
                         f_ref = batch["forces"][f_mask]
                         loss_f = _loss_fn(f_pred, f_ref)
                         loss = loss + cur_pref_f * loss_f
-                        sum_lf += loss_f.item() * f_mask.sum().item()
+                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
 
                 if has_virial and "virial" in result:
                     v_mask = batch["virial_mask"]
@@ -833,10 +806,11 @@ def train_nep(
                         v_ref = batch["virial"]
                         if v_ref.shape[1] == 9:
                             na = batch["natoms"][v_mask].unsqueeze(-1)
-                            loss_v = _loss_fn(v_sys[v_mask] / na,
-                                              v_ref[v_mask] / na)
+                            v_pred_pa = v_sys[v_mask] / na
+                            v_ref_pa = v_ref[v_mask] / na
+                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
-                            sum_lv += loss_v.item() * v_mask.sum().item()
+                            sum_lv += ((v_pred_pa - v_ref_pa) ** 2).mean().item() * v_mask.sum().item()
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -859,7 +833,7 @@ def train_nep(
 
                 optimizer.step()
 
-                if in_stage2 and swa_model is not None and is_main:
+                if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
 
                 sum_loss += loss.item()
@@ -868,21 +842,6 @@ def train_nep(
                 sum_v_structs += batch["virial_mask"].sum().item()
                 n_batch += 1
                 max_gn = max(max_gn, gn)
-
-            # DDP: aggregate metrics across ranks
-            if is_ddp:
-                metrics = torch.tensor(
-                    [sum_loss, sum_le, sum_lf, sum_lv,
-                     float(sum_e_structs), float(sum_f_atoms),
-                     float(sum_v_structs), float(n_batch)],
-                    device=dev)
-                dist.all_reduce(metrics)
-                gn_t = torch.tensor(max_gn, device=dev)
-                dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
-                (sum_loss, sum_le, sum_lf, sum_lv,
-                 sum_e_structs, sum_f_atoms, sum_v_structs,
-                 n_batch) = metrics.tolist()
-                max_gn = gn_t.item()
 
             avg_loss = sum_loss / max(n_batch, 1)
             rmse_e = np.sqrt(sum_le / max(sum_e_structs, 1)) * 1000
@@ -897,71 +856,66 @@ def train_nep(
             elif not in_stage2:
                 lr_scheduler.step(avg_loss)
 
-            if is_main:
-                loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} "
-                               f"{rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
-                loss_log.flush()
+            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} "
+                           f"{rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
+            loss_log.flush()
 
-                stage_str = "[S2] " if in_stage2 else ""
-                cur_lr = optimizer.param_groups[0]['lr']
-                v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
-                line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
-                        f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A"
-                        f"{v_str} | gnorm {max_gn:.1f} | "
-                        f"lr {cur_lr:.2e} | {dt:.1f}s")
-                if epoch % print_interval == 0 or epoch == 1:
-                    _log(line)
-                else:
-                    _out_log_file.write(line + "\n")
-                    _out_log_file.flush()
+            stage_str = "[S2] " if in_stage2 else ""
+            cur_lr = optimizer.param_groups[0]['lr']
+            v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
+            line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+                    f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A"
+                    f"{v_str} | gnorm {max_gn:.1f} | "
+                    f"lr {cur_lr:.2e} | {dt:.1f}s")
+            if epoch % print_interval == 0 or epoch == 1:
+                _log(line)
+            else:
+                _out_log_file.write(line + "\n")
+                _out_log_file.flush()
 
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    raw_model.save_nep_txt(
-                        os.path.join(output_dir, "nep.txt"),
-                        max_NN_rad, max_NN_ang)
-                    torch.save(raw_model.state_dict(),
-                               os.path.join(output_dir, "best_model.pt"))
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                raw_model.save_nep_txt(
+                    os.path.join(output_dir, "nep.txt"),
+                    max_NN_rad, max_NN_ang)
+                torch.save(raw_model.state_dict(),
+                           os.path.join(output_dir, "best_model.pt"))
 
-                if epoch % checkpoint_interval == 0 or epoch == num_epochs:
-                    _save_checkpoint(ckpt_path, model, optimizer,
-                                     lr_scheduler, epoch, best_loss)
+            if epoch % checkpoint_interval == 0 or epoch == num_epochs:
+                _save_checkpoint(ckpt_path, model, optimizer,
+                                 lr_scheduler, epoch, best_loss)
     finally:
-        if is_main and loss_log is not None:
+        if loss_log is not None:
             loss_log.close()
 
-    if is_main:
-        raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
+    raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
+                           max_NN_rad, max_NN_ang)
+    if swa_model is not None:
+        swa_state = swa_model.module.state_dict()
+        raw_model.load_state_dict(swa_state)
+        raw_model.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
                                max_NN_rad, max_NN_ang)
-        if swa_model is not None:
-            swa_state = swa_model.module.state_dict()
-            raw_model.load_state_dict(swa_state)
-            raw_model.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
-                                   max_NN_rad, max_NN_ang)
-            torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
-            _log("SWA model saved to nep_swa.txt")
+        torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
+        _log("SWA model saved to nep_swa.txt")
 
-        train_time = time.time() - train_t0
-        h, rem = divmod(train_time, 3600)
-        m_, s = divmod(rem, 60)
-        _log(f"\nDone. Best loss: {best_loss:.6e}")
-        _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
+    train_time = time.time() - train_t0
+    h, rem = divmod(train_time, 3600)
+    m_, s = divmod(rem, 60)
+    _log(f"\nDone. Best loss: {best_loss:.6e}")
+    _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-        nep_file = os.path.join(output_dir, "nep.txt")
-        if os.path.exists(nep_file):
-            _log("\nRunning prediction on training set...")
-            pred_t0 = time.time()
-            predict_dataset(nep_file, data_file, output_dir=output_dir,
-                            dtype="float64", device=str(dev))
-            _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
+    nep_file = os.path.join(output_dir, "nep.txt")
+    if os.path.exists(nep_file):
+        _log("\nRunning prediction on training set...")
+        pred_t0 = time.time()
+        predict_dataset(nep_file, data_file, output_dir=output_dir,
+                        dtype="float64", device=str(dev))
+        _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
-        total_time = time.time() - total_t0
-        h, rem = divmod(total_time, 3600)
-        m_, s = divmod(rem, 60)
-        _log(f"\nTotal time (data + train + predict): "
-             f"{int(h):02d}:{int(m_):02d}:{s:04.1f}")
-        _log(f"Output: {output_dir}/")
-        _out_log_file.close()
-
-    if is_ddp:
-        dist.destroy_process_group()
+    total_time = time.time() - total_t0
+    h, rem = divmod(total_time, 3600)
+    m_, s = divmod(rem, 60)
+    _log(f"\nTotal time (data + train + predict): "
+         f"{int(h):02d}:{int(m_):02d}:{s:04.1f}")
+    _log(f"Output: {output_dir}/")
+    _out_log_file.close()

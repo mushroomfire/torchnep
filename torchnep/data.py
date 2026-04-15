@@ -8,18 +8,67 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 
 
+def _parse_properties_schema(comment: str):
+    """Parse the extended-XYZ ``Properties=...`` field.
+
+    Returns a dict mapping field name → (col_offset_in_numeric_part, width).
+    The species field (type ``S``) is always the first atom-line token and is
+    NOT part of the numeric tail; we record its offset in the full atom-line
+    token list but exclude it from numeric columns.
+
+    Example input segment: ``Properties=species:S:1:pos:R:3:Z:I:1:force:R:3``
+      → {'species': ('S', 0, 1),
+         'pos':     ('R', 0, 3),
+         'Z':       ('I', 3, 1),
+         'force':   ('R', 4, 3)}
+    (pos/Z/force offsets are in the numeric tail, i.e. after the species token.)
+    """
+    key = "Properties="
+    idx = comment.find(key)
+    if idx < 0:
+        return None
+    start = idx + len(key)
+    end = start
+    while end < len(comment) and comment[end] not in (" ", "\t"):
+        end += 1
+    spec = comment[start:end]
+    toks = spec.split(":")
+    # spec has groups of 3: name, type, count
+    if len(toks) % 3 != 0:
+        return None
+    schema = {}
+    numeric_col = 0
+    for i in range(0, len(toks), 3):
+        name, tp, cnt = toks[i], toks[i + 1], int(toks[i + 2])
+        if tp == "S":
+            # species is the text column; does not contribute to numeric tail
+            schema[name] = (tp, 0, cnt)
+        else:
+            schema[name] = (tp, numeric_col, cnt)
+            numeric_col += cnt
+    return schema
+
+
 def _parse_frame_block(block):
-    """Parse one frame from a list of text lines (picklable for mp.Pool)."""
+    """Parse one frame from a list of text lines (picklable for mp.Pool).
+
+    Reads standard extended XYZ with a ``Properties=...`` schema. Recognises
+    ``pos``, ``force`` / ``forces``, and skips any other columns (e.g.
+    ``Z:I:1`` atomic number). Energy / virial / lattice come from the
+    comment-line key=value tags (see ``_parse_comment``).
+    """
     natoms = int(block[0].strip())
     comment = block[1].strip()
     frame = _parse_comment(comment, natoms)
 
-    # Vectorized parse: whitespace split, then fromstring for the numeric cols.
-    # Avoids Python-level float() per atom.
+    schema = _parse_properties_schema(comment)
+    if schema is None or "pos" not in schema:
+        raise ValueError(
+            "extended-xyz parser requires a Properties=... header with "
+            "at least species and pos fields; got: " + comment[:120])
+
     atoms = block[2:2 + natoms]
-    # Fast path: concatenate and use np.fromstring on the numeric tail
     species = [None] * natoms
-    # First column = species (string). Numeric part = everything after first token.
     numeric_parts = []
     ncol_numeric = None
     for j, line in enumerate(atoms):
@@ -35,9 +84,16 @@ def _parse_frame_block(block):
 
     frame["natoms"] = natoms
     frame["species"] = species
-    frame["positions"] = arr[:, :3].copy()
-    if ncol_numeric >= 6:
-        frame["forces"] = arr[:, 3:6].copy()
+
+    _, pos_off, pos_w = schema["pos"]
+    frame["positions"] = arr[:, pos_off:pos_off + pos_w].copy()
+
+    # Force column is conventionally "force" or "forces"; accept either.
+    force_key = "force" if "force" in schema else (
+                "forces" if "forces" in schema else None)
+    if force_key is not None:
+        _, f_off, f_w = schema[force_key]
+        frame["forces"] = arr[:, f_off:f_off + f_w].copy()
     return frame
 
 
