@@ -65,12 +65,14 @@ class NEPModel(nn.Module):
         # ZBL
         self.zbl = config.get("zbl", None)
         if self.zbl is not None:
-            atomic_numbers = [ELEMENTS.index(n) for n in self.type_names]
+            # Real atomic numbers (H=1). ZBL needs physical Z in Z*Z', Z^0.23.
+            atomic_numbers = [ELEMENTS.index(n) + 1 for n in self.type_names]
             self.register_buffer("atomic_numbers",
                                  torch.tensor(atomic_numbers, dtype=torch.long))
             tw = config.get("typewise_cutoff_zbl_factor", None)
             if tw is not None:
-                rc_i = [tw * COVALENT_RADIUS[z] for z in atomic_numbers]
+                # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z → z-1.
+                rc_i = [tw * COVALENT_RADIUS[z - 1] for z in atomic_numbers]
                 self.register_buffer("zbl_rc_inner_per_type", torch.tensor(rc_i))
                 self.register_buffer("zbl_rc_outer_per_type",
                                      torch.tensor([2.0 * r for r in rc_i]))

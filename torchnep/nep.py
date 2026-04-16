@@ -46,7 +46,9 @@ class NEPCalculator:
         self.has_zbl = "zbl" in version_str
         self.num_types = int(header[1])
         self.type_names = header[2 : 2 + self.num_types]
-        self.atomic_numbers = [ELEMENTS.index(n) for n in self.type_names]
+        # Real atomic numbers (Z = 1 for H, 6 for C, ...). ELEMENTS is
+        # 0-indexed, so we add 1. ZBL uses these directly (Z*Z', Z^0.23).
+        self.atomic_numbers = [ELEMENTS.index(n) + 1 for n in self.type_names]
         idx += 1
 
         # ZBL line
@@ -58,9 +60,10 @@ class NEPCalculator:
             idx += 1
 
             if self.zbl_typewise_factor is not None:
-                # Per-type cutoffs
+                # Per-type cutoffs. COVALENT_RADIUS is 0-indexed (H at 0),
+                # while self.atomic_numbers holds real Z (H=1), hence z-1.
                 self.zbl_rc_inner_per_type = torch.tensor(
-                    [self.zbl_typewise_factor * COVALENT_RADIUS[z]
+                    [self.zbl_typewise_factor * COVALENT_RADIUS[z - 1]
                      for z in self.atomic_numbers],
                     dtype=self.dtype, device=self.device)
                 self.zbl_rc_outer_per_type = 2.0 * self.zbl_rc_inner_per_type
@@ -299,18 +302,39 @@ class NEPCalculator:
         Fp = Fp * self.q_scaler
         Ei = Ei - self.b1
 
-        # ZBL correction
+        # ZBL correction (energy + forces/virial via local autograd on rij_ang).
+        # enable_grad: predict_dataset wraps this call in torch.no_grad(),
+        # but ZBL forces need a local autograd pass.
+        zbl_forces = None
+        zbl_virial = None
         if self.has_zbl:
-            Ei_zbl = ops.compute_zbl(
-                batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
-                batch["rij_ang"], N,
-                self.atomic_numbers, self.zbl_rc_inner, self.zbl_rc_outer,
-                self.zbl_typewise_factor,
-                getattr(self, "zbl_rc_inner_per_type", None),
-                getattr(self, "zbl_rc_outer_per_type", None),
-                dtype, device,
-            )
+            with torch.enable_grad():
+                rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
+                Ei_zbl = ops.compute_zbl(
+                    batch["atom_types"], batch["pair_i_ang"],
+                    batch["pair_j_ang"], rij_zbl, N,
+                    self.atomic_numbers,
+                    self.zbl_rc_inner, self.zbl_rc_outer,
+                    self.zbl_typewise_factor,
+                    getattr(self, "zbl_rc_inner_per_type", None),
+                    getattr(self, "zbl_rc_outer_per_type", None),
+                    dtype, device,
+                )
+                if Ei_zbl.requires_grad:
+                    g_zbl = torch.autograd.grad(
+                        Ei_zbl.sum(), rij_zbl, allow_unused=True)[0]
+                else:
+                    g_zbl = None
             Ei = Ei + Ei_zbl.detach()
+            if g_zbl is not None:
+                empty_i = torch.zeros(0, dtype=torch.long, device=device)
+                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
+                zbl_forces, zbl_virial = ops.accumulate_forces_virial(
+                    N, empty_i, empty_i, empty_r, empty_r,
+                    batch["pair_i_ang"], batch["pair_j_ang"],
+                    batch["rij_ang"].detach(), g_zbl.detach(),
+                    dtype, device,
+                )
 
         # Per-structure totals
         Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
@@ -333,6 +357,10 @@ class NEPCalculator:
             compute_virial=True,
             pytorch_only=True,
         )
+        if zbl_forces is not None:
+            forces = forces + zbl_forces
+            if zbl_virial is not None:
+                virial = virial + zbl_virial
 
         return {"Ei": Ei, "Etot": Etot, "forces": forces, "virial": virial}
 

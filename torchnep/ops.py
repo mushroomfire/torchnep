@@ -359,15 +359,11 @@ def compute_zbl(
     dij = torch.norm(rij, dim=-1)
     use_tw = typewise_factor is not None and rc_inner_per_type is not None
 
+    # Coarse cutoff for the initial distance mask. For typewise, the actual
+    # per-pair cutoff may be smaller, so we evaluate tighter cutoffs later.
     if use_tw:
-        t1 = atom_types[pair_i]
-        t2 = atom_types[pair_j]
-        rc_inner = (rc_inner_per_type[t1] + rc_inner_per_type[t2]) * 0.5
-        rc_outer = (rc_outer_per_type[t1] + rc_outer_per_type[t2]) * 0.5
-        max_rc = rc_outer_per_type.max().item()
+        max_rc = min(float(rc_outer_per_type.max().item()), rc_outer_default)
     else:
-        rc_inner = rc_inner_default
-        rc_outer = rc_outer_default
         max_rc = rc_outer_default
 
     mask = dij < max_rc
@@ -377,11 +373,36 @@ def compute_zbl(
     pi, pj = pair_i[mask], pair_j[mask]
     d = dij[mask]
 
+    if use_tw:
+        # NEP_CPU typewise convention (nep.cpp:1795-1801):
+        #   rc_outer_pair = min((cov_i + cov_j) * typewise_factor, rc_outer_default)
+        #   rc_inner      = 0
+        # rc_outer_per_type was built as 2*typewise_factor*cov, so its pair
+        # average equals (cov_i + cov_j) * typewise_factor.
+        t1 = atom_types[pi]
+        t2 = atom_types[pj]
+        rc_outer_pair = (rc_outer_per_type[t1] + rc_outer_per_type[t2]) * 0.5
+        rc_outer = torch.clamp(rc_outer_pair, max=rc_outer_default)
+        rc_inner = torch.zeros_like(rc_outer)
+        # Drop pairs outside the tightened per-pair cutoff
+        tw_mask = d < rc_outer
+        if not tw_mask.all():
+            pi, pj = pi[tw_mask], pj[tw_mask]
+            d = d[tw_mask]
+            rc_inner = rc_inner[tw_mask]
+            rc_outer = rc_outer[tw_mask]
+    else:
+        rc_inner = rc_inner_default
+        rc_outer = rc_outer_default
+
     an = torch.tensor(atomic_numbers_list, dtype=dtype, device=device)
     zi = an[atom_types[pi]]
     zj = an[atom_types[pj]]
 
-    a_inv = (zi ** 0.23 + zj ** 0.23) / 0.46850
+    # Constant must match NEP_CPU's `2.134563` literal to get bit-identical
+    # forward output; 1/0.46850 = 2.1344717… differs at the 4e-5 level,
+    # which accumulates to meV-scale errors on strong ZBL pairs.
+    a_inv = (zi ** 0.23 + zj ** 0.23) * 2.134563
     zizj = K_C_SP * zi * zj
     x = d * a_inv
     phi = (ZBL_PARA[0] * torch.exp(-ZBL_PARA[1] * x)
@@ -389,12 +410,8 @@ def compute_zbl(
            + ZBL_PARA[4] * torch.exp(-ZBL_PARA[5] * x)
            + ZBL_PARA[6] * torch.exp(-ZBL_PARA[7] * x))
 
-    if use_tw:
-        rc_i = rc_inner[mask]
-        rc_o = rc_outer[mask]
-    else:
-        rc_i = rc_inner
-        rc_o = rc_outer
+    rc_i = rc_inner  # per-pair tensor in typewise, scalar otherwise
+    rc_o = rc_outer
 
     fc = torch.zeros_like(d)
     m1 = d < rc_i
@@ -406,9 +423,12 @@ def compute_zbl(
         fc[m2] = 0.5 * torch.cos(PI / (ro - ri) * (d[m2] - ri)) + 0.5
 
     e_pair = zizj * phi / d * fc
+    # Neighbor list is directed: every physical pair (i,j) appears twice
+    # (once as (i,j) and once as (j,i)). Halving the pair energy and
+    # scattering only to pi gives each atom 0.5*e_pair per neighbour and
+    # a total system energy of 1*e_pair per physical pair.
     e_atom = torch.zeros(N, dtype=dtype, device=device)
     e_atom.scatter_add_(0, pi, 0.5 * e_pair)
-    e_atom.scatter_add_(0, pj, 0.5 * e_pair)
     return e_atom
 
 

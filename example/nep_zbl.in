@@ -1,0 +1,22 @@
+version      4
+type         4 Pd Cu Ni P
+zbl          1.8
+cutoff       6 4
+n_max        8 8
+basis_size   8 8
+l_max        4 2
+neuron       50
+
+# Stage 1 loss weights (same as GPUMD lambda_e/f/v)
+lambda_e   10.0
+lambda_f   100.0
+lambda_v   0.0
+
+# Training parameters
+epoch      5           # number of epochs
+batch      64            # batch size
+lr         1e-2         # initial learning rate
+stop_lr    1e-6          # minimum learning rate
+scheduler_patience 15    # epochs without improvement before LR reduction
+scheduler_factor   0.8   # LR reduction factor
+max_grad_norm      20.0  # gradient clipping

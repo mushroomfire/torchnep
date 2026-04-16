@@ -11,17 +11,11 @@ from typing import Dict, List, Optional, Tuple
 def _parse_properties_schema(comment: str):
     """Parse the extended-XYZ ``Properties=...`` field.
 
-    Returns a dict mapping field name → (col_offset_in_numeric_part, width).
-    The species field (type ``S``) is always the first atom-line token and is
-    NOT part of the numeric tail; we record its offset in the full atom-line
-    token list but exclude it from numeric columns.
-
-    Example input segment: ``Properties=species:S:1:pos:R:3:Z:I:1:force:R:3``
-      → {'species': ('S', 0, 1),
-         'pos':     ('R', 0, 3),
-         'Z':       ('I', 3, 1),
-         'force':   ('R', 4, 3)}
-    (pos/Z/force offsets are in the numeric tail, i.e. after the species token.)
+    Returns a dict mapping field name → (type_code, token_offset, width).
+    ``token_offset`` is the starting column in the FULL per-atom token list
+    (so species and numeric fields share the same coordinate). This lets
+    downstream parsing handle arbitrary field ordering, including the
+    ``pos:R:3:species:S:1`` form produced by some exporters.
     """
     key = "Properties="
     idx = comment.find(key)
@@ -33,19 +27,14 @@ def _parse_properties_schema(comment: str):
         end += 1
     spec = comment[start:end]
     toks = spec.split(":")
-    # spec has groups of 3: name, type, count
     if len(toks) % 3 != 0:
         return None
     schema = {}
-    numeric_col = 0
+    col = 0
     for i in range(0, len(toks), 3):
         name, tp, cnt = toks[i], toks[i + 1], int(toks[i + 2])
-        if tp == "S":
-            # species is the text column; does not contribute to numeric tail
-            schema[name] = (tp, 0, cnt)
-        else:
-            schema[name] = (tp, numeric_col, cnt)
-            numeric_col += cnt
+        schema[name] = (tp, col, cnt)
+        col += cnt
     return schema
 
 
@@ -67,32 +56,44 @@ def _parse_frame_block(block):
             "extended-xyz parser requires a Properties=... header with "
             "at least species and pos fields; got: " + comment[:120])
 
+    # Find species column (only field with type 'S')
+    species_key = next((k for k, v in schema.items() if v[0] == "S"), None)
+    if species_key is None:
+        raise ValueError("Properties schema missing species (type S) field")
+    _, sp_col, _ = schema[species_key]
+
     atoms = block[2:2 + natoms]
     species = [None] * natoms
-    numeric_parts = []
-    ncol_numeric = None
+    numeric_rows = []
     for j, line in enumerate(atoms):
-        sp, _, rest = line.strip().partition(" ")
-        species[j] = sp
-        numeric_parts.append(rest)
-        if ncol_numeric is None:
-            ncol_numeric = len(rest.split())
+        toks = line.split()
+        species[j] = toks[sp_col]
+        # collect everything except the species token, preserving order
+        numeric_rows.append([t for k, t in enumerate(toks) if k != sp_col])
 
-    flat = " ".join(numeric_parts)
+    ncol_numeric = len(numeric_rows[0])
+    flat = " ".join(" ".join(r) for r in numeric_rows)
     arr = np.fromstring(flat, sep=" ", dtype=np.float64)
     arr = arr.reshape(natoms, ncol_numeric)
 
     frame["natoms"] = natoms
     frame["species"] = species
 
-    _, pos_off, pos_w = schema["pos"]
+    # Column offsets in schema are relative to the full token list including
+    # species; convert to offsets within the numeric tail by subtracting 1 for
+    # any field whose token position is beyond species.
+    def _numeric_offset(field_col):
+        return field_col if field_col < sp_col else field_col - 1
+
+    _, pos_col, pos_w = schema["pos"]
+    pos_off = _numeric_offset(pos_col)
     frame["positions"] = arr[:, pos_off:pos_off + pos_w].copy()
 
-    # Force column is conventionally "force" or "forces"; accept either.
     force_key = "force" if "force" in schema else (
                 "forces" if "forces" in schema else None)
     if force_key is not None:
-        _, f_off, f_w = schema[force_key]
+        _, f_col, f_w = schema[force_key]
+        f_off = _numeric_offset(f_col)
         frame["forces"] = arr[:, f_off:f_off + f_w].copy()
     return frame
 
