@@ -11,7 +11,7 @@ lambda_f   100.0
 lambda_v   0.0
 
 # Training parameters
-epoch      5           # number of epochs
+epoch      3           # number of epochs
 batch      8            # batch size
 lr         1e-2         # initial learning rate
 stop_lr    1e-6          # minimum learning rate

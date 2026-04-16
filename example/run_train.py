@@ -4,7 +4,7 @@ Single-GPU:  python run_train.py
 Multi-GPU :  torchrun --nproc_per_node=N run_train.py
 """
 
-from torchnep import train_nep
+from torchnep import train_nep, train_nep_sharded
 
 # train_nep(
 #     config_file="nep_AlO.in",
@@ -27,13 +27,12 @@ from torchnep import train_nep
 #     use_compile=True
 # )
 
-train_nep(
-    config_file="nep_AlO.in",
-    data_file="train_AlO.xyz",
-    output_dir="output_autograd_AlO",
-    device="cuda",
-    pytorch_only=True,
+train_nep_sharded(
+    config_file="nep_Si.in",
+    data_file="train_Si.xyz",
+    output_dir="output_Si",
+    pytorch_only=False,
     use_autograd_forces=True,
     print_interval=1,
-    use_compile=True
+    use_compile=True,
 )

@@ -10,5 +10,8 @@
 /example/prof*
 /example/run*
 /example/nep_lmax*
+/example/test*
+/check*
+/eval*
 /build/*
 /profile*
