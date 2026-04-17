@@ -1,15 +1,52 @@
 """
-Core NEP operations.
-
-Pure PyTorch implementations. The cached training path can optionally
-dispatch to CUDA contraction kernels from ``cuda_ops`` — everything else
-is pure PyTorch on both CPU and CUDA.
+Core NEP operations — pure PyTorch on CPU / CUDA / MPS.
 """
 
 import torch
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 from .constants import PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B
+
+
+# ---------------------------------------------------------------------------
+# Backend selection
+#
+# Two concrete implementations of the type-pair contraction plus one meta:
+#   "loop" : pure PyTorch, nested for-loop over (t1, t2) type pairs. Wins when
+#            ntypes is small (≤ ~5) — the outer loop runs few times.
+#   "bmm"  : pure PyTorch, fancy index + torch.bmm (dispatched to cuBLAS on
+#            CUDA, MKL on CPU, MPS on Apple). Wins when ntypes ≥ ~8 — one
+#            batched GEMM replaces the O(ntypes²) python-level loop.
+#   "auto" : picks by num_types (≥ 8 → bmm, else loop).
+#
+# Both backends are autograd-compatible and run on any PyTorch backend.
+# ---------------------------------------------------------------------------
+
+Backend = Literal["auto", "loop", "bmm"]
+
+
+def resolve_backend(backend: str = "auto",
+                     num_types: Optional[int] = None) -> str:
+    """Resolve "auto" into a concrete backend.
+
+    ntypes ≥ 8  → "bmm"   (fancy-index + batched GEMM wins)
+    otherwise   → "loop"  (few-types; inline Python loop is fastest)
+
+    Any non-"auto" string is returned unchanged (for explicit overrides).
+    """
+    if backend != "auto":
+        return backend
+    if num_types is not None and num_types >= 8:
+        return "bmm"
+    return "loop"
+
+
+def _select_contraction_funcs(backend: str):
+    """Return (scatter_fn, type_fn) for the concrete backend."""
+    if backend == "bmm":
+        return _scatter_contraction_bmm, _type_contraction_bmm
+    # "loop" — default
+    return _scatter_contraction_loop, _type_contraction_loop
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +67,10 @@ def build_neighbor_list(
     N = positions.shape[0]
     inv_cell = torch.linalg.inv(cell)
 
-    n_rep = [int(torch.ceil(cutoff / (1.0 / torch.norm(inv_cell[i]))).item())
+    # Columns of inv_cell are reciprocal lattice vectors; 1/|col i| is the
+    # perpendicular distance between the two cell planes normal to direction i.
+    # Using rows silently undercounts replicas for triclinic cells.
+    n_rep = [int(torch.ceil(cutoff * torch.norm(inv_cell[:, i])).item())
              for i in range(3)]
 
     ranges = [torch.arange(-n, n + 1, device=device, dtype=dtype) for n in n_rep]
@@ -219,13 +259,14 @@ def compute_descriptors(
     n_max_radial, n_max_angular, l_max_3b, l_max_4b, l_max_5b,
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
-    pytorch_only: bool = False,
+    backend: str = "loop",
 ) -> torch.Tensor:
     """Compute NEP4 descriptors. Returns (N, dim).
 
-    pytorch_only=True forces pure-PyTorch path (fully differentiable w.r.t.
-    both rij and c params — required for force/virial training).
+    The non-cached path has no CUDA dispatch, so only "loop" and "fast" apply
+    here. backend="cuda" falls through to "fast" (both use vectorised bmm).
     """
+    use_fast = backend in ("fast", "cuda")
     ntypes = int(c2.shape[0]) if c2.shape[0] != n_max_radial + 1 else int(c2.shape[2])
 
     # --- Radial ---
@@ -233,15 +274,23 @@ def compute_descriptors(
     fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
     t1r = atom_types[pi_rad]
     t2r = atom_types[pj_rad]
-    # Type-pair matmul loop: avoids atomic scatter in backward (38x faster)
     q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
-    for _t1 in range(ntypes):
-        for _t2 in range(ntypes):
-            _m = (t1r == _t1) & (t2r == _t2)
-            if not _m.any():
-                continue
-            _gn = fk_rad[_m] @ c2[_t1, _t2].T
-            q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
+    if use_fast:
+        # Vectorised: gather c[t1,t2] per pair, fused bmm, single scatter_add.
+        # Collapses the ntypes² python-launched kernels into one call — huge
+        # speed-up for large ntypes. Autograd through fancy index + bmm is fine.
+        c_p = c2[t1r, t2r]                                            # (P, N_out, K)
+        _gn = torch.bmm(c_p, fk_rad.unsqueeze(-1)).squeeze(-1)         # (P, N_out)
+        q_rad.scatter_add_(0, pi_rad.unsqueeze(-1).expand_as(_gn), _gn)
+    else:
+        # Type-pair matmul loop: lower peak memory, preferred for small ntypes.
+        for _t1 in range(ntypes):
+            for _t2 in range(ntypes):
+                _m = (t1r == _t1) & (t2r == _t2)
+                if not _m.any():
+                    continue
+                _gn = fk_rad[_m] @ c2[_t1, _t2].T
+                q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
 
     parts = [q_rad]
 
@@ -263,14 +312,18 @@ def compute_descriptors(
         fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
         t1a = atom_types[pi_ang]
         t2a = atom_types[pj_ang]
-        # Type-pair matmul loop (same optimization as radial)
-        gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
-        for _t1 in range(ntypes):
-            for _t2 in range(ntypes):
-                _m = (t1a == _t1) & (t2a == _t2)
-                if not _m.any():
-                    continue
-                gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
+        if use_fast:
+            c3_p = c3[t1a, t2a]                                        # (P, N_out, K)
+            gn_ang = torch.bmm(c3_p, fk_ang.unsqueeze(-1)).squeeze(-1)  # (P, N_out)
+        else:
+            # Type-pair matmul loop.
+            gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
+            for _t1 in range(ntypes):
+                for _t2 in range(ntypes):
+                    _m = (t1a == _t1) & (t2a == _t2)
+                    if not _m.any():
+                        continue
+                    gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
         d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
         blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,
                             rij_ang[:, 2]*d12inv, l_max_3b)
@@ -457,8 +510,11 @@ def precompute_basis(rij, dij, rc, basis_size, l_max_3b=0):
     return result
 
 
-def _scatter_contraction_pytorch(basis, pair_i, pair_j, atom_types, c, N):
-    """Pure PyTorch: type-contraction + scatter_add. Fully differentiable via autograd."""
+def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
+    """Type-pair loop: Σ_k c[t1, t2, n, k]·basis[p, k] then scatter_add into q.
+
+    The outer loop is O(ntypes²) python iterations. Preferred when ntypes is
+    small (few kernel launches, each matmul is fat) and peak memory matters."""
     ntypes = c.shape[0]
     t1 = atom_types[pair_i]
     t2 = atom_types[pair_j]
@@ -473,8 +529,8 @@ def _scatter_contraction_pytorch(basis, pair_i, pair_j, atom_types, c, N):
     return q
 
 
-def _type_contraction_pytorch(basis, pair_i, pair_j, atom_types, c):
-    """Pure PyTorch: type-pair contraction (no scatter). Fully differentiable via autograd."""
+def _type_contraction_loop(basis, pair_i, pair_j, atom_types, c):
+    """Type-pair loop (no scatter). See ``_scatter_contraction_loop``."""
     ntypes = c.shape[0]
     t1 = atom_types[pair_i]
     t2 = atom_types[pair_j]
@@ -488,6 +544,28 @@ def _type_contraction_pytorch(basis, pair_i, pair_j, atom_types, c):
     return gn
 
 
+def _scatter_contraction_bmm(basis, pair_i, pair_j, atom_types, c, N):
+    """Vectorised: gather c[t1, t2] per pair, one torch.bmm, scatter_add.
+
+    Allocates a (P, N_out, K) intermediate so peak memory is higher, but
+    launches ~1 kernel instead of O(ntypes²). Wins when ntypes ≥ ~8."""
+    t1 = atom_types[pair_i]
+    t2 = atom_types[pair_j]
+    c_p = c[t1, t2]                                            # (P, N_out, K)
+    gn = torch.bmm(c_p, basis.unsqueeze(-1)).squeeze(-1)        # (P, N_out)
+    q = torch.zeros(N, c.shape[2], dtype=basis.dtype, device=basis.device)
+    q.scatter_add_(0, pair_i.unsqueeze(-1).expand_as(gn), gn)
+    return q
+
+
+def _type_contraction_bmm(basis, pair_i, pair_j, atom_types, c):
+    """Vectorised counterpart of ``_type_contraction_loop``."""
+    t1 = atom_types[pair_i]
+    t2 = atom_types[pair_j]
+    c_p = c[t1, t2]                                            # (P, N_out, K)
+    return torch.bmm(c_p, basis.unsqueeze(-1)).squeeze(-1)      # (P, N_out)
+
+
 def compute_descriptors_cached(
     fk_rad, fk_ang, blm,
     pi_rad, pj_rad, pi_ang, pj_ang,
@@ -496,27 +574,22 @@ def compute_descriptors_cached(
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
     return_intermediates: bool = False,
-    pytorch_only: bool = False,
+    backend: str = "loop",
 ):
     """Compute descriptors using precomputed basis functions.
 
     Faster than compute_descriptors because Chebyshev/angular basis are cached.
     Differentiable through c2, c3 only (not rij).
 
-    When pytorch_only=True, uses pure PyTorch ops (no custom autograd.Function).
-    When pytorch_only=False, uses CUDA-accelerated type-pair contraction kernels
-    when available, falling back to vectorized PyTorch otherwise.
+    ``backend`` selects the type-pair contraction implementation:
+      "loop" — pure-PyTorch ntypes² loop (few types)
+      "bmm"  — fancy-index + torch.bmm (many types)
 
     If return_intermediates=True, returns (q, s, gn_ang) where:
       s      : (N, n_ap1, num_lm) sum_fxyz moments — needed for analytical forces
       gn_ang : (P_ang, n_ap1) pair-level angular radial factor
     """
-    if pytorch_only:
-        _scatter_fn = _scatter_contraction_pytorch
-        _type_fn = _type_contraction_pytorch
-    else:
-        _scatter_fn = scatter_contraction
-        _type_fn = type_contraction
+    _scatter_fn, _type_fn = _select_contraction_funcs(backend)
 
     ntypes = c2.shape[0]
 
@@ -648,7 +721,7 @@ def compute_analytical_forces(
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
     compute_virial: bool = True,
-    pytorch_only: bool = False,
+    backend: str = "loop",
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -661,12 +734,9 @@ def compute_analytical_forces(
     track gradients through them — they are not trainable parameters.  Only Fp
     (→ NN weights) and c2/c3 carry gradient information.
 
-    When pytorch_only=True, uses pure PyTorch ops (no custom autograd.Function).
+    ``backend`` — see ``compute_descriptors_cached`` for options.
     """
-    if pytorch_only:
-        _type_fn = _type_contraction_pytorch
-    else:
-        _type_fn = type_contraction
+    _, _type_fn = _select_contraction_funcs(backend)
 
     forces = torch.zeros(N, 3, dtype=dtype, device=device)
     virial = torch.zeros(N, 9, dtype=dtype, device=device) if compute_virial else None
@@ -834,16 +904,3 @@ def accumulate_forces_virial(
     _acc(pi_rad, pj_rad, rij_rad, g_rad)
     _acc(pi_ang, pj_ang, rij_ang, g_ang)
     return forces, virial
-
-
-# ---------------------------------------------------------------------------
-# Optional CUDA contraction ops (cached training path).
-# Imported at the bottom to break circular dependency (cuda_ops imports ops).
-# ---------------------------------------------------------------------------
-
-try:
-    from .cuda_ops import scatter_contraction, type_contraction  # noqa: E402
-except Exception:
-    scatter_contraction = None      # type: ignore[assignment]
-    type_contraction = None         # type: ignore[assignment]
-

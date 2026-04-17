@@ -15,3 +15,7 @@
 /eval*
 /build/*
 /profile*
+/big_bench/gpu*/*
+/big_bench/tor*/*
+/big_bench/*
+/probe/

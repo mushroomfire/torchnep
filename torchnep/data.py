@@ -235,8 +235,6 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stop_lr"] = float(parts[1])
             elif key == "max_grad_norm":
                 params["max_grad_norm"] = float(parts[1])
-            elif key == "huber_delta":
-                params["huber_delta"] = float(parts[1])
             elif key == "stage2":
                 params["stage2"] = int(parts[1]) != 0
             elif key == "start_stage2":
@@ -249,10 +247,8 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stage2_pref_f"] = float(parts[1])
             elif key == "stage2_lambda_v":
                 params["stage2_pref_v"] = float(parts[1])
-            elif key == "use_swa":
-                params["use_swa"] = int(parts[1]) != 0
 
-    # Defaults — model
+    # Defaults — model architecture
     params.setdefault("version", 4)
     params.setdefault("cutoff_radial", 6.0)
     params.setdefault("cutoff_angular", 6.0)
@@ -262,11 +258,27 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("basis_size_angular", 12)
     params.setdefault("l_max", [4, 2, 0])
     params.setdefault("neuron", 40)
-    params.setdefault("lambda_e", 1.0)
-    params.setdefault("lambda_f", 1.0)
-    params.setdefault("lambda_v", 0.0)
-    params.setdefault("lambda_1", 0.0)
+
+    # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
+    params.setdefault("num_epochs", 200)
     params.setdefault("batch_size", 1000)
+    params.setdefault("lr", 0.01)
+    params.setdefault("stop_lr", 1e-6)
+    params.setdefault("scheduler_patience", 50)
+    params.setdefault("scheduler_factor", 0.8)
+    params.setdefault("max_grad_norm", 10.0)
+    params.setdefault("lambda_e", 1.0)
+    params.setdefault("lambda_f", 100.0)
+    params.setdefault("lambda_v", 1.0)
+    params.setdefault("lambda_1", 0.0)
+    params.setdefault("lambda_2", 0.0)
+    params.setdefault("stage2", False)
+    # Defaults for optional stage-2 parameters (only used if stage2=1)
+    params.setdefault("stage2_lr", 1e-3)
+    params.setdefault("stage2_pref_e", 1000.0)
+    params.setdefault("stage2_pref_f", 100.0)
+    params.setdefault("stage2_pref_v", 10.0)
+    # start_stage2 defaults to 0.75 * num_epochs if not set — handled in trainer
 
     return params
 
@@ -276,11 +288,18 @@ def parse_nep_in(filename: str) -> Dict:
 # ---------------------------------------------------------------------------
 
 def build_neighbor_list_np(positions, cell, cutoff):
-    """Build neighbor list using numpy (for preprocessing). Returns arrays."""
+    """Build neighbor list using numpy (for preprocessing). Returns arrays.
+
+    Cell is stored with lattice vectors as ROWS. The perpendicular distance
+    between planes spanned by (b,c), (a,c), (a,b) is V/|b×c|, V/|a×c|,
+    V/|a×b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
+    reciprocal vectors). Using rows silently undercounts image replicas for
+    heavily skewed triclinic cells and drops real neighbors — bug fixed 2025.
+    """
     N = positions.shape[0]
     inv_cell = np.linalg.inv(cell)
 
-    n_rep = [int(np.ceil(cutoff / (1.0 / np.linalg.norm(inv_cell[i])))) for i in range(3)]
+    n_rep = [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i]))) for i in range(3)]
 
     a_r = np.arange(-n_rep[0], n_rep[0] + 1)
     b_r = np.arange(-n_rep[1], n_rep[1] + 1)

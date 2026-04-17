@@ -30,8 +30,7 @@ from .model import NEPModel, slim_model
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
-from .predict import predict_dataset
-from .cuda_ops import _load_cached_kernels
+from .predict import predict_dataset, predict_from_store
 
 
 # ---------------------------------------------------------------------------
@@ -382,10 +381,10 @@ def compute_max_neighbors(structures):
 
 
 @torch.no_grad()
-def compute_q_scaler(model, data_store, batch_size=64, pytorch_only=True):
+def compute_q_scaler(model, data_store, batch_size=64, backend="loop"):
     """Compute descriptor min/max across training set.
 
-    ``pytorch_only`` must match the value used during training so that the
+    ``backend`` must match the value used during training so that the
     descriptor statistics are consistent with the actual training-time
     descriptor values.
     """
@@ -403,7 +402,7 @@ def compute_q_scaler(model, data_store, batch_size=64, pytorch_only=True):
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
-            pytorch_only=pytorch_only,
+            backend=backend,
         )
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
@@ -451,44 +450,48 @@ def train_nep(
     output_dir: str = ".",
     device: str = None,
     precision: str = "float32",
-    num_epochs: int = None,
-    batch_size: int = None,
-    lr: float = None,
-    print_interval: int = 10,
+    backend: str = "auto",
+    use_autograd_forces: bool = False,
+    use_swa: bool = False,
     use_compile: bool = False,
+    print_interval: int = 10,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    pytorch_only: bool = True,
-    use_autograd_forces: bool = False,
-    max_grad_norm: float = None,
-    pref_e: float = None,
-    pref_f: float = None,
-    pref_v: float = None,
-    scheduler_patience: int = None,
-    scheduler_factor: float = None,
-    stop_lr: float = None,
-    huber_delta: float = None,
-    stage2: bool = None,
-    start_stage2: int = None,
-    stage2_lr: float = None,
-    stage2_pref_e: float = None,
-    stage2_pref_f: float = None,
-    stage2_pref_v: float = None,
-    use_swa: bool = None,
+    prediction_interval: int = 20,
     finetune_from: str = None,
     reset_lr: float = None,
     slim_types: bool = False,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
-    For multi-GPU training use ``train_nep_sharded`` launched with torchrun.
+    Hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / …) come
+    from ``config_file`` only. See README for the full nep.in reference.
 
-    Training strategy follows MACE (Batatia et al.):
-    - Stage 1: Fixed loss weights + ReduceLROnPlateau (patience=50, factor=0.8).
-    - Stage 2 (optional): Energy-focused fine-tuning with SWA model averaging.
+    Launch:  python run_train.py
 
-    Launch:
-        python run_train.py                               # single GPU / CPU
+    Parameters
+    ----------
+    config_file, data_file, output_dir : paths.
+    device : "cuda" | "cpu" | "mps" — auto-detected if omitted.
+    precision : "float32" (default) or "float64".
+    backend : "auto" | "loop" | "bmm" — see torchnep.ops.resolve_backend.
+    use_autograd_forces : True → autograd-through-rij forces (slower, gold
+        standard); False (default) → analytical chain rule.
+    use_swa : True → maintain an averaged model during stage 2 and save it
+        as ``nep_average.txt`` / ``nep_average.pt`` at the end.
+    use_compile : wrap model in torch.compile (~10 % extra speedup).
+    print_interval : log a line to screen every N epochs (all epochs still
+        land in output.log).
+    restart : on fresh output_dir, write new log; otherwise resume from
+        checkpoint.pt if present.
+    checkpoint_interval : save checkpoint.pt every N epochs.
+    prediction_interval : every N epochs, run predict_from_store with the
+        current nep_best weights and overwrite {energy,force,virial}_predict.out
+        in output_dir — lets you watch the parity-plot converge live.
+        Set to 0 or a negative value to disable.
+    finetune_from : path to an existing .pt or nep.txt to load weights from.
+    reset_lr : override LR after resume/finetune.
+    slim_types : drop element types not present in data_file before training.
     """
     # ---- Device ----------------------------------------------------------
     if device is None:
@@ -517,39 +520,30 @@ def train_nep(
     _log(f"Precision: {precision}")
     _log("")
 
-    # ---- CUDA kernels -------------------------------------------------------
-    # First call JIT-compiles nep_cached.cu (~30–90s, one-time); later calls
-    # load from torch's extensions cache instantly.
-    if dev.type == "cuda" and not pytorch_only:
-        _load_cached_kernels()
-
-    # ---- Config ----------------------------------------------------------
+    # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
     config = orig_config
-    lambda_1 = config.get("lambda_1", 0.0)
-    lambda_2 = config.get("lambda_2", 0.0)
-
-    def _cfg(arg_val, cfg_key, default):
-        return arg_val if arg_val is not None else config.get(cfg_key, default)
-
-    num_epochs = _cfg(num_epochs, "num_epochs", 200)
-    batch_size = _cfg(batch_size, "batch_size", 32)
-    lr = _cfg(lr, "lr", 0.01)
-    max_grad_norm = _cfg(max_grad_norm, "max_grad_norm", 10.0)
-    pref_e = _cfg(pref_e, "lambda_e", 1.0)
-    pref_f = _cfg(pref_f, "lambda_f", 100.0)
-    pref_v = _cfg(pref_v, "lambda_v", 1.0)
-    scheduler_patience = _cfg(scheduler_patience, "scheduler_patience", 50)
-    scheduler_factor = _cfg(scheduler_factor, "scheduler_factor", 0.8)
-    stop_lr = _cfg(stop_lr, "stop_lr", 1e-6)
-    huber_delta = _cfg(huber_delta, "huber_delta", 0.0)
-    stage2 = _cfg(stage2, "stage2", False)
-    start_stage2 = _cfg(start_stage2, "start_stage2", None)
-    stage2_lr = _cfg(stage2_lr, "stage2_lr", 1e-3)
-    stage2_pref_e = _cfg(stage2_pref_e, "stage2_pref_e", 1000.0)
-    stage2_pref_f = _cfg(stage2_pref_f, "stage2_pref_f", 100.0)
-    stage2_pref_v = _cfg(stage2_pref_v, "stage2_pref_v", 10.0)
-    use_swa = _cfg(use_swa, "use_swa", True)
+    # Model regularisation coefficients
+    lambda_1 = config["lambda_1"]
+    lambda_2 = config["lambda_2"]
+    # Training schedule + loss weights
+    num_epochs         = config["num_epochs"]
+    batch_size         = config["batch_size"]
+    lr                 = config["lr"]
+    stop_lr            = config["stop_lr"]
+    scheduler_patience = config["scheduler_patience"]
+    scheduler_factor   = config["scheduler_factor"]
+    max_grad_norm      = config["max_grad_norm"]
+    pref_e             = config["lambda_e"]
+    pref_f             = config["lambda_f"]
+    pref_v             = config["lambda_v"]
+    # Optional stage-2 block
+    stage2             = config["stage2"]
+    start_stage2       = config.get("start_stage2")  # may be None → auto 0.75·num_epochs
+    stage2_lr          = config["stage2_lr"]
+    stage2_pref_e      = config["stage2_pref_e"]
+    stage2_pref_f      = config["stage2_pref_f"]
+    stage2_pref_v      = config["stage2_pref_v"]
 
     # ---- Data ------------------------------------------------------------
     _log("Loading training data...")
@@ -634,9 +628,15 @@ def train_nep(
         _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
+    # Resolve "auto" backend now that we know num_types (and the CUDA kernel
+    # load attempt above has updated availability).
+    from .ops import resolve_backend as _resolve_backend
+    backend = _resolve_backend(backend, num_types=model.num_types)
+    _log(f"Compute backend: {backend}")
+
     _log("Computing q_scaler...")
     q_min, q_max = compute_q_scaler(model, data_store, batch_size,
-                                    pytorch_only=pytorch_only)
+                                    backend=backend)
     model.set_q_scaler(q_min, q_max)
 
     if use_compile and hasattr(torch, "compile"):
@@ -655,11 +655,7 @@ def train_nep(
         optimizer, mode="min", factor=scheduler_factor,
         patience=scheduler_patience, min_lr=stop_lr)
 
-    use_huber = huber_delta > 0
     def _loss_fn(pred, ref):
-        if use_huber:
-            return torch.nn.functional.huber_loss(pred, ref, reduction="mean",
-                                                  delta=huber_delta)
         return torch.mean((pred - ref) ** 2)
 
     swa_model = None
@@ -674,6 +670,7 @@ def train_nep(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
+    best_state = None  # cached state_dict of the best-loss model so far
     if restart and os.path.exists(ckpt_path) and finetune_from is None:
         start_epoch, best_loss = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
@@ -697,15 +694,17 @@ def train_nep(
         loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
                        "rmse_v(meV/atom)  gnorm\n")
 
-    backend_str = "pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated"
+    backend_str = {
+        "loop": "PyTorch type-pair loop",
+        "bmm":  "PyTorch fancy-index + torch.bmm (batched GEMM)",
+    }.get(backend, backend)
     force_str = ("autograd (create_graph)" if use_autograd_forces
                  else "analytical")
     clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
-    loss_type = f"Huber(delta={huber_delta})" if use_huber else "MSE"
     _log(f"\nTraining: epochs {start_epoch}-{num_epochs}, "
          f"batch={batch_size}, dtype={precision}")
     _log(f"Backend: {backend_str} | forces: {force_str} | "
-         f"{clip_str} | loss: {loss_type}")
+         f"{clip_str} | loss: MSE")
     _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
          f"factor={scheduler_factor}), stop_lr={stop_lr}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
@@ -761,19 +760,19 @@ def train_nep(
                         batch["pair_i_ang"], batch["pair_j_ang"],
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
-                        need_forces=has_forces, need_virial=has_virial)
+                        need_forces=has_forces, need_virial=has_virial,
+                        backend=backend)
                 else:
                     result = raw_model.compute_properties_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
-                        pytorch_only=pytorch_only)
+                        backend=backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                # sum_l* always accumulates the true MSE so rmse_* columns in the
-                # log are real RMSE regardless of huber_delta. The optimizer sees
-                # _loss_fn (Huber or MSE) as the gradient source.
+                # sum_l* accumulates per-batch MSE so the rmse_* columns in
+                # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
                 if e_mask.any():
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
@@ -870,27 +869,54 @@ def train_nep(
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 raw_model.save_nep_txt(
-                    os.path.join(output_dir, "nep.txt"),
+                    os.path.join(output_dir, "nep_best.txt"),
                     max_NN_rad, max_NN_ang)
                 torch.save(raw_model.state_dict(),
-                           os.path.join(output_dir, "best_model.pt"))
+                           os.path.join(output_dir, "nep_best.pt"))
+                # Cache the best state for interim predicts (no file round-trip).
+                best_state = {k: v.detach().clone()
+                              for k, v in raw_model.state_dict().items()}
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
                 _save_checkpoint(ckpt_path, model, optimizer,
                                  lr_scheduler, epoch, best_loss)
+
+            # Interim predict on the current nep_best weights — overwrites the
+            # same output files, so users can refresh the parity plot live.
+            # Skip on the final epoch — the end-of-training predict (below)
+            # immediately overwrites these files with the final-epoch result.
+            if (prediction_interval > 0
+                    and epoch % prediction_interval == 0
+                    and epoch != num_epochs
+                    and best_state is not None):
+                _log(f"  [epoch {epoch}] interim predict (nep_best weights)...")
+                current_state = {k: v.detach().clone()
+                                 for k, v in raw_model.state_dict().items()}
+                raw_model.load_state_dict(best_state)
+                predict_from_store(raw_model, data_store, output_dir,
+                                   batch_size=batch_size, backend=backend,
+                                   verbose=False)
+                raw_model.load_state_dict(current_state)
     finally:
         if loss_log is not None:
             loss_log.close()
 
+    # Final-epoch model (what the current weights actually are).
     raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                            max_NN_rad, max_NN_ang)
+    # SWA-averaged model (only when user opted in and stage 2 ran).
     if swa_model is not None:
         swa_state = swa_model.module.state_dict()
+        # Separate copy of raw_model's state so we can restore it after
+        # writing the SWA file (so the end-of-training predict still sees
+        # the final-epoch weights, not the SWA ones).
+        final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
         raw_model.load_state_dict(swa_state)
-        raw_model.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
+        raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                max_NN_rad, max_NN_ang)
-        torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
-        _log("SWA model saved to nep_swa.txt")
+        torch.save(swa_state, os.path.join(output_dir, "nep_average.pt"))
+        raw_model.load_state_dict(final_state)
+        _log("SWA model saved to nep_average.txt / nep_average.pt")
 
     train_time = time.time() - train_t0
     h, rem = divmod(train_time, 3600)
@@ -898,13 +924,13 @@ def train_nep(
     _log(f"\nDone. Best loss: {best_loss:.6e}")
     _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-    nep_file = os.path.join(output_dir, "nep.txt")
-    if os.path.exists(nep_file):
-        _log("\nRunning prediction on training set...")
-        pred_t0 = time.time()
-        predict_dataset(nep_file, data_file, output_dir=output_dir,
-                        dtype="float64", device=str(dev))
-        _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
+    # End-of-training prediction: reuse the in-memory data_store (no re-read)
+    # and the final-epoch model weights — no file I/O for the model either.
+    _log("\nRunning prediction on training set (final-epoch model)...")
+    pred_t0 = time.time()
+    predict_from_store(raw_model, data_store, output_dir,
+                       batch_size=batch_size, backend=backend, verbose=False)
+    _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     total_time = time.time() - total_t0
     h, rem = divmod(total_time, 3600)

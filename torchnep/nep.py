@@ -256,13 +256,15 @@ class NEPCalculator:
             result["descriptor"] = descriptor
         return result
 
-    def compute_batch(self, batch: Dict) -> Dict:
+    def compute_batch(self, batch: Dict, backend: str = "loop") -> Dict:
         """Compute energy, forces, virial for a pre-built batch dict.
 
         The batch dict must contain pre-cached basis tensors on the device:
         fk_rad, fkp_rad, d12inv_rad, fk_ang, fkp_ang, d12inv_ang, blm,
         pair_i_rad, pair_j_rad, rij_rad, pair_i_ang, pair_j_ang, rij_ang,
         atom_types, struct_idx, N, num_structures.
+
+        ``backend`` ∈ {"loop", "fast", "cuda"} — see ops.resolve_backend.
         """
         dtype, device = self.dtype, self.device
         N = batch["N"]
@@ -279,7 +281,7 @@ class NEPCalculator:
             self.num_lm, self._c3b, self._c4b, self._c5b,
             dtype, device,
             return_intermediates=True,
-            pytorch_only=True,
+            backend=backend,
         )
 
         q_scaled = q * self.q_scaler
@@ -355,7 +357,7 @@ class NEPCalculator:
             self.num_lm, self._c3b, self._c4b, self._c5b,
             dtype, device,
             compute_virial=True,
-            pytorch_only=True,
+            backend=backend,
         )
         if zbl_forces is not None:
             forces = forces + zbl_forces

@@ -125,8 +125,8 @@ class NEPModel(nn.Module):
 
     def compute_descriptors(self, rij_rad, rij_ang, pi_rad, pj_rad,
                             pi_ang, pj_ang, atom_types, N,
-                            pytorch_only: bool = False):
-        """Compute descriptors. Returns (N, dim)."""
+                            backend: str = "loop"):
+        """Compute descriptors. Returns (N, dim). See ops.resolve_backend."""
         return ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c_param_2, self.c_param_3,
@@ -136,17 +136,17 @@ class NEPModel(nn.Module):
             self.l_max_3b, self.l_max_4b, self.l_max_5b,
             self.num_lm, self._c3b, self._c4b, self._c5b,
             rij_rad.dtype, rij_rad.device,
-            pytorch_only=pytorch_only,
+            backend=backend,
         )
 
     def forward(self, rij_rad, rij_ang, pi_rad, pj_rad,
                 pi_ang, pj_ang, atom_types, N,
-                pytorch_only: bool = False):
+                backend: str = "loop"):
         """Forward pass: returns per-atom energy Ei (N,)."""
         q = self.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad,
             pi_ang, pj_ang, atom_types, N,
-            pytorch_only=pytorch_only)
+            backend=backend)
         q_scaled = q * self.q_scaler
         Ei = torch.zeros(N, dtype=q.dtype, device=q.device)
         for t in range(self.num_types):
@@ -158,8 +158,9 @@ class NEPModel(nn.Module):
     def compute_properties(self, rij_rad, rij_ang, pi_rad, pj_rad,
                            pi_ang, pj_ang, atom_types, N,
                            struct_idx, num_structures,
-                           need_forces=True, need_virial=False):
-        """Compute energy, forces, virial."""
+                           need_forces=True, need_virial=False,
+                           backend: str = "loop"):
+        """Compute energy, forces, virial (autograd-through-rij path)."""
         dtype = rij_rad.dtype
         device = rij_rad.device
 
@@ -167,14 +168,17 @@ class NEPModel(nn.Module):
             rij_rad = rij_rad.detach().requires_grad_(True)
             rij_ang = rij_ang.detach().requires_grad_(True)
 
-        # During training: pure PyTorch descriptors so gradients flow through
-        # both rij (for forces) and c_param_2/c_param_3 (for descriptor params).
-        # CUDA autograd.Functions are buggy for c3 gradients; PyTorch fallback
-        # is fully differentiable and correct.
-        use_pytorch_only = self.training
+        # During training, the non-cached descriptor path must stay autograd-
+        # friendly through rij AND through c. CUDA autograd.Function.backward
+        # for ScatterContraction is known buggy for c3 gradients (see notes),
+        # so during training we coerce backend to "loop"/"fast" which are
+        # fully autograd-safe.
+        fwd_backend = backend
+        if self.training and backend == "cuda":
+            fwd_backend = "fast"
         Ei = self.forward(rij_rad, rij_ang, pi_rad, pj_rad,
                           pi_ang, pj_ang, atom_types, N,
-                          pytorch_only=use_pytorch_only)
+                          backend=fwd_backend)
 
         if self.zbl is not None:
             Ei = Ei + ops.compute_zbl(
@@ -213,14 +217,13 @@ class NEPModel(nn.Module):
         return result
 
     def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
-                                   pytorch_only: bool = True):
+                                   backend: str = "loop"):
         """Compute energy, forces, virial using precomputed basis.
 
         Uses fully analytical force computation — no create_graph=True needed.
         Forces are differentiable through c2, c3 (via Fp→NN weights and via s→c3).
 
-        When pytorch_only=True (default), all computations use pure PyTorch ops.
-        No custom CUDA autograd.Functions are used, ensuring correct gradients.
+        ``backend`` ∈ {"loop", "fast", "cuda"} — see torchnep.ops.resolve_backend.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -239,7 +242,7 @@ class NEPModel(nn.Module):
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
                 return_intermediates=True,
-                pytorch_only=pytorch_only,
+                backend=backend,
             )
         else:
             q = ops.compute_descriptors_cached(
@@ -251,7 +254,7 @@ class NEPModel(nn.Module):
                 self.l_max_3b, self.l_max_4b, self.l_max_5b,
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
-                pytorch_only=pytorch_only,
+                backend=backend,
             )
             s = gn_ang = None
 
@@ -327,7 +330,7 @@ class NEPModel(nn.Module):
                 self.num_lm, self._c3b, self._c4b, self._c5b,
                 dtype, device,
                 compute_virial=need_virial,
-                pytorch_only=pytorch_only,
+                backend=backend,
             )
             if zbl_forces is not None:
                 forces = forces + zbl_forces

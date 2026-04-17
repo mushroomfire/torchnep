@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnep"
-version = "1.0.0"
+dynamic = ["version"]
 description = "PyTorch implementation of NEP (Neuroevolution Potential)"
 requires-python = ">=3.9"
 dependencies = [
@@ -13,11 +13,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["ninja"]
-dev = ["pytest"]
+dev = ["pytest", "mdapy"]
 
 [tool.setuptools.packages.find]
 include = ["torchnep*"]
 
-[tool.setuptools.package-data]
-torchnep = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
+[tool.setuptools.dynamic]
+version = {attr = "torchnep.__version__"}

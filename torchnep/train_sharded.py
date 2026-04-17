@@ -32,7 +32,6 @@ from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_dataset
-from .cuda_ops import _load_cached_kernels
 from .model import slim_model
 from .train import (
     _BANNER, _AUTHOR,
@@ -49,7 +48,7 @@ from .train import (
 
 @torch.no_grad()
 def _compute_q_scaler_sharded(model, data_store, batch_size=64,
-                               pytorch_only=True):
+                               backend="loop"):
     """Compute descriptor min/max over the local shard, then all-reduce.
 
     Returns (q_min, q_max) that are globally consistent across all ranks.
@@ -69,7 +68,7 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=64,
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
-            pytorch_only=pytorch_only,
+            backend=backend,
         )
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
@@ -91,40 +90,30 @@ def train_nep_sharded(
     data_file: str,
     output_dir: str = ".",
     precision: str = "float32",
-    num_epochs: int = None,
-    batch_size: int = None,
-    lr: float = None,
-    print_interval: int = 10,
+    backend: str = "auto",
+    use_autograd_forces: bool = False,
+    use_swa: bool = False,
     use_compile: bool = False,
+    print_interval: int = 10,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    pytorch_only: bool = True,
-    use_autograd_forces: bool = False,
-    max_grad_norm: float = None,
-    pref_e: float = None,
-    pref_f: float = None,
-    pref_v: float = None,
-    scheduler_patience: int = None,
-    scheduler_factor: float = None,
-    stop_lr: float = None,
-    huber_delta: float = None,
-    stage2: bool = None,
-    start_stage2: int = None,
-    stage2_lr: float = None,
-    stage2_pref_e: float = None,
-    stage2_pref_f: float = None,
-    stage2_pref_v: float = None,
-    use_swa: bool = None,
+    prediction_interval: int = 20,
     finetune_from: str = None,
     slim_types: bool = False,
 ):
     """Data-sharded NEP training.  Must be launched via torchrun.
+
+    All hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / ...)
+    come from ``config_file`` — see README for the nep.in reference.
 
     Each rank loads structures[rank::world_size] only, so total GPU memory
     for the data store scales as 1/world_size.  Gradients are all-reduced by
     DDP; q_scaler and epoch metrics are all-reduced explicitly.
 
         torchrun --nproc_per_node=N run_train.py
+
+    Parameters are the same as ``train_nep``; the only runtime-exclusive
+    differences are DDP launch + distributed q_scaler/metric aggregation.
     """
     # ---- Distributed init ------------------------------------------------
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -168,43 +157,27 @@ def train_nep_sharded(
          f"each holds 1/{world_size} of structures)")
     _log("")
 
-    # ---- CUDA kernels ----------------------------------------------------
-    # Rank 0 JIT-compiles (if cache is cold) while others wait. After the
-    # barrier all ranks load the same cached .so — no torch-extensions race.
-    if not pytorch_only:
-        if is_main:
-            _load_cached_kernels()
-        dist.barrier()
-        if not is_main:
-            _load_cached_kernels()
-
-    # ---- Config ----------------------------------------------------------
+    # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
     config = orig_config
-    lambda_1 = config.get("lambda_1", 0.0)
-    lambda_2 = config.get("lambda_2", 0.0)
-
-    def _cfg(arg_val, cfg_key, default):
-        return arg_val if arg_val is not None else config.get(cfg_key, default)
-
-    num_epochs         = _cfg(num_epochs,          "num_epochs",          200)
-    batch_size         = _cfg(batch_size,           "batch_size",          32)
-    lr                 = _cfg(lr,                   "lr",                  0.01)
-    max_grad_norm      = _cfg(max_grad_norm,         "max_grad_norm",       10.0)
-    pref_e             = _cfg(pref_e,               "lambda_e",            1.0)
-    pref_f             = _cfg(pref_f,               "lambda_f",            100.0)
-    pref_v             = _cfg(pref_v,               "lambda_v",            1.0)
-    scheduler_patience = _cfg(scheduler_patience,   "scheduler_patience",  50)
-    scheduler_factor   = _cfg(scheduler_factor,     "scheduler_factor",    0.8)
-    stop_lr            = _cfg(stop_lr,              "stop_lr",             1e-6)
-    huber_delta        = _cfg(huber_delta,          "huber_delta",         0.0)
-    stage2             = _cfg(stage2,               "stage2",              False)
-    start_stage2       = _cfg(start_stage2,         "start_stage2",        None)
-    stage2_lr          = _cfg(stage2_lr,            "stage2_lr",           1e-3)
-    stage2_pref_e      = _cfg(stage2_pref_e,        "stage2_pref_e",       1000.0)
-    stage2_pref_f      = _cfg(stage2_pref_f,        "stage2_pref_f",       100.0)
-    stage2_pref_v      = _cfg(stage2_pref_v,        "stage2_pref_v",       10.0)
-    use_swa            = _cfg(use_swa,              "use_swa",             True)
+    lambda_1 = config["lambda_1"]
+    lambda_2 = config["lambda_2"]
+    num_epochs         = config["num_epochs"]
+    batch_size         = config["batch_size"]
+    lr                 = config["lr"]
+    stop_lr            = config["stop_lr"]
+    scheduler_patience = config["scheduler_patience"]
+    scheduler_factor   = config["scheduler_factor"]
+    max_grad_norm      = config["max_grad_norm"]
+    pref_e             = config["lambda_e"]
+    pref_f             = config["lambda_f"]
+    pref_v             = config["lambda_v"]
+    stage2             = config["stage2"]
+    start_stage2       = config.get("start_stage2")
+    stage2_lr          = config["stage2_lr"]
+    stage2_pref_e      = config["stage2_pref_e"]
+    stage2_pref_f      = config["stage2_pref_f"]
+    stage2_pref_v      = config["stage2_pref_v"]
 
     # ---- Data: each rank loads 1/world_size of structures ----------------
     _log("Loading training data...")
@@ -322,10 +295,15 @@ def train_nep_sharded(
     global_has_forces = bool(flags_t[0].item())
     global_has_virial = bool(flags_t[1].item())
 
+    # Resolve "auto" backend now that we know num_types + kernel availability.
+    from .ops import resolve_backend as _resolve_backend
+    backend = _resolve_backend(backend, num_types=model.num_types)
+    _log(f"Compute backend: {backend}")
+
     # q_scaler: local shard → all_reduce
     _log("Computing q_scaler (all-reduce across shards)...")
     q_min, q_max = _compute_q_scaler_sharded(model, data_store, batch_size,
-                                              pytorch_only=pytorch_only)
+                                              backend=backend)
     model.set_q_scaler(q_min, q_max)
 
     if use_compile and hasattr(torch, "compile"):
@@ -347,11 +325,7 @@ def train_nep_sharded(
         optimizer, mode="min", factor=scheduler_factor,
         patience=scheduler_patience, min_lr=stop_lr)
 
-    use_huber = huber_delta > 0
     def _loss_fn(pred, ref):
-        if use_huber:
-            return torch.nn.functional.huber_loss(pred, ref, reduction="mean",
-                                                  delta=huber_delta)
         return torch.mean((pred - ref) ** 2)
 
     swa_model = None
@@ -385,15 +359,17 @@ def train_nep_sharded(
             loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
                            "rmse_v(meV/atom)  gnorm\n")
 
-    backend_str = "pure-PyTorch" if pytorch_only else "CUDA-kernel accelerated"
+    backend_str = {
+        "loop": "PyTorch type-pair loop",
+        "bmm":  "PyTorch fancy-index + torch.bmm (batched GEMM)",
+    }.get(backend, backend)
     force_str = ("autograd (create_graph)" if use_autograd_forces
                  else "analytical")
     clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
-    loss_type = f"Huber(delta={huber_delta})" if use_huber else "MSE"
     _log(f"\nTraining: epochs {start_epoch}-{num_epochs}, "
          f"batch={batch_size}, dtype={precision}")
     _log(f"Backend: {backend_str} | forces: {force_str} | "
-         f"{clip_str} | loss: {loss_type}")
+         f"{clip_str} | loss: MSE")
     _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
          f"factor={scheduler_factor}), stop_lr={stop_lr}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
@@ -450,19 +426,19 @@ def train_nep_sharded(
                         batch["pair_i_ang"], batch["pair_j_ang"],
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
-                        need_forces=has_forces, need_virial=has_virial)
+                        need_forces=has_forces, need_virial=has_virial,
+                        backend=backend)
                 else:
                     result = raw_model.compute_properties_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
-                        pytorch_only=pytorch_only)
+                        backend=backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                # sum_l* always accumulates the true MSE so rmse_* columns in the
-                # log are real RMSE regardless of huber_delta. The optimizer sees
-                # _loss_fn (Huber or MSE) as the gradient source.
+                # sum_l* accumulates per-batch MSE so the rmse_* columns in
+                # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
                 if e_mask.any():
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
@@ -574,14 +550,32 @@ def train_nep_sharded(
                 if avg_loss < best_loss:
                     best_loss = avg_loss
                     raw_model.save_nep_txt(
-                        os.path.join(output_dir, "nep.txt"),
+                        os.path.join(output_dir, "nep_best.txt"),
                         max_NN_rad, max_NN_ang)
                     torch.save(raw_model.state_dict(),
-                               os.path.join(output_dir, "best_model.pt"))
+                               os.path.join(output_dir, "nep_best.pt"))
 
                 if epoch % checkpoint_interval == 0 or epoch == num_epochs:
                     _save_checkpoint(ckpt_path, model, optimizer,
                                      lr_scheduler, epoch, best_loss)
+
+                # Interim predict — rank 0 only, reads nep_best.txt from disk.
+                # Each rank has only 1/N of the structures so the in-memory
+                # data_store can't give a full dataset prediction; we fall back
+                # to the file-based predict_dataset here. Skip on the last
+                # epoch — the end-of-training predict runs right after.
+                if (prediction_interval > 0
+                        and epoch % prediction_interval == 0
+                        and epoch != num_epochs
+                        and os.path.exists(os.path.join(output_dir,
+                                                         "nep_best.txt"))):
+                    _log(f"  [epoch {epoch}] interim predict "
+                         f"(nep_best.txt)...")
+                    predict_dataset(
+                        os.path.join(output_dir, "nep_best.txt"),
+                        data_file, output_dir=output_dir,
+                        dtype=precision, device=str(dev),
+                        backend=backend, verbose=False)
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
@@ -591,11 +585,13 @@ def train_nep_sharded(
                                max_NN_rad, max_NN_ang)
         if swa_model is not None:
             swa_state = swa_model.module.state_dict()
+            final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
             raw_model.load_state_dict(swa_state)
-            raw_model.save_nep_txt(os.path.join(output_dir, "nep_swa.txt"),
+            raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                    max_NN_rad, max_NN_ang)
-            torch.save(swa_state, os.path.join(output_dir, "swa_model.pt"))
-            _log("SWA model saved to nep_swa.txt")
+            torch.save(swa_state, os.path.join(output_dir, "nep_average.pt"))
+            raw_model.load_state_dict(final_state)
+            _log("SWA model saved to nep_average.txt / nep_average.pt")
 
         train_time = time.time() - train_t0
         h, rem = divmod(train_time, 3600)
@@ -603,13 +599,16 @@ def train_nep_sharded(
         _log(f"\nDone. Best loss: {best_loss:.6e}")
         _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-        nep_file = os.path.join(output_dir, "nep.txt")
-        if os.path.exists(nep_file):
-            _log("\nRunning prediction on training set...")
-            pred_t0 = time.time()
-            predict_dataset(nep_file, data_file, output_dir=output_dir,
-                            dtype="float64", device=str(dev))
-            _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
+        # End-of-training predict: rank 0 only. In sharded mode each rank holds
+        # only 1/N of the structures, so reusing the local store would miss
+        # the other ranks' frames — simpler to re-read the full xyz on rank 0.
+        _log("\nRunning prediction on training set (final-epoch model)...")
+        pred_t0 = time.time()
+        predict_dataset(os.path.join(output_dir, "nep_final.txt"),
+                        data_file, output_dir=output_dir,
+                        dtype=precision, device=str(dev),
+                        backend=backend)
+        _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
         total_time = time.time() - total_t0
         h, rem = divmod(total_time, 3600)

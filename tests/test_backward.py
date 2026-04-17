@@ -158,7 +158,7 @@ def check_train_vs_predict(frame, calc, device, dtype_str):
 
     with torch.enable_grad():
         r_train = model.compute_properties_cached(
-            batch, need_forces=True, need_virial=True, pytorch_only=True)
+            batch, need_forces=True, need_virial=True, backend="loop")
     f_train = r_train["forces"].detach().cpu().double().numpy()
     v_train = r_train["virial"].detach().cpu().double().numpy()
 

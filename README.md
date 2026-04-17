@@ -5,7 +5,7 @@ A PyTorch implementation of [NEP4](https://gpumd.org/theory/nep.html) (Neuroevol
 ## Features
 
 - **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
-- **Three compute backends** — pure PyTorch (CPU/CUDA/MPS), analytical PyTorch forces, CUDA kernel accelerated (up to 363× faster than naive PyTorch)
+- **Two compute backends auto-picked by element count** — `"loop"` (Python type-pair loop, best for few types) and `"bmm"` (fancy-index + `torch.bmm`, best for ≥8 types). Both pure PyTorch; works on CPU / CUDA / MPS. Set `backend="auto"` and the trainer picks the right one.
 - **Two-stage training** — Stage 1: force-focused with ReduceLROnPlateau; Stage 2: energy fine-tuning with Stochastic Weight Averaging
 - **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`; each rank holds only `1/N` of the structures (single-node and multi-node SLURM templates included)
 - **Fine-tuning** — load any `nep.txt` or `best_model.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
@@ -23,14 +23,7 @@ pip install -e .
 
 Requirements: `torch >= 2.0`, `numpy`.
 
-Optional — `ninja` speeds up CUDA kernel compilation:
-
-```bash
-pip install ninja
-```
-
-CUDA kernels (`nep_cached.cu`) are JIT-compiled on the first training run
-(~30–90 s) and cached to `~/.cache/torch_extensions/` for all subsequent runs.
+Pure PyTorch — no native extensions to compile. Runs on CPU, CUDA, or MPS.
 
 ---
 
@@ -70,7 +63,7 @@ train_nep(
     data_file="train.xyz",
     output_dir="output",
     device="cuda",          # "cuda" | "cpu" | "mps" — auto-detected if omitted
-    pytorch_only=False,     # use CUDA kernel acceleration
+    backend="auto",         # "auto" | "loop" | "bmm" — see table below
     use_compile=True,       # torch.compile (~10% extra speedup)
 )
 ```
@@ -177,20 +170,21 @@ All parameters can be set in `nep.in` or passed as keyword arguments to `train_n
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `epoch` | `200` | Total training epochs |
-| `batch` | `32` | Batch size (structures per step) |
+| `batch` | `1000` | Structures per gradient step |
 | `lr` | `0.01` | Initial learning rate |
 | `stop_lr` | `1e-6` | Minimum learning rate (scheduler floor) |
 | `lambda_e` | `1.0` | Energy loss weight |
 | `lambda_f` | `100.0` | Force loss weight |
 | `lambda_v` | `1.0` | Virial loss weight |
-| `lambda_1` | `0` | L1 regularisation |
-| `lambda_2` | `0` | L2 regularisation (weight decay) |
+| `lambda_1` | `0.0` | L1 regularisation |
+| `lambda_2` | `0.0` | L2 regularisation (weight decay) |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
-| `huber_delta` | `0` | Huber loss delta (0 = MSE) |
 | `scheduler_patience` | `50` | Epochs without improvement before LR reduction |
 | `scheduler_factor` | `0.8` | LR reduction factor |
 
-### Stage 2 (energy fine-tuning)
+Loss is plain MSE. Hyperparameters are **read from `nep.in` only** — no function-argument override.
+
+### Stage 2 (energy fine-tuning, optional)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -200,7 +194,8 @@ All parameters can be set in `nep.in` or passed as keyword arguments to `train_n
 | `stage2_lambda_e` | `1000.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `100.0` | Stage 2 force weight |
 | `stage2_lambda_v` | `10.0` | Stage 2 virial weight |
-| `use_swa` | `1` | Stochastic Weight Averaging in Stage 2 |
+
+SWA (Stochastic Weight Averaging) is opt-in via the **function argument** `use_swa=True` (not a `nep.in` key, since it is an optional feature).
 
 ### Example `nep.in`
 
@@ -217,7 +212,7 @@ lambda_f   100.0
 lambda_v   1.0
 
 epoch      1000
-batch      32
+batch      64
 lr         0.01
 stop_lr    1e-6
 
@@ -228,17 +223,43 @@ stage2_lambda_f  100.0
 stage2_lambda_v  10.0
 ```
 
+### Runtime arguments (function kwargs)
+
+Everything that is not about hyperparameter *values* lives on the Python
+function (`train_nep` / `train_nep_sharded`) — things the user flips at
+launch time:
+
+| Argument | Default | What it controls |
+|---|---|---|
+| `device` | auto | "cuda" / "cpu" / "mps" |
+| `precision` | `"float32"` | dtype for training + store |
+| `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
+| `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
+| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.*` |
+| `use_compile` | `False` | wrap in `torch.compile` |
+| `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
+| `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
+| `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_predict.out` — live parity plot |
+| `restart` | `True` | resume from `checkpoint.pt` if present |
+| `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` before training |
+| `reset_lr` | `None` | override LR after resume/finetune |
+| `slim_types` | `False` | drop element types absent from the dataset |
+
 ---
 
 ## Output Files
 
 | File | Contents |
 |------|----------|
-| `nep.txt` | Best-loss model (GPUMD-compatible) |
-| `nep_final.txt` | Model at final epoch |
-| `nep_swa.txt` | SWA-averaged model (Stage 2 + `use_swa=True`) |
-| `best_model.pt` | Best-loss weights as PyTorch state dict |
-| `checkpoint.pt` | Full training state: weights + optimizer + scheduler + epoch |
+| `nep_best.txt`     | **Best-loss** model (GPUMD-compatible) — rewritten whenever `avg_loss < best_loss` |
+| `nep_best.pt`      | Same weights as PyTorch state_dict |
+| `nep_final.txt`    | Model at the **last** epoch (used for the end-of-training predict) |
+| `nep_average.txt`  | **SWA-averaged** model — only when `use_swa=True` |
+| `nep_average.pt`   | SWA weights as PyTorch state_dict |
+| `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch |
+| `output.log`       | Full training log |
+| `loss.out`         | Per-epoch loss / RMSE (for plotting) |
+| `energy_predict.out`, `force_predict.out`, `virial_predict.out` | Interim parity plot (every `prediction_interval` epochs, **nep_best weights**), replaced at end of training by final-epoch prediction |
 | `loss.out` | Per-epoch: loss, RMSE_E (meV/atom), RMSE_F (eV/Å), RMSE_V, gnorm |
 | `output.log` | Full console log |
 | `energy_predict.out` | Per-structure energy predictions vs targets |
@@ -396,15 +417,27 @@ predict_dataset(
 
 ## Compute Backends
 
-| Backend | How to enable | Platforms | Speed |
-|---------|--------------|-----------|-------|
-| Autograd PyTorch | `use_autograd_forces=True` | CPU / CUDA / MPS | Slowest |
-| Analytical PyTorch | default (`pytorch_only=True`) | CPU / CUDA / MPS | Fast |
-| CUDA kernels | `pytorch_only=False` | CUDA only | Fastest |
+Two implementations of the same type-pair contraction
+`q[i,n] = Σ_k c[t1,t2,n,k]·basis[p,k]` → scatter. Pick one with `backend=`:
 
-The CUDA kernel backend uses three hand-written `.cu` files for fused descriptor computation, type contraction, and force/virial accumulation.  It falls back to analytical PyTorch automatically on non-CUDA devices.
+| `backend=` | Implementation | Best for |
+|---|---|---|
+| `"loop"` | nested `for t1, t2` over type pairs, small matmul + scatter per pair | **few types** (≤ ~7) — outer loop runs few iterations |
+| `"bmm"`  | fancy-index `c[t1, t2]` then `torch.bmm` (one batched GEMM) | **many types** (≥ 8) — one kernel launch beats the Python loop |
+| `"auto"` (default) | picks `bmm` if `num_types ≥ 8` else `loop` | everything |
 
-In practice the CUDA kernel backend is **10–20% faster** than analytical PyTorch on typical training workloads — the bottleneck is the MLP forward/backward pass, not the descriptor computation.  The main benefit of `pytorch_only=False` is reduced descriptor memory traffic, not raw throughput.
+Both backends are pure PyTorch, fully autograd-differentiable, and work on CPU / CUDA / MPS (`torch.bmm` dispatches to cuBLAS / MKL / MPS respectively). They compute the same function — float64 output agrees to machine precision.
+
+Measured one-epoch training wall-time on RTX A2000, float32 (single-GPU, see `probe/`):
+
+| Dataset | num_types | loop | bmm | auto picks |
+|---|---:|---:|---:|---|
+| Si (2474f, BS=64) | 1 | **~2 s** | ~13 s | loop |
+| AlO (2190f, BS=64) | 2 | **2.1 s** | 16.2 s | loop |
+| CrCoNi (3030f, BS=64) | 3 | **2.2 s** | 11.1 s | loop |
+| NEP89 (3000f, BS=100) | 53 | 26 s | **2.2 s** | bmm |
+
+Orthogonal force toggle: `use_autograd_forces=True` switches to autograd-through-rij forces (slower, used only as a gold standard in tests — the analytical path matches it to float precision).
 
 ---
 
@@ -447,11 +480,8 @@ torchnep/
   nep.py          — NEPCalculator (inference from nep.txt)
   predict.py      — predict_dataset (batched full-dataset prediction)
   data.py         — read_xyz, parse_nep_in, build_neighbor_list_np
-  ops.py          — basis functions, descriptors, analytical forces (PyTorch)
-  cuda_ops.py     — CUDA kernel wrappers (torch.autograd.Function)
+  ops.py          — basis functions, descriptors, analytical forces (pure PyTorch)
   constants.py    — physical constants, element data, C3B/C4B/C5B, Z_COEFFICIENT
-  csrc/
-    nep_cached.cu       — type/scatter contraction kernels (only .cu file kept)
 example/
   run_train.py            — typical entry point users edit
   run_1node_4gpu.sbatch   — single-node multi-GPU SLURM template
