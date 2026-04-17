@@ -123,14 +123,19 @@ def _build_batch(structures, indices, calc, dtype, device):
 
 def _virial9_to_6(v9):
     """Re-order a length-9 virial (xx,xy,xz,yx,yy,yz,zx,zy,zz)
-    into the GPUMD 6-vector (xx,yy,zz,xy,yz,zx)."""
+    into the GPUMD 6-vector (xx,yy,zz,xy,yz,zx).
+
+    Off-diagonal entries are averaged with their symmetric partner
+    (0.5 * (xy + yx) etc.) — the per-frame virial is symmetric in principle,
+    but the per-atom construction ``-rij ⊗ f12`` is not, so averaging is
+    slightly more accurate than picking one entry arbitrarily."""
     out = np.empty((v9.shape[0], 6), dtype=v9.dtype)
-    out[:, 0] = v9[:, 0]   # xx
-    out[:, 1] = v9[:, 4]   # yy
-    out[:, 2] = v9[:, 8]   # zz
-    out[:, 3] = v9[:, 1]   # xy
-    out[:, 4] = v9[:, 5]   # yz
-    out[:, 5] = v9[:, 2]   # zx
+    out[:, 0] = v9[:, 0]                      # xx
+    out[:, 1] = v9[:, 4]                      # yy
+    out[:, 2] = v9[:, 8]                      # zz
+    out[:, 3] = 0.5 * (v9[:, 1] + v9[:, 3])   # xy, yx
+    out[:, 4] = 0.5 * (v9[:, 5] + v9[:, 7])   # yz, zy
+    out[:, 5] = 0.5 * (v9[:, 2] + v9[:, 6])   # xz, zx
     return out
 
 
@@ -247,6 +252,9 @@ def predict_dataset(
     virial_ref = np.full((n_struct, 6), np.nan, dtype=np.float64)
     if has_virial_global:
         # Per-atom virial, to match GPUMD's *_train.out columns.
+        # Symmetrize off-diagonal pairs (xy with yx, yz with zy, xz with zx)
+        # the same way we symmetrize the prediction, so the two columns are
+        # computed on the exact same definition.
         for i, s in enumerate(structures):
             v = s.get("virial")
             if v is None:
@@ -254,8 +262,14 @@ def predict_dataset(
             v = np.asarray(v).flatten()
             inv_n = 1.0 / float(s["natoms"])
             if v.size == 9:
-                virial_ref[i] = [v[0] * inv_n, v[4] * inv_n, v[8] * inv_n,
-                                 v[1] * inv_n, v[5] * inv_n, v[2] * inv_n]
+                virial_ref[i] = [
+                    v[0] * inv_n,                          # xx
+                    v[4] * inv_n,                          # yy
+                    v[8] * inv_n,                          # zz
+                    0.5 * (v[1] + v[3]) * inv_n,           # xy, yx
+                    0.5 * (v[5] + v[7]) * inv_n,           # yz, zy
+                    0.5 * (v[2] + v[6]) * inv_n,           # xz, zx
+                ]
             elif v.size >= 6:
                 virial_ref[i] = v[:6] * inv_n
 
@@ -461,8 +475,14 @@ def predict_from_store(model, data_store, output_dir: str,
         if data_store.has_virial_flag[i]:
             v9 = data_store.virial[i].cpu().numpy().flatten()  # length-9
             n = float(nat_arr[i])
-            virial_ref[i] = [v9[0]/n, v9[4]/n, v9[8]/n,
-                             v9[1]/n, v9[5]/n, v9[2]/n]
+            virial_ref[i] = [
+                v9[0] / n,                    # xx
+                v9[4] / n,                    # yy
+                v9[8] / n,                    # zz
+                0.5 * (v9[1] + v9[3]) / n,    # xy, yx
+                0.5 * (v9[5] + v9[7]) / n,    # yz, zy
+                0.5 * (v9[2] + v9[6]) / n,    # xz, zx
+            ]
 
     os.makedirs(output_dir, exist_ok=True)
     t_write = time.time()

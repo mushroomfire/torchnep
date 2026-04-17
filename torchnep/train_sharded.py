@@ -47,11 +47,12 @@ from .train import (
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _compute_q_scaler_sharded(model, data_store, batch_size=64,
+def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
                                backend="loop"):
     """Compute descriptor min/max over the local shard, then all-reduce.
 
-    Returns (q_min, q_max) that are globally consistent across all ranks.
+    Uses cached basis from data_store (no Chebyshev recompute). batch_size
+    here is q-scaler-only (independent from training batch), default 1000.
     """
     model.eval()
     dev = next(model.parameters()).device
@@ -63,11 +64,16 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=64,
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
         batch = data_store.collate(list(range(start, end)))
-        q = model.compute_descriptors(
-            batch["rij_rad"], batch["rij_ang"],
+        q = ops.compute_descriptors_cached(
+            batch["fk_rad"], batch["fk_ang"], batch["blm"],
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
+            model.c_param_2, model.c_param_3,
+            model.n_max_radial, model.n_max_angular,
+            model.l_max_3b, model.l_max_4b, model.l_max_5b,
+            model.num_lm, model._c3b, model._c4b, model._c5b,
+            dtype, dev,
             backend=backend,
         )
         q_min = torch.min(q_min, q.min(0).values)
@@ -116,11 +122,19 @@ def train_nep_sharded(
     differences are DDP launch + distributed q_scaler/metric aggregation.
     """
     # ---- Distributed init ------------------------------------------------
+    # Wrap local_rank around the number of visible GPUs — lets several
+    # processes share one GPU (useful for locally simulating multi-rank DDP).
+    # NCCL refuses to share a GPU across ranks, so fall back to gloo (slower
+    # but correct) when world_size > available GPUs.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
-    dev = torch.device(f"cuda:{local_rank}")
+    n_gpus = max(1, torch.cuda.device_count())
+    gpu_id = local_rank % n_gpus
+    torch.cuda.set_device(gpu_id)
+    dev = torch.device(f"cuda:{gpu_id}")
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", device_id=dev)
+        world_size_env = int(os.environ.get("WORLD_SIZE", 1))
+        ddp_backend = "nccl" if world_size_env <= n_gpus else "gloo"
+        dist.init_process_group(backend=ddp_backend)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -302,15 +316,21 @@ def train_nep_sharded(
 
     # q_scaler: local shard → all_reduce
     _log("Computing q_scaler (all-reduce across shards)...")
-    q_min, q_max = _compute_q_scaler_sharded(model, data_store, batch_size,
-                                              backend=backend)
+    t_qs = time.time()
+    q_min, q_max = _compute_q_scaler_sharded(model, data_store, backend=backend)
     model.set_q_scaler(q_min, q_max)
+    torch.cuda.synchronize()
+    _log(f"  Done in {time.time() - t_qs:.1f}s")
 
     if use_compile and hasattr(torch, "compile"):
         _log("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    # All per-type nets are always touched in NEPModel.forward (dummy pass for
+    # types absent in a given batch) so DDP sees every parameter in every step
+    # — no need for find_unused_parameters, and no implicit grad dilution for
+    # rare types.
+    model = DDP(model, device_ids=[gpu_id], find_unused_parameters=False)
     raw_model = (model.module._orig_mod
                  if hasattr(model.module, "_orig_mod")
                  else model.module)
@@ -436,40 +456,62 @@ def train_nep_sharded(
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
+                f_mask = batch["force_mask"] if has_forces else None
+                v_mask = batch["virial_mask"] if has_virial else None
+
+                # --- DDP-correct normalisation --------------------------
+                # DDP averages gradients by world_size. If each rank used a
+                # plain local .mean() loss, the implicit per-rank n_local in
+                # the denominator leaks into the global gradient (only
+                # equivalent to single-card global mean when all n_local are
+                # equal — which is NOT the case here because frames have
+                # different atom counts).
+                # Fix: each rank computes SUM-of-squared-errors, and we divide
+                # by the GLOBAL count (all-reduced per batch). The × world_size
+                # factor cancels DDP's /world_size averaging — giving a true
+                # global-mean loss regardless of how atoms are sharded.
+                counts = torch.tensor([
+                    float(e_mask.sum().item()),
+                    float(f_mask.sum().item()) if f_mask is not None else 0.0,
+                    float(v_mask.sum().item()) if v_mask is not None else 0.0,
+                ], device=dev, dtype=torch.float64)
+                dist.all_reduce(counts)
+                n_e_g = max(counts[0].item(), 1.0)
+                n_f_g = max(counts[1].item(), 1.0)
+                n_v_g = max(counts[2].item(), 1.0)
+                ws = float(world_size)
+
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                # sum_l* accumulates per-batch MSE so the rmse_* columns in
-                # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
+
                 if e_mask.any():
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
-                    loss = loss + cur_pref_e * loss_e
-                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
+                    sum_sq_e = (diff_e ** 2).sum()
+                    loss = loss + cur_pref_e * sum_sq_e * ws / n_e_g
+                    sum_le += sum_sq_e.item()  # global sum-of-squared-errors
 
-                if has_forces:
-                    f_mask = batch["force_mask"]
-                    if f_mask.any():
-                        f_pred = result["forces"][f_mask]
-                        f_ref = batch["forces"][f_mask]
-                        loss_f = _loss_fn(f_pred, f_ref)
-                        loss = loss + cur_pref_f * loss_f
-                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
+                if f_mask is not None and f_mask.any():
+                    f_pred = result["forces"][f_mask]
+                    f_ref = batch["forces"][f_mask]
+                    sum_sq_f = ((f_pred - f_ref) ** 2).sum()
+                    # 3 components per atom → divide by (3 × n_f_g)
+                    loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
+                    sum_lf += (sum_sq_f.item() / 3.0)
 
-                if has_virial and "virial" in result:
-                    v_mask = batch["virial_mask"]
-                    if v_mask.any():
-                        v_atom = result["virial"]
-                        v_sys = torch.zeros(batch["num_structures"], 9,
-                                            dtype=dtype, device=dev)
-                        si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                        v_sys.scatter_add_(0, si, v_atom)
-                        v_ref = batch["virial"]
-                        if v_ref.shape[1] == 9:
-                            na = batch["natoms"][v_mask].unsqueeze(-1)
-                            v_pred_pa = v_sys[v_mask] / na
-                            v_ref_pa = v_ref[v_mask] / na
-                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
-                            loss = loss + cur_pref_v * loss_v
-                            sum_lv += ((v_pred_pa - v_ref_pa) ** 2).mean().item() * v_mask.sum().item()
+                if v_mask is not None and v_mask.any() and "virial" in result:
+                    v_atom = result["virial"]
+                    v_sys = torch.zeros(batch["num_structures"], 9,
+                                        dtype=dtype, device=dev)
+                    si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
+                    v_sys.scatter_add_(0, si, v_atom)
+                    v_ref = batch["virial"]
+                    if v_ref.shape[1] == 9:
+                        na = batch["natoms"][v_mask].unsqueeze(-1)
+                        v_pred_pa = v_sys[v_mask] / na
+                        v_ref_pa = v_ref[v_mask] / na
+                        sum_sq_v = ((v_pred_pa - v_ref_pa) ** 2).sum()
+                        # 9 components per frame → divide by (9 × n_v_g)
+                        loss = loss + cur_pref_v * sum_sq_v * ws / (9.0 * n_v_g)
+                        sum_lv += (sum_sq_v.item() / 9.0)
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -569,8 +611,6 @@ def train_nep_sharded(
                         and epoch != num_epochs
                         and os.path.exists(os.path.join(output_dir,
                                                          "nep_best.txt"))):
-                    _log(f"  [epoch {epoch}] interim predict "
-                         f"(nep_best.txt)...")
                     predict_dataset(
                         os.path.join(output_dir, "nep_best.txt"),
                         data_file, output_dir=output_dir,
@@ -579,6 +619,14 @@ def train_nep_sharded(
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
+
+    # Free every rank's data_store BEFORE rank 0 runs end-of-training predict
+    # (which re-reads full xyz). This matters for simulated multi-process-on-
+    # single-GPU testing; on real multi-GPU it is free extra memory for the
+    # predict pass.
+    del data_store
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
 
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),

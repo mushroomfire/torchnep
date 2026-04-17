@@ -381,12 +381,18 @@ def compute_max_neighbors(structures):
 
 
 @torch.no_grad()
-def compute_q_scaler(model, data_store, batch_size=64, backend="loop"):
+def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
     """Compute descriptor min/max across training set.
 
-    ``backend`` must match the value used during training so that the
-    descriptor statistics are consistent with the actual training-time
-    descriptor values.
+    Uses the cached-basis path (reusing data_store's precomputed Chebyshev +
+    angular basis) — orders of magnitude faster than recomputing from rij.
+
+    ``batch_size`` is a q-scaler-only knob; independent from the training
+    batch size because q-scaler has no backward and can tolerate much bigger
+    batches (default 1000). Set smaller if GPU memory is tight.
+    ``backend`` should match the training backend so the type-pair contraction
+    order of operations (and hence the floating-point accumulation) is the
+    same as what training will see.
     """
     model.eval()
     dev = next(model.parameters()).device
@@ -397,11 +403,16 @@ def compute_q_scaler(model, data_store, batch_size=64, backend="loop"):
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
         batch = data_store.collate(list(range(start, end)))
-        q = model.compute_descriptors(
-            batch["rij_rad"], batch["rij_ang"],
+        q = ops.compute_descriptors_cached(
+            batch["fk_rad"], batch["fk_ang"], batch["blm"],
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
+            model.c_param_2, model.c_param_3,
+            model.n_max_radial, model.n_max_angular,
+            model.l_max_3b, model.l_max_4b, model.l_max_5b,
+            model.num_lm, model._c3b, model._c4b, model._c5b,
+            dtype, dev,
             backend=backend,
         )
         q_min = torch.min(q_min, q.min(0).values)
@@ -635,9 +646,12 @@ def train_nep(
     _log(f"Compute backend: {backend}")
 
     _log("Computing q_scaler...")
-    q_min, q_max = compute_q_scaler(model, data_store, batch_size,
-                                    backend=backend)
+    t0 = time.time()
+    q_min, q_max = compute_q_scaler(model, data_store, backend=backend)
     model.set_q_scaler(q_min, q_max)
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    _log(f"  Done in {time.time() - t0:.1f}s")
 
     if use_compile and hasattr(torch, "compile"):
         _log("Compiling model with torch.compile...")
@@ -889,7 +903,8 @@ def train_nep(
                     and epoch % prediction_interval == 0
                     and epoch != num_epochs
                     and best_state is not None):
-                _log(f"  [epoch {epoch}] interim predict (nep_best weights)...")
+                # Silent interim predict — reuses data_store's preprocessed
+                # neighbor lists + basis (no xyz re-read, no recompute).
                 current_state = {k: v.detach().clone()
                                  for k, v in raw_model.state_dict().items()}
                 raw_model.load_state_dict(best_state)

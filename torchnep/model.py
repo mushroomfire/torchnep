@@ -148,11 +148,19 @@ class NEPModel(nn.Module):
             pi_ang, pj_ang, atom_types, N,
             backend=backend)
         q_scaled = q * self.q_scaler
+        # See compute_properties_cached for why every per-type net is touched.
         Ei = torch.zeros(N, dtype=q.dtype, device=q.device)
+        dummy_accum = torch.zeros((), dtype=q.dtype, device=q.device)
+        dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
+            1, self.dim, dtype=q.dtype, device=q.device)
         for t in range(self.num_types):
             mask = atom_types == t
+            net = self.fitting_nets[t]
             if mask.any():
-                Ei[mask] = self.fitting_nets[t](q_scaled[mask])
+                Ei[mask] = net(q_scaled[mask])
+            else:
+                dummy_accum = dummy_accum + net(dummy_q).sum()
+        Ei = Ei + dummy_accum * 0.0
         return Ei - self.b1
 
     def compute_properties(self, rij_rad, rij_ang, pi_rad, pj_rad,
@@ -260,24 +268,40 @@ class NEPModel(nn.Module):
 
         q_scaled = q * self.q_scaler
 
-        # NN forward + Fp computation (differentiable through NN weights)
+        # NN forward + Fp computation (differentiable through NN weights).
+        #
+        # Every per-type fitting net is touched in the graph on every forward
+        # — even types with no atoms in this batch get a zeroed-out dummy pass.
+        # This keeps DDP gradient bookkeeping consistent (no need for
+        # find_unused_parameters=True) and, critically, avoids the implicit
+        # /world_size gradient dilution that DDP applies to unused parameters
+        # (which was biasing rare-type NNs toward lower effective LR).
         Ei = torch.zeros(N, dtype=dtype, device=device)
         Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
+        dummy_accum = torch.zeros((), dtype=dtype, device=device)
+        dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
+            1, self.dim, dtype=dtype, device=device)
 
         for t in range(self.num_types):
             mask = batch["atom_types"] == t
-            if not mask.any():
-                continue
             net = self.fitting_nets[t]
-            qt = q_scaled[mask]
-            z = qt @ net.w0 - net.b0          # (Nt, neurons)
-            h = torch.tanh(z)
-            Ei[mask] = h @ net.w1
-            # Fp = dEi/dq_scaled: backprop through tanh
-            tanh_der = 1.0 - h * h            # (Nt, neurons)
-            Fp[mask] = (net.w1 * tanh_der) @ net.w0.T  # (Nt, dim)
+            if mask.any():
+                qt = q_scaled[mask]
+                z = qt @ net.w0 - net.b0
+                h = torch.tanh(z)
+                Ei[mask] = h @ net.w1
+                tanh_der = 1.0 - h * h
+                Fp[mask] = (net.w1 * tanh_der) @ net.w0.T
+            else:
+                # Dummy forward (the × 0 below nulls the contribution but
+                # keeps the net's parameters in the autograd graph).
+                z_d = dummy_q @ net.w0 - net.b0
+                h_d = torch.tanh(z_d)
+                dummy_accum = dummy_accum + (h_d @ net.w1).sum()
 
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
+        # Nail the unused-type gradient path into Ei without changing its value.
+        Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1  # subtract shared output bias
 
         # ZBL energy
