@@ -21,8 +21,11 @@ def _parse_properties_schema(comment: str):
     downstream parsing handle arbitrary field ordering, including the
     ``pos:R:3:species:S:1`` form produced by some exporters.
     """
-    key = "Properties="
-    idx = comment.find(key)
+    # Case-insensitive match: ASE uses "Properties=" while some exporters
+    # use "properties=". Look in a lower-cased copy but slice from original
+    # so we preserve field names (species, pos, force, ...).
+    key = "properties="
+    idx = comment.lower().find(key)
     if idx < 0:
         return None
     start = idx + len(key)
@@ -133,9 +136,14 @@ def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
 
 
 def _find_quoted(comment: str, key: str):
-    """Return the content inside key="..." or None if absent."""
-    needle = key + '="'
-    i = comment.find(needle)
+    """Return the content inside key="..." or None if absent.
+
+    Matches ``key`` case-insensitively (e.g. ``Virial="..."`` and
+    ``virial="..."`` both work — GPUMD / ASE / pymatgen differ on casing).
+    """
+    low = comment.lower()
+    needle = key.lower() + '="'
+    i = low.find(needle)
     if i < 0:
         return None
     i += len(needle)
@@ -148,16 +156,18 @@ def _find_quoted(comment: str, key: str):
 def _find_scalar(comment: str, key: str):
     """Return the string value after ``key=`` (unquoted) or None if absent.
 
-    Only returns a match when ``key=`` is preceded by whitespace or start of
-    string — prevents ``atomization_energy=`` from matching ``energy=``.
+    Matches ``key`` case-insensitively. Only returns a match when ``key=``
+    is preceded by whitespace or start of string — prevents
+    ``atomization_energy=`` from matching ``energy=``.
     """
-    needle = key + "="
+    low = comment.lower()
+    needle = key.lower() + "="
     start = 0
     while True:
-        i = comment.find(needle, start)
+        i = low.find(needle, start)
         if i < 0:
             return None
-        if i == 0 or comment[i - 1] in (" ", "\t"):
+        if i == 0 or low[i - 1] in (" ", "\t"):
             i += len(needle)
             j = i
             while j < len(comment) and comment[j] not in (" ", "\t", '"'):

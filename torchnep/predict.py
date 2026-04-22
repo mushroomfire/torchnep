@@ -403,16 +403,19 @@ def predict_dataset(
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
 
-    # Stress = virial_total / V × EV_PER_A3_TO_GPa  (GPa). Matches GPUMD's
-    # stress_train.out convention (src/main_nep/fitness.cu: the output is
-    # virial/volume with no sign flip, so torchnep's stress_predict.out is
-    # byte-comparable with GPUMD's stress_train.out). Since v_pred_arr and
-    # virial_ref are stored per-atom, multiply by natoms to recover totals.
+    # Stress = -virial_total / V × EV_PER_A3_TO_GPa  (GPa). The negative
+    # sign makes the round-trip XYZ-stress ↔ output-stress consistent:
+    # data.py reads a stress= tag as virial = -stress × V, so emitting
+    # stress_out = -virial / V cancels that flip and the user sees the
+    # same sign on input and output (positive = tensile per torchnep/GPUMD
+    # README). NOTE this differs from GPUMD's own stress_train.out by a
+    # sign — GPUMD writes +virial/V, inheriting its internal virial sign
+    # (which is why GPUMD's output stress contradicts its input README).
     from .constants import EV_PER_A3_TO_GPa
     nat_col = natoms_arr.astype(np.float64)[:, None]
     vol_col = volumes_arr[:, None]
     vol_safe = np.where(vol_col > 0, vol_col, 1.0)
-    scale = nat_col / vol_safe * EV_PER_A3_TO_GPa
+    scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
     stress_pred = v_pred_arr * scale
     stress_ref = virial_ref * scale
     np.savetxt(os.path.join(output_dir, "stress_predict.out"),
@@ -527,14 +530,15 @@ def predict_from_store(model, data_store, output_dir: str,
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
-    # Stress (GPa) = virial_total / V × conversion. Matches GPUMD's
-    # stress_train.out convention (no sign flip) — see predict_dataset.
+    # Stress (GPa) = -virial_total / V × conversion. Sign picked so round-
+    # trip XYZ-stress ↔ output-stress is consistent (see predict_dataset
+    # for the derivation; differs from GPUMD's stress_train.out by a sign).
     from .constants import EV_PER_A3_TO_GPa
     vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
     nat_col = nat_arr.astype(np.float64)[:, None]
     vol_col = vol_arr[:, None]
     vol_safe = np.where(vol_col > 0, vol_col, 1.0)
-    scale = nat_col / vol_safe * EV_PER_A3_TO_GPa
+    scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
     stress_pred = v_pred * scale
     stress_ref = virial_ref * scale
     np.savetxt(os.path.join(output_dir, "stress_predict.out"),
