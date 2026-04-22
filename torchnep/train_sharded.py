@@ -705,7 +705,8 @@ def train_nep_sharded(
                         os.path.join(output_dir, "nep_best.txt"),
                         data_file, output_dir=output_dir,
                         dtype=precision, device=str(dev),
-                        backend=backend, verbose=False)
+                        backend=backend, verbose=False,
+                        energy_key=energy_key)
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
@@ -745,7 +746,7 @@ def train_nep_sharded(
         predict_dataset(os.path.join(output_dir, "nep_final.txt"),
                         data_file, output_dir=output_dir,
                         dtype=precision, device=str(dev),
-                        backend=backend)
+                        backend=backend, energy_key=energy_key)
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
         total_time = time.time() - total_t0
