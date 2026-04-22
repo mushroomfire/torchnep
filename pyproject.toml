@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "PyTorch implementation of NEP (Neuroevolution Potential)"
 readme = "README.md"
 authors = [
-    {name = "Yongchao Wu", email = "yongchao.wu@aalto.fi"},
+    {name = "Yongchao Wu"},
+    {email = "yongchao.wu@aalto.fi"},
 ]
 license = "BSD-3-Clause"
 license-files = ["LICENSE"]
@@ -20,6 +21,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "mdapy"]
+
+[project.urls]
+Homepage = "https://github.com/mushroomfire/torchnep"
+Repository = "https://github.com/mushroomfire/torchnep"
+Issues = "https://github.com/mushroomfire/torchnep/issues"
 
 [tool.hatch.version]
 path = "torchnep/__init__.py"
