@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026, Yongchao Wu.
+# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+
 """
 Trainable NEP4 model as a PyTorch nn.Module.
 
