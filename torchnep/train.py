@@ -54,19 +54,29 @@ def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
 
     ``world_size`` is used by ``train_nep_sharded`` to surface DDP info;
     single-GPU ``train_nep`` keeps the default of 1.
+
+    PyTorch-ROCm exposes AMD GPUs through the ``torch.cuda`` namespace, so
+    the cuda branch also handles ROCm. Intel GPUs use ``torch.xpu``.
     """
     lines = []
     if dev.type == "cuda":
         n_visible = torch.cuda.device_count()
+        is_rocm = getattr(torch.version, "hip", None) is not None
+        tag = "ROCm" if is_rocm else "CUDA"
         if world_size > 1:
-            lines.append(f"Backend  : CUDA (DDP, {world_size} processes)")
+            lines.append(f"Backend  : {tag} (DDP, {world_size} processes)")
         else:
-            lines.append("Backend  : CUDA")
+            lines.append(f"Backend  : {tag}")
         names = {torch.cuda.get_device_name(i) for i in range(n_visible)}
         name_str = ", ".join(sorted(names))
         total_gb = sum(torch.cuda.get_device_properties(i).total_memory
                        for i in range(n_visible)) / 1e9
         lines.append(f"Devices  : {n_visible} x {name_str}  ({total_gb:.1f} GB total)")
+    elif dev.type == "xpu":
+        n_visible = torch.xpu.device_count()
+        lines.append(f"Backend  : XPU (Intel){' (DDP, ' + str(world_size) + ' processes)' if world_size > 1 else ''}")
+        names = {torch.xpu.get_device_name(i) for i in range(n_visible)}
+        lines.append(f"Devices  : {n_visible} x {', '.join(sorted(names))}")
     elif dev.type == "mps":
         lines.append("Backend  : MPS (Apple Silicon)")
     else:
@@ -76,12 +86,80 @@ def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
 
 
 def _default_device() -> str:
-    """Select best available device: CUDA → MPS → CPU."""
+    """Select best available device: CUDA/ROCm → XPU → MPS → CPU.
+
+    PyTorch-ROCm routes AMD GPUs through the cuda namespace, so the cuda
+    probe catches both. Other torch backends (e.g. XPU for Intel) are
+    detected if their namespace is present and reports an available device.
+    """
     if torch.cuda.is_available():
         return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Bucket batching
+#
+# Frames are sorted by natoms, then cut into buckets of ``world_size × batch_size``
+# contiguous frames. Each rank's share from each bucket is a ``batch_size``-long
+# slice. Per-epoch, the BUCKET ORDER is shuffled (same seed on every rank), so
+# within any DDP iteration all ranks process frames from the same natoms
+# quantile of the dataset → per-batch atom counts are matched across ranks,
+# eliminating straggler waste.
+#
+# For single-GPU (world_size == 1) we still sort + bucket; the last bucket
+# may be partial. This gives a slight stability gain (within-batch natoms
+# variance is small) at zero compute cost.
+# ---------------------------------------------------------------------------
+
+def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
+                     batch_size: int):
+    """Sort frames by natoms and return this rank's local slice + bucket count.
+
+    Parameters
+    ----------
+    frames       : list of frame dicts (as returned by read_xyz).
+    rank         : int in [0, world_size).
+    world_size   : int  ≥ 1.
+    batch_size   : int  per-rank batch size.
+
+    Returns
+    -------
+    local_frames : list of frames this rank should preprocess / store.
+                   Length is ``num_buckets * batch_size`` for DDP, or
+                   ``len(frames)`` for single-GPU (last bucket may be partial).
+    num_buckets  : number of buckets == iterations per epoch on this rank.
+    dropped      : number of frames dropped from the end of the dataset
+                   (always 0 for single-GPU).
+    """
+    n = len(frames)
+    B = batch_size
+    W = world_size
+
+    sorted_frames = sorted(frames, key=lambda f: f["natoms"])
+
+    if W == 1:
+        num_buckets = (n + B - 1) // B
+        return sorted_frames, num_buckets, 0
+
+    num_full_buckets = n // (W * B)
+    if num_full_buckets == 0:
+        raise RuntimeError(
+            f"dataset too small for bucket batching with DDP: need at least "
+            f"world_size × batch_size = {W * B} frames, got {n}. Reduce "
+            f"batch_size or run on a single GPU.")
+    dropped = n - num_full_buckets * W * B
+
+    local = []
+    for b in range(num_full_buckets):
+        bucket_start = b * W * B
+        rank_start = bucket_start + rank * B
+        local.extend(sorted_frames[rank_start:rank_start + B])
+    return local, num_full_buckets, dropped
 
 
 
@@ -472,6 +550,7 @@ def train_nep(
     finetune_from: str = None,
     reset_lr: float = None,
     slim_types: bool = False,
+    energy_key: str = "energy",
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -503,6 +582,9 @@ def train_nep(
     finetune_from : path to an existing .pt or nep.txt to load weights from.
     reset_lr : override LR after resume/finetune.
     slim_types : drop element types not present in data_file before training.
+    energy_key : name of the comment-line tag read as the reference energy
+        (default ``"energy"``). Set to ``"atomization_energy"`` to train
+        against atomization energies instead of totals.
     """
     # ---- Device ----------------------------------------------------------
     if device is None:
@@ -558,8 +640,14 @@ def train_nep(
 
     # ---- Data ------------------------------------------------------------
     _log("Loading training data...")
-    frames = read_xyz(data_file)
+    _log(f"  energy label: {energy_key}")
+    frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  {len(frames)} structures")
+
+    # Sort by natoms + bucket for stable batch compute (see _sort_and_shard).
+    frames, num_buckets, _dropped = _sort_and_shard(
+        frames, rank=0, world_size=1, batch_size=batch_size)
+    _log(f"  {num_buckets} buckets (sorted by natoms, batch_size={batch_size})")
 
     # slim_types: detect which element types actually appear in the data and
     # narrow config before building neighbor lists / GPUDataStore / model.
@@ -737,9 +825,14 @@ def train_nep(
             t_epoch = time.time()
             model.train()
 
+            # Bucket batching: frames in data_store are sorted by natoms;
+            # a "bucket" is a contiguous slice of ``batch_size`` frames and
+            # corresponds to one DDP iteration. Shuffling only the bucket
+            # ORDER keeps batches natoms-homogeneous while randomising the
+            # per-epoch iteration sequence.
             g = torch.Generator()
             g.manual_seed(epoch)
-            perm = torch.randperm(n_structs, generator=g)
+            bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = 0.0
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
@@ -761,9 +854,10 @@ def train_nep(
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
-            batch_starts = list(range(0, n_structs, batch_size))
-            for bi, start in enumerate(batch_starts):
-                idx = perm[start:start + batch_size].tolist()
+            for bi in bucket_perm:
+                start = bi * batch_size
+                end = min(start + batch_size, n_structs)
+                idx = list(range(start, end))
                 batch = data_store.collate(idx)
 
                 if use_autograd_forces:

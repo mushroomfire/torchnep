@@ -38,17 +38,18 @@ def _parse_properties_schema(comment: str):
     return schema
 
 
-def _parse_frame_block(block):
+def _parse_frame_block(block, energy_key="energy"):
     """Parse one frame from a list of text lines (picklable for mp.Pool).
 
-    Reads standard extended XYZ with a ``Properties=...`` schema. Recognises
-    ``pos``, ``force`` / ``forces``, and skips any other columns (e.g.
-    ``Z:I:1`` atomic number). Energy / virial / lattice come from the
-    comment-line key=value tags (see ``_parse_comment``).
+    Reads extended XYZ with a ``Properties=...`` schema. Only
+    ``species:S:1``, ``pos:R:3``, and ``force:R:3`` / ``forces:R:3`` are
+    consumed — any other columns are silently ignored. Energy / virial /
+    stress / lattice come from the comment-line key=value tags; see
+    ``_parse_comment`` for strict-mode validation rules.
     """
     natoms = int(block[0].strip())
     comment = block[1].strip()
-    frame = _parse_comment(comment, natoms)
+    frame = _parse_comment(comment, natoms, energy_key=energy_key)
 
     schema = _parse_properties_schema(comment)
     if schema is None or "pos" not in schema:
@@ -68,7 +69,6 @@ def _parse_frame_block(block):
     for j, line in enumerate(atoms):
         toks = line.split()
         species[j] = toks[sp_col]
-        # collect everything except the species token, preserving order
         numeric_rows.append([t for k, t in enumerate(toks) if k != sp_col])
 
     ncol_numeric = len(numeric_rows[0])
@@ -79,9 +79,6 @@ def _parse_frame_block(block):
     frame["natoms"] = natoms
     frame["species"] = species
 
-    # Column offsets in schema are relative to the full token list including
-    # species; convert to offsets within the numeric tail by subtracting 1 for
-    # any field whose token position is beyond species.
     def _numeric_offset(field_col):
         return field_col if field_col < sp_col else field_col - 1
 
@@ -111,48 +108,111 @@ def _split_frames(lines):
     return blocks
 
 
-def read_xyz(filename: str) -> List[Dict]:
-    """Read extended XYZ file (GPUMD format)."""
+def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
+    """Read extended XYZ file (GPUMD format).
+
+    Parameters
+    ----------
+    filename : str
+        Path to the .xyz file.
+    energy_key : str
+        Name of the per-frame energy tag to read. Defaults to ``"energy"``;
+        set to e.g. ``"atomization_energy"`` to use atomization energies
+        instead of total energies.
+    """
     with open(filename) as f:
         lines = f.readlines()
 
     blocks = _split_frames(lines)
     del lines
-    return [_parse_frame_block(b) for b in blocks]
+    return [_parse_frame_block(b, energy_key=energy_key) for b in blocks]
 
 
-def _parse_comment(comment: str, natoms: int) -> Dict:
-    """Parse extended XYZ comment line."""
+def _find_quoted(comment: str, key: str):
+    """Return the content inside key="..." or None if absent."""
+    needle = key + '="'
+    i = comment.find(needle)
+    if i < 0:
+        return None
+    i += len(needle)
+    j = comment.find('"', i)
+    if j < 0:
+        return None
+    return comment[i:j]
+
+
+def _find_scalar(comment: str, key: str):
+    """Return the string value after ``key=`` (unquoted) or None if absent.
+
+    Only returns a match when ``key=`` is preceded by whitespace or start of
+    string — prevents ``atomization_energy=`` from matching ``energy=``.
+    """
+    needle = key + "="
+    start = 0
+    while True:
+        i = comment.find(needle, start)
+        if i < 0:
+            return None
+        if i == 0 or comment[i - 1] in (" ", "\t"):
+            i += len(needle)
+            j = i
+            while j < len(comment) and comment[j] not in (" ", "\t", '"'):
+                j += 1
+            return comment[i:j]
+        start = i + 1
+
+
+def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dict:
+    """Parse extended XYZ comment line with strict-mode validation.
+
+    Rules:
+      - ``Lattice="ax ay az bx by bz cx cy cz"`` is mandatory (9 floats).
+        Every frame is treated as fully periodic; the ``pbc=`` tag is
+        ignored (isolated clusters / molecules must be wrapped in a large
+        vacuum box by the user before loading).
+      - Energy tag name is configurable via ``energy_key`` (default "energy");
+        if missing, the frame simply has no energy (handled downstream).
+      - ``virial="..."`` and ``stress="..."`` are optional but, when present,
+        must have exactly 9 components. If both are given, virial wins.
+        stress (eV/Å³) is converted to virial (eV) as
+        ``virial = -stress * |det(lattice)|`` — opposite sign convention.
+    """
     frame = {}
 
-    # Extract Lattice
-    lat_start = comment.find('Lattice="')
-    if lat_start >= 0:
-        lat_start += len('Lattice="')
-        lat_end = comment.find('"', lat_start)
-        lat_str = comment[lat_start:lat_end]
-        lat_vals = [float(x) for x in lat_str.split()]
-        frame["cell"] = np.array(lat_vals).reshape(3, 3)
+    lat_str = _find_quoted(comment, "Lattice")
+    if lat_str is None:
+        raise ValueError(
+            "extended-xyz frame is missing mandatory Lattice=\"...\" tag; "
+            "comment: " + comment[:160])
+    lat_vals = [float(x) for x in lat_str.split()]
+    if len(lat_vals) != 9:
+        raise ValueError(
+            f"Lattice must have exactly 9 components, got {len(lat_vals)}; "
+            "comment: " + comment[:160])
+    frame["cell"] = np.array(lat_vals).reshape(3, 3)
 
-    # Extract energy
-    for prefix in ["energy=", "Energy="]:
-        idx = comment.find(prefix)
-        if idx >= 0:
-            start = idx + len(prefix)
-            end = start
-            while end < len(comment) and comment[end] not in (" ", '"', "\t"):
-                end += 1
-            frame["energy"] = float(comment[start:end])
-            break
+    e_val = _find_scalar(comment, energy_key)
+    if e_val is not None:
+        frame["energy"] = float(e_val)
 
-    # Extract virial
-    vir_start = comment.find('virial="')
-    if vir_start >= 0:
-        vir_start += len('virial="')
-        vir_end = comment.find('"', vir_start)
-        vir_str = comment[vir_start:vir_end]
+    vir_str = _find_quoted(comment, "virial")
+    if vir_str is not None:
         vir_vals = [float(x) for x in vir_str.split()]
+        if len(vir_vals) != 9:
+            raise ValueError(
+                f"virial must have exactly 9 components, got {len(vir_vals)}; "
+                "comment: " + comment[:160])
         frame["virial"] = np.array(vir_vals)
+    else:
+        stress_str = _find_quoted(comment, "stress")
+        if stress_str is not None:
+            stress_vals = [float(x) for x in stress_str.split()]
+            if len(stress_vals) != 9:
+                raise ValueError(
+                    f"stress must have exactly 9 components, got "
+                    f"{len(stress_vals)}; comment: " + comment[:160])
+            volume = abs(float(np.linalg.det(frame["cell"])))
+            frame["virial"] = -np.array(stress_vals) * volume
 
     return frame
 
@@ -295,9 +355,19 @@ def build_neighbor_list_np(positions, cell, cutoff):
     V/|a×b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
     reciprocal vectors). Using rows silently undercounts image replicas for
     heavily skewed triclinic cells and drops real neighbors — bug fixed 2025.
+
+    Input positions may lie outside the primary cell. Under full PBC, physics
+    is translation-invariant, so we wrap fractional coordinates into [0, 1)
+    before computing ``n_rep``; otherwise atoms far outside the box would
+    miss periodic images that the (inside-box) ``n_rep`` estimate doesn't
+    cover.
     """
     N = positions.shape[0]
     inv_cell = np.linalg.inv(cell)
+
+    frac = positions @ inv_cell
+    frac -= np.floor(frac)
+    positions = frac @ cell
 
     n_rep = [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i]))) for i in range(3)]
 

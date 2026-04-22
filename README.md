@@ -23,7 +23,37 @@ pip install -e .
 
 Requirements: `torch >= 2.0`, `numpy`.
 
-Pure PyTorch — no native extensions to compile. Runs on CPU, CUDA, or MPS.
+Pure PyTorch — no native extensions to compile.
+
+---
+
+## Device backends
+
+torchnep is written on top of stock PyTorch, so it runs on any device
+backend that PyTorch itself supports. The four that are handled explicitly
+(auto-detected in this order) are:
+
+| Backend | Vendor / hardware | Status |
+| --- | --- | --- |
+| `cuda` | NVIDIA GPUs | tested, primary target (single GPU, DDP multi-GPU, multi-node) |
+| `cuda` | AMD GPUs via PyTorch-ROCm | works unmodified — PyTorch-HIP exposes AMD GPUs through the `torch.cuda` namespace, so `dev.type == "cuda"` is already `True`. Not CI-tested by us |
+| `xpu` | Intel GPUs | auto-detected if `torch.xpu.is_available()`. Not CI-tested by us |
+| `mps` | Apple Silicon | tested |
+| `cpu` | any | tested |
+
+Any other PyTorch device that behaves like a standard stream-based
+accelerator (exposes `.to(dev)` plus the usual tensor ops) should work if
+you pass it explicitly, e.g. `train_nep(..., device="<name>")`. The only
+device-specific code paths are `torch.cuda.synchronize()` /
+`torch.cuda.empty_cache()` calls used for timing accuracy on CUDA/ROCm;
+they are skipped on other backends, so correctness is unaffected but the
+reported per-epoch seconds may include a small amount of async queueing
+overhead.
+
+No custom kernels: both compute backends (`"loop"` and `"bmm"`) are pure
+PyTorch. `"bmm"` dispatches to whatever `torch.bmm` uses on your device
+(cuBLAS on CUDA, rocBLAS on ROCm, oneDNN on XPU, MKL/Accelerate on CPU,
+MPS on Apple).
 
 ---
 
@@ -36,6 +66,56 @@ train_nep("nep.in", "train.xyz", output_dir="output")
 ```
 
 That is all that is needed for a single-GPU run.  Output files appear in `output/`.
+
+---
+
+## Input XYZ format
+
+torchnep reads extended-XYZ files. Every frame is two lines of header
+(atom count + comment line with `key="value"` tags) followed by one line
+per atom. The parser is strict — the following rules are enforced and
+violations raise on load rather than silently producing wrong physics.
+
+### Comment line tags
+
+- `Lattice="ax ay az bx by bz cx cy cz"` — **mandatory**. Nine floats in
+  Å giving the three lattice vectors as rows. Every frame is treated as
+  fully periodic; if your data has isolated clusters / molecules, wrap
+  them in a large vacuum box first (a standalone helper script is
+  provided in [PeriodicTable/prepare_xyz.py](PeriodicTable/prepare_xyz.py)).
+- `pbc=...` — ignored. Because `Lattice` is mandatory, frames are always
+  treated as fully periodic. If you really need a non-periodic direction,
+  use a vacuum box wider than the NEP cutoff in that direction.
+- `energy=<value>` — optional, eV. The tag name is configurable via the
+  `energy_key` argument of `train_nep` / `train_nep_sharded` /
+  `predict_dataset` (default `"energy"`). For example, pass
+  `energy_key="atomization_energy"` to train against atomization energies.
+- `virial="vxx vxy vxz vyx vyy vyz vzx vzy vzz"` — optional, eV. Must
+  have exactly 9 components. Positive values denote compressed states,
+  negative denote stretched states (GPUMD convention).
+- `stress="sxx sxy sxz syx syy syz szx szy szz"` — optional, eV/Å³.
+  Must have exactly 9 components. Positive = stretched, negative =
+  compressed — opposite sign to virial. Internally converted as
+  `virial = -stress * det(Lattice)`. If both `virial` and `stress` are
+  present, `virial` wins.
+
+### Per-atom columns
+
+The `Properties=...` schema declares column layout. torchnep reads only
+three fields and silently ignores everything else (e.g. `Z:I:1`):
+
+- `species:S:1` — chemical symbol (case-sensitive; must match the
+  `type` list in `nep.in`).
+- `pos:R:3` — Cartesian position in Å. Positions may lie outside the
+  primary cell; the neighbor-list code wraps them back automatically
+  (full PBC makes this exact).
+- `force:R:3` or `forces:R:3` — reference force in eV/Å (optional).
+
+Example frame header:
+
+```text
+Lattice="5.43 0 0 0 5.43 0 0 0 5.43" Properties=species:S:1:pos:R:3:forces:R:3 energy=-123.45 stress="0.001 0 0 0 0.001 0 0 0 0.001" pbc="T T T"
+```
 
 ---
 
@@ -62,7 +142,7 @@ train_nep(
     config_file="nep.in",
     data_file="train.xyz",
     output_dir="output",
-    device="cuda",          # "cuda" | "cpu" | "mps" — auto-detected if omitted
+    device="cuda",          # "cuda" | "xpu" | "mps" | "cpu" — auto-detected if omitted
     backend="auto",         # "auto" | "loop" | "bmm" — see table below
     use_compile=True,       # torch.compile (~10% extra speedup)
 )
@@ -232,7 +312,7 @@ launch time:
 
 | Argument | Default | What it controls |
 |---|---|---|
-| `device` | auto | "cuda" / "cpu" / "mps" |
+| `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"` (see Device backends above) |
 | `precision` | `"float32"` | dtype for training + store |
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
 | `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
@@ -245,6 +325,7 @@ launch time:
 | `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` before training |
 | `reset_lr` | `None` | override LR after resume/finetune |
 | `slim_types` | `False` | drop element types absent from the dataset |
+| `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
 
 ---
 

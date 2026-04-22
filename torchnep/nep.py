@@ -269,7 +269,7 @@ class NEPCalculator:
         pair_i_rad, pair_j_rad, rij_rad, pair_i_ang, pair_j_ang, rij_ang,
         atom_types, struct_idx, N, num_structures.
 
-        ``backend`` ∈ {"loop", "fast", "cuda"} — see ops.resolve_backend.
+        ``backend`` ∈ {"loop", "bmm"} — see ops.resolve_backend.
         """
         dtype, device = self.dtype, self.device
         N = batch["N"]

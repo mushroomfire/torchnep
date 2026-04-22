@@ -6,6 +6,12 @@ build-backend = "hatchling.build"
 name = "torchnep"
 dynamic = ["version"]
 description = "PyTorch implementation of NEP (Neuroevolution Potential)"
+readme = "README.md"
+authors = [
+    {name = "Yongchao Wu", email = "yongchao.wu@aalto.fi"},
+]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.0",
@@ -28,6 +34,7 @@ packages = ["torchnep"]
 include = [
     "torchnep/**/*.py",
     "README.md",
+    "LICENSE",
     "pyproject.toml",
 ]
 exclude = [

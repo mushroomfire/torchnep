@@ -176,17 +176,9 @@ class NEPModel(nn.Module):
             rij_rad = rij_rad.detach().requires_grad_(True)
             rij_ang = rij_ang.detach().requires_grad_(True)
 
-        # During training, the non-cached descriptor path must stay autograd-
-        # friendly through rij AND through c. CUDA autograd.Function.backward
-        # for ScatterContraction is known buggy for c3 gradients (see notes),
-        # so during training we coerce backend to "loop"/"fast" which are
-        # fully autograd-safe.
-        fwd_backend = backend
-        if self.training and backend == "cuda":
-            fwd_backend = "fast"
         Ei = self.forward(rij_rad, rij_ang, pi_rad, pj_rad,
                           pi_ang, pj_ang, atom_types, N,
-                          backend=fwd_backend)
+                          backend=backend)
 
         if self.zbl is not None:
             Ei = Ei + ops.compute_zbl(
@@ -231,7 +223,7 @@ class NEPModel(nn.Module):
         Uses fully analytical force computation — no create_graph=True needed.
         Forces are differentiable through c2, c3 (via Fp→NN weights and via s→c3).
 
-        ``backend`` ∈ {"loop", "fast", "cuda"} — see torchnep.ops.resolve_backend.
+        ``backend`` ∈ {"loop", "bmm"} — see torchnep.ops.resolve_backend.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device

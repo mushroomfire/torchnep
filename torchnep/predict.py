@@ -148,6 +148,7 @@ def predict_dataset(
     batch_size: int = 1000,
     verbose: bool = True,
     backend: str = "auto",
+    energy_key: str = "energy",
 ):
     """Run batched prediction on a full dataset and save GPUMD-format outputs.
 
@@ -159,12 +160,15 @@ def predict_dataset(
     The format mirrors GPUMD's *_train.out files, so the two can be diffed
     column by column.
 
-    ``backend`` ∈ {"auto", "loop", "fast", "cuda"} — see
+    ``backend`` ∈ {"auto", "loop", "bmm"} — see
     ``torchnep.ops.resolve_backend``.
     """
     if device is None:
+        # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
         if torch.cuda.is_available():
             device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = "mps"
         else:
@@ -184,16 +188,16 @@ def predict_dataset(
     l_max_3b = calc.l_max_3b
     num_lm = calc.num_lm
 
-    # Resolve backend now that num_types is known. "auto" probes the kernel
-    # if ntypes < 8, falls back to "fast" if nvcc is unavailable.
+    # Resolve "auto" now that num_types is known (≥8 → "bmm", else "loop").
     backend = ops.resolve_backend(backend, num_types=calc.num_types)
     _log(f"  backend: {backend}")
 
     # 1) Read xyz
     t0 = time.time()
-    frames = read_xyz(xyz_file)
+    frames = read_xyz(xyz_file, energy_key=energy_key)
     n_struct = len(frames)
-    _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames)")
+    _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames, "
+         f"energy label: {energy_key})")
 
     # 2) Multi-process neighbor-list construction
     from .train import preprocess_structures  # local import: avoid cycle

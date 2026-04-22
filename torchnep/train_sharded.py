@@ -74,6 +74,7 @@ from .train import (
     GPUDataStore,
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
+    _sort_and_shard,
 )
 
 
@@ -142,6 +143,7 @@ def train_nep_sharded(
     finetune_from: str = None,
     reset_lr: float = None,
     slim_types: bool = False,
+    energy_key: str = "energy",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -238,7 +240,8 @@ def train_nep_sharded(
 
     # ---- Data: each rank loads 1/world_size of structures ----------------
     _log("Loading training data...")
-    frames = read_xyz(data_file)
+    _log(f"  energy label: {energy_key}")
+    frames = read_xyz(data_file, energy_key=energy_key)
     n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
@@ -257,13 +260,23 @@ def train_nep_sharded(
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
+    # Bucket sharding: sort globally by natoms, drop partial last bucket,
+    # assign rank r the r-th batch_size-block inside every bucket. This
+    # guarantees all ranks have identical n_local (= num_buckets × batch_size)
+    # and that iteration i on every rank draws from the same natoms quantile,
+    # so per-batch compute is matched across ranks.
+    local_frames, num_buckets, dropped = _sort_and_shard(
+        frames, rank=rank, world_size=world_size,
+        batch_size=config["batch_size"])
+    n_local = len(local_frames)
     _log(f"  {n_total} structures total → "
-         f"rank {rank} loads {len(frames[rank::world_size])}")
+         f"rank {rank} gets {n_local} (bucket-sharded across {world_size} ranks, "
+         f"{num_buckets} buckets × batch_size={config['batch_size']}"
+         f"{', dropped ' + str(dropped) + ' frames from partial tail bucket' if dropped else ''})")
 
     _log("Building neighbor lists (local shard)...")
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
-    local_frames = frames[rank::world_size]
     structures = preprocess_structures(local_frames, config, np_dtype)
     _log(f"  Done in {time.time() - t0:.1f}s")
 
@@ -465,11 +478,13 @@ def train_nep_sharded(
             t_epoch = time.time()
             model.train()
 
-            # Each rank permutes its own local indices independently.
-            # DDP gradient all-reduce ensures consistent parameter updates.
+            # Bucket-order shuffle: same seed on every rank → identical
+            # bucket_perm across ranks. Each rank processes its own slice of
+            # each bucket, so iteration i on every rank draws from the same
+            # natoms quantile — per-batch compute stays balanced.
             g = torch.Generator()
-            g.manual_seed(epoch * world_size + rank)
-            perm = torch.randperm(n_local, generator=g)
+            g.manual_seed(epoch)
+            bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = 0.0
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
@@ -491,8 +506,9 @@ def train_nep_sharded(
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
-            for start in range(0, n_local, batch_size):
-                idx = perm[start:start + batch_size].tolist()
+            for bi in bucket_perm:
+                start = bi * batch_size
+                idx = list(range(start, start + batch_size))
                 batch = data_store.collate(idx)
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the

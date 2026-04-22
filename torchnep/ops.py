@@ -57,7 +57,20 @@ def chebyshev_basis(dij: torch.Tensor, rc: float,
                     basis_size: int) -> torch.Tensor:
     """Chebyshev radial basis: f_k(r) = 0.5*(T_k(x)+1)*fc(r).
 
-    Returns: (P, basis_size+1).
+    Parameters
+    ----------
+    dij : (P,) float
+        Pair distances in Å. P is the total number of pairs in the batch
+        (so this works for one frame, many frames, or zero pairs).
+    rc : float
+        Radial cutoff in Å. Basis is designed so f_k(rc) = 0.
+    basis_size : int
+        Polynomial order (== NEP ``basis_size`` parameter).
+
+    Returns
+    -------
+    fk : (P, basis_size + 1) float
+        Chebyshev basis values, fk[p, k] = 0.5*(T_k(x_p)+1)*fc(r_p).
     """
     rcinv = 1.0 / rc
     fc = 0.5 * torch.cos(PI * dij * rcinv) + 0.5
@@ -74,8 +87,19 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
                               basis_size: int):
     """Compute Chebyshev basis AND its derivative wrt distance.
 
-    Returns: fk (P, basis_size+1), fkp (P, basis_size+1).
-    fkp[k] = d(fk[k])/d(rij).
+    Parameters
+    ----------
+    dij : (P,) float
+        Pair distances in Å.
+    rc : float
+        Radial cutoff in Å.
+    basis_size : int
+        Polynomial order.
+
+    Returns
+    -------
+    fk  : (P, basis_size + 1) float — same values as ``chebyshev_basis``.
+    fkp : (P, basis_size + 1) float — d(fk[k])/d(rij) at each pair distance.
 
     Writes directly into a preallocated (P, basis_size+1) output buffer and
     keeps only 4 sliding-window scalars (T_{k-2}, T_{k-1}, U_{k-2}, U_{k-1})
@@ -179,7 +203,16 @@ def angular_basis(x: torch.Tensor, y: torch.Tensor,
     polynomial coefficients in ``Z_COEFFICIENT``. Bit-identical to the
     previous hand-coded formulas for l_max_3b ≤ 4.
 
-    Returns: (P, num_lm) with num_lm = sum_{L=1}^{l_max_3b}(2L + 1).
+    Parameters
+    ----------
+    x, y, z : (P,) float
+        Components of the unit vector rij / |rij| for each angular pair.
+    l_max_3b : int
+        Max angular momentum (NEP ``l_max`` first entry).
+
+    Returns
+    -------
+    blm : (P, num_lm) float, where num_lm = Σ_{L=1..l_max_3b} (2L + 1).
     """
     if l_max_3b < 1:
         return torch.zeros(x.shape[0], 0, dtype=x.dtype, device=x.device)
@@ -223,6 +256,37 @@ def compute_descriptors(
     This builds the Chebyshev/angular basis internally, unlike
     ``compute_descriptors_cached`` which takes them as inputs. Used by the
     non-training ASE-like path (NEPCalculator.compute).
+
+    Parameters
+    ----------
+    rij_rad : (P_rad, 3) float   radial displacement vectors (Å).
+    rij_ang : (P_ang, 3) float   angular displacement vectors (Å); may be
+                                 empty for isolated atoms / dimers.
+    pi_rad, pj_rad : (P_rad,) int64    central / neighbor atom indices.
+    pi_ang, pj_ang : (P_ang,) int64    same, angular pairs.
+    atom_types     : (N,) int64        per-atom type id ∈ [0, ntypes).
+    N              : int               total atoms in the batch.
+    c2             : (ntypes, ntypes, basis_size_radial+1, n_max_radial+1)
+                                        radial type-pair expansion coeffs.
+    c3             : (ntypes, ntypes, basis_size_angular+1, n_max_angular+1)
+                                        angular type-pair expansion coeffs.
+    rc_radial, rc_angular : float      cutoffs (Å).
+    basis_size_radial, basis_size_angular : int
+    n_max_radial, n_max_angular           : int
+    l_max_3b, l_max_4b, l_max_5b          : int   NEP ``l_max`` entries.
+    num_lm         : int               Σ_{L=1..l_max_3b}(2L+1).
+    c3b_coeffs, c4b_coeffs, c5b_coeffs : per-body fixed coefficient tensors.
+    dtype, device   : torch dtype / device for outputs.
+    backend         : "auto" | "loop" | "bmm" (see resolve_backend).
+
+    Returns
+    -------
+    q : (N, dim) float   per-atom descriptor, dim =
+        (n_max_radial+1)                    radial
+      + (n_max_angular+1) * l_max_3b        3-body
+      + (n_max_angular+1) * l_max_4b        4-body
+      + (n_max_angular+1) * l_max_5b        5-body
+    Zero-filled for atoms with no angular pairs (isolated atoms / dimers).
     """
     backend = resolve_backend(backend, num_types=int(c2.shape[0]))
     scatter_fn, type_fn = _select_contraction_funcs(backend)
@@ -293,7 +357,13 @@ def compute_descriptors(
             q5 = cb[0]*s0sq**2 + cb[1]*s0sq*s1sq + cb[2]*s1sq**2
             parts.append(q5)
 
-    return torch.cat(parts, dim=-1)
+    q = torch.cat(parts, dim=-1)
+    # DDP gradient pin (see compute_descriptors_cached for why).
+    if rij_rad.shape[0] == 0:
+        q = q + c2.sum() * 0.0
+    if l_max_3b > 0 and rij_ang.shape[0] == 0:
+        q = q + c3.sum() * 0.0
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +381,23 @@ def apply_ann(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Per-type NN: tanh(q @ W0^T - b0) @ w1 - b1. Returns (N,)."""
+    """Per-type NN: E_i = tanh(q_i @ W0_t^T - b0_t) @ w1_t - b1  (per element t).
+
+    Parameters
+    ----------
+    q          : (N, dim) float       scaled per-atom descriptors.
+    atom_types : (N,) int64           per-atom type id ∈ [0, num_types).
+    num_types  : int                  number of distinct element types.
+    w0_list    : list[(neuron, dim)]  first-layer weights, one per type.
+    b0_list    : list[(neuron,)]      first-layer biases, one per type.
+    w1_list    : list[(neuron,)]      second-layer weights, one per type.
+    b1         : scalar tensor        global energy offset.
+    dtype, device : torch dtype / device for the output.
+
+    Returns
+    -------
+    Ei : (N,) float — per-atom energy contribution.
+    """
     N = q.shape[0]
     Ei = torch.zeros(N, dtype=dtype, device=device)
     for t in range(num_types):
@@ -334,7 +420,29 @@ def compute_zbl(
     typewise_factor, rc_inner_per_type, rc_outer_per_type,
     dtype, device,
 ) -> torch.Tensor:
-    """ZBL repulsive energy with optional typewise cutoffs. Returns (N,)."""
+    """ZBL repulsive energy with optional typewise cutoffs.
+
+    Parameters
+    ----------
+    atom_types : (N,) int64
+    pair_i, pair_j : (P,) int64   angular-list pairs (ZBL reuses them).
+    rij        : (P, 3) float     displacement vectors (Å).
+    N          : int              total atoms in the batch.
+    atomic_numbers_list : list[int] of length ntypes, Z per element.
+    rc_inner_default, rc_outer_default : float
+        Global fallback switching window (Å) when typewise is off.
+    typewise_factor : float or None
+    rc_inner_per_type, rc_outer_per_type : (ntypes,) float or None
+        Per-element covalent-radius-based switching window; when both are
+        provided the per-pair cutoff is
+        min((cov_i + cov_j) * typewise_factor, rc_outer_default).
+    dtype, device : torch dtype / device for the output.
+
+    Returns
+    -------
+    Ei_zbl : (N,) float — per-atom ZBL repulsive contribution (half-split
+             across pairs, scatter-added onto central atoms).
+    """
     dij = torch.norm(rij, dim=-1)
     use_tw = typewise_factor is not None and rc_inner_per_type is not None
 
@@ -415,7 +523,20 @@ def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
     """Type-pair loop: Σ_k c[t1, t2, n, k]·basis[p, k] then scatter_add into q.
 
     The outer loop is O(ntypes²) python iterations. Preferred when ntypes is
-    small (few kernel launches, each matmul is fat) and peak memory matters."""
+    small (few kernel launches, each matmul is fat) and peak memory matters.
+
+    Inputs
+    ------
+    basis      : (P, K)                         K = basis_size + 1.
+    pair_i, pair_j : (P,) int64                 central / neighbor indices.
+    atom_types : (N,) int64                     ∈ [0, ntypes).
+    c          : (ntypes, ntypes, N_out, K)     expansion coefficients.
+    N          : int                            total atoms in the batch.
+
+    Returns
+    -------
+    q : (N, N_out) float  scatter-summed per-atom contribution.
+    """
     ntypes = c.shape[0]
     t1 = atom_types[pair_i]
     t2 = atom_types[pair_j]
@@ -431,7 +552,12 @@ def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
 
 
 def _type_contraction_loop(basis, pair_i, pair_j, atom_types, c):
-    """Type-pair loop (no scatter). See ``_scatter_contraction_loop``."""
+    """Type-pair loop, no scatter — returns per-pair contracted basis.
+
+    Shapes: same as ``_scatter_contraction_loop`` but returns
+        gn : (P, N_out) float
+    (the "pair-level angular radial factor" used by the 3b/4b/5b forward).
+    """
     ntypes = c.shape[0]
     t1 = atom_types[pair_i]
     t2 = atom_types[pair_j]
@@ -482,13 +608,36 @@ def compute_descriptors_cached(
     Faster than compute_descriptors because Chebyshev/angular basis are cached.
     Differentiable through c2, c3 only (not rij).
 
-    ``backend`` selects the type-pair contraction implementation:
-      "loop" — pure-PyTorch ntypes² loop (few types)
-      "bmm"  — fancy-index + torch.bmm (many types)
+    Parameters
+    ----------
+    fk_rad : (P_rad, basis_size_radial + 1) float   cached Chebyshev basis.
+    fk_ang : (P_ang, basis_size_angular + 1) float  cached Chebyshev basis
+             (may be empty if no angular pairs).
+    blm    : (P_ang, num_lm) float  cached angular basis.
+    pi_rad, pj_rad : (P_rad,) int64   radial central / neighbor indices.
+    pi_ang, pj_ang : (P_ang,) int64   angular central / neighbor indices.
+    atom_types     : (N,) int64      per-atom type id ∈ [0, ntypes).
+    N              : int             total atoms in the batch.
+    c2 : (ntypes, ntypes, basis_size_radial + 1, n_max_radial + 1).
+    c3 : (ntypes, ntypes, basis_size_angular + 1, n_max_angular + 1).
+    n_max_radial, n_max_angular, l_max_3b, l_max_4b, l_max_5b : int.
+    num_lm : int  = Σ_{L=1..l_max_3b}(2L + 1).
+    c3b_coeffs, c4b_coeffs, c5b_coeffs : body-order coefficient tensors.
+    dtype, device : torch dtype / device for outputs.
+    return_intermediates : bool  also return s and gn_ang (needed by the
+                                 analytical-force path).
+    backend : "loop" | "bmm"  type-pair contraction implementation:
+        "loop" — pure-PyTorch ntypes² loop (few types)
+        "bmm"  — fancy-index + torch.bmm (many types)
 
-    If return_intermediates=True, returns (q, s, gn_ang) where:
-      s      : (N, n_ap1, num_lm) sum_fxyz moments — needed for analytical forces
-      gn_ang : (P_ang, n_ap1) pair-level angular radial factor
+    Returns
+    -------
+    q : (N, dim) float — per-atom descriptor. dim breakdown matches
+        ``compute_descriptors``.
+    If ``return_intermediates``: also returns
+        s      : (N, n_max_angular + 1, num_lm) sum_fxyz moments
+        gn_ang : (P_ang, n_max_angular + 1) pair-level angular radial factor
+        Both are ``None`` when l_max_3b == 0 or there are no angular pairs.
     """
     _scatter_fn, _type_fn = _select_contraction_funcs(backend)
 
@@ -500,10 +649,19 @@ def compute_descriptors_cached(
     parts = [q_rad]
     s_out = None
     gn_ang_out = None
+    n_ap1 = n_max_angular + 1
+
+    if l_max_3b > 0 and fk_ang.shape[0] == 0:
+        # No angular neighbors anywhere in the batch (all-monomer bucket, or
+        # very sparse structures). Emit zero-filled angular blocks so the
+        # returned dim still matches q_scaler / the NN's input layer.
+        parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
+        if l_max_4b > 0:
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
+        if l_max_5b > 0:
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and fk_ang.shape[0] > 0:
-        n_ap1 = n_max_angular + 1
-
         # Angular: type contraction (no scatter yet — need gn for blm product)
         gn_ang = _type_fn(fk_ang, pi_ang, pj_ang, atom_types, c3)
 
@@ -548,6 +706,15 @@ def compute_descriptors_cached(
             parts.append(q5)
 
     q = torch.cat(parts, dim=-1)
+    # DDP gradient pin: when a batch has no pairs (all-monomer bucket under
+    # bucket batching), c2 / c3 never enter the compute graph and DDP errors
+    # out with "parameter did not receive grad". Add a zero-valued grad path
+    # through c2/c3 so they stay synchronised across ranks. Guarded so the
+    # (common) non-empty case pays nothing.
+    if fk_rad.shape[0] == 0:
+        q = q + c2.sum() * 0.0
+    if l_max_3b > 0 and fk_ang.shape[0] == 0:
+        q = q + c3.sum() * 0.0
     if return_intermediates:
         return q, s_out, gn_ang_out
     return q
@@ -627,15 +794,39 @@ def compute_analytical_forces(
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
 
-    Fp: (N, dim) = dEi/dq * q_scaler, includes q_scaler already.
-    s: (N, n_ap1, num_lm) sum_fxyz from descriptor forward.
-    gn_ang: (P_ang, n_ap1) pair-level angular radial basis.
+    Parameters
+    ----------
+    Fp : (N, dim) float             dEi/dq * q_scaler (already includes q_scaler).
+    atom_types : (N,) int64
+    N : int                         total atoms in the batch.
+    c2 : (ntypes, ntypes, basis_size_radial+1, n_max_radial+1).
+    c3 : (ntypes, ntypes, basis_size_angular+1, n_max_angular+1).
+    fkp_rad : (P_rad, basis_size_radial + 1) float    d(fk)/d(rij) for radial.
+    fkp_ang : (P_ang, basis_size_angular + 1) float   d(fk)/d(rij) for angular.
+    blm     : (P_ang, num_lm) float                   cached angular basis.
+    pi_rad, pj_rad : (P_rad,) int64
+    rij_rad        : (P_rad, 3) float  displacement vectors (Å).
+    d12inv_rad     : (P_rad,) float    1 / |rij_rad|.
+    pi_ang, pj_ang : (P_ang,) int64
+    rij_ang        : (P_ang, 3) float
+    d12inv_ang     : (P_ang,) float
+    s      : (N, n_max_angular + 1, num_lm) sum_fxyz from descriptor forward.
+    gn_ang : (P_ang, n_max_angular + 1) pair-level angular radial factor.
+    n_max_radial, n_max_angular, l_max_3b, l_max_4b, l_max_5b : int.
+    num_lm : int.
+    c3b_coeffs, c4b_coeffs, c5b_coeffs : body-order coefficient tensors.
+    dtype, device : torch dtype / device for outputs.
+    compute_virial : bool  if False, ``virial`` output is ``None``.
+    backend : "loop" | "bmm" — see ``compute_descriptors_cached``.
+
+    Returns
+    -------
+    forces : (N, 3) float
+    virial : (N, 9) float or None  per-atom 3×3 virial flattened row-major.
 
     Geometry tensors (rij, fkp, d12inv, blm) are detached so PyTorch does not
-    track gradients through them — they are not trainable parameters.  Only Fp
+    track gradients through them — they are not trainable parameters. Only Fp
     (→ NN weights) and c2/c3 carry gradient information.
-
-    ``backend`` — see ``compute_descriptors_cached`` for options.
     """
     _, _type_fn = _select_contraction_funcs(backend)
 
@@ -791,6 +982,22 @@ def accumulate_forces_virial(
 
     F_k = sum_{pairs i=k} grad - sum_{pairs j=k} grad
     virial_ab(j) = -rij_a * grad_b  (accumulated on j)
+
+    Parameters
+    ----------
+    N : int                        total atoms in the batch.
+    pi_rad, pj_rad : (P_rad,) int64    radial pairs (central, neighbor).
+    rij_rad : (P_rad, 3) float         radial displacement vectors.
+    g_rad   : (P_rad, 3) float         pair gradients dE/drij for radial.
+    pi_ang, pj_ang : (P_ang,) int64    angular pairs.
+    rij_ang : (P_ang, 3) float         angular displacement vectors.
+    g_ang   : (P_ang, 3) float         pair gradients dE/drij for angular.
+    dtype, device : torch dtype / device for outputs.
+
+    Returns
+    -------
+    forces : (N, 3) float  per-atom force in eV/Å.
+    virial : (N, 9) float  per-atom virial tensor (row-major 3×3) in eV.
     """
     forces = torch.zeros(N, 3, dtype=dtype, device=device)
     virial = torch.zeros(N, 9, dtype=dtype, device=device)
