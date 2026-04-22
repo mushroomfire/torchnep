@@ -15,6 +15,12 @@ ELEMENTS = [
     "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
     "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po",
     "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu",
+    # Transuranics + transactinides (Z = 95–118). Datasets like MAD / MatPES
+    # include actinides up to Cm / Bk; the rest rarely appear in practice
+    # but keeping the table full through Og avoids 'X' is not in list errors.
+    "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr",
+    "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn",
+    "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
 ]
 
 # Maximum 3-body angular order supported by the implementation.
@@ -96,9 +102,26 @@ C5B = [0.026596810706114, 0.053193621412227, 0.026596810706114]
 
 K_C_SP = 14.399645  # Coulomb constant (eV*Angstrom)
 
+# Unit conversion: 1 eV/Å³ = 160.21766208 GPa  (CODATA 2018 e = 1.602176634e-19 C)
+EV_PER_A3_TO_GPa = 160.21766208
+
 ZBL_PARA = [0.18175, 3.1998, 0.50986, 0.94229, 0.28022, 0.4029, 0.02817, 0.20162]
 
-# Covalent radii in Angstrom (94 elements, from GPUMD)
+# Covalent radii in Angstrom, indexed by Z-1.
+#
+# Z = 1–94:   from GPUMD (src/utilities/nep_utilities.cuh::COVALENT_RADIUS),
+#             which stores Grimme's DFT-D3 covalent radii × 4/3 (k2 scaling).
+#             Reference: Grimme, Antony, Ehrlich, Krieg, J. Chem. Phys. 132,
+#             154104 (2010), Table I (itself derived from Pyykkö & Atsumi
+#             2009 with Li/Be/B/etc. empirical adjustments). GPUMD hard-codes
+#             these × 4/3 for ZBL typewise cutoffs; we reproduce them exactly
+#             for bit-compatibility.
+# Z = 95–118: Pyykkö, "Additive Covalent Radii for Single-, Double-, and
+#             Triple-Bonded Molecules and Tetrahedrally Bonded Crystals: A
+#             Summary", J. Phys. Chem. A 119, 2326 (2015), single-bond
+#             radii. Grimme D3 only tabulates up to Z=94 (Pu), so this block
+#             fills the gap from a different reference — there is a minor
+#             scale discontinuity at the Z=94 → 95 boundary.
 COVALENT_RADIUS = [
     0.426667, 0.613333, 1.6, 1.25333, 1.02667, 1.0, 0.946667, 0.84,
     0.853333, 0.893333, 1.86667, 1.66667, 1.50667, 1.38667, 1.46667, 1.36,
@@ -112,4 +135,9 @@ COVALENT_RADIUS = [
     1.74667, 1.64, 1.57333, 1.54667, 1.48, 1.49333, 1.50667, 1.76,
     1.73333, 1.73333, 1.81333, 1.74667, 1.84, 1.89333, 2.68, 2.41333,
     2.22667, 2.10667, 2.02667, 2.04, 2.05333, 2.06667,
+    # Pyykkö 2015 single-bond values (see note above the table).
+    1.80, 1.69, 1.68, 1.68, 1.65, 1.67, 1.73, 1.76, 1.61,   # Am-Lr
+    1.57, 1.49, 1.43, 1.41, 1.34, 1.29, 1.28, 1.21, 1.22,   # Rf-Cn
+    1.36, 1.43, 1.62, 1.75, 1.65, 1.57,                       # Nh-Og
 ]
+assert len(COVALENT_RADIUS) == 118

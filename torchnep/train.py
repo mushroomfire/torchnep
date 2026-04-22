@@ -122,7 +122,7 @@ def _default_device() -> str:
 
 def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
                      batch_size: int):
-    """Sort frames by natoms and return this rank's local slice + bucket count.
+    """Sort frames by natoms and return this rank's local slice + bucket layout.
 
     Parameters
     ----------
@@ -134,11 +134,18 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
     Returns
     -------
     local_frames : list of frames this rank should preprocess / store.
-                   Length is ``num_buckets * batch_size`` for DDP, or
-                   ``len(frames)`` for single-GPU (last bucket may be partial).
-    num_buckets  : number of buckets == iterations per epoch on this rank.
-    dropped      : number of frames dropped from the end of the dataset
-                   (always 0 for single-GPU).
+    boundaries   : list of (start, end) tuples into ``local_frames``. One entry
+                   per bucket (== one per DDP iteration per epoch). All ranks
+                   agree on ``len(boundaries)``; for the last partial bucket
+                   different ranks may get slightly different batch sizes, but
+                   every rank still does the same number of iterations, which
+                   is all DDP requires. The loss normalisation already uses
+                   global sample counts, so unequal rank batch sizes are
+                   accounted for.
+    dropped      : number of frames dropped. Only non-zero when the trailing
+                   partial bucket has fewer than ``world_size`` frames total
+                   (at most W-1 frames — unavoidable because every rank needs
+                   at least one frame per iteration).
     """
     n = len(frames)
     B = batch_size
@@ -146,24 +153,58 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
 
     sorted_frames = sorted(frames, key=lambda f: f["natoms"])
 
+    # ----- Single-GPU: one bucket per B-sized slice; trailing one may be partial.
     if W == 1:
-        num_buckets = (n + B - 1) // B
-        return sorted_frames, num_buckets, 0
+        boundaries = [(b * B, min((b + 1) * B, n))
+                      for b in range((n + B - 1) // B)]
+        return sorted_frames, boundaries, 0
 
-    num_full_buckets = n // (W * B)
-    if num_full_buckets == 0:
-        raise RuntimeError(
-            f"dataset too small for bucket batching with DDP: need at least "
-            f"world_size × batch_size = {W * B} frames, got {n}. Reduce "
-            f"batch_size or run on a single GPU.")
-    dropped = n - num_full_buckets * W * B
+    # ----- DDP: pack full buckets of W*B frames, then split the leftover
+    # evenly across ranks (possibly unequal by 1). Ranks all do the same
+    # number of iterations; only the last iteration's batch size may differ.
+    num_full = n // (W * B)
+    if num_full == 0:
+        # No full bucket even once → dataset < W*B. Very rare.
+        remaining = n
+    else:
+        remaining = n - num_full * W * B
 
     local = []
-    for b in range(num_full_buckets):
+    boundaries = []
+
+    for b in range(num_full):
         bucket_start = b * W * B
         rank_start = bucket_start + rank * B
+        off = len(local)
         local.extend(sorted_frames[rank_start:rank_start + B])
-    return local, num_full_buckets, dropped
+        boundaries.append((off, off + B))
+
+    dropped = 0
+    if remaining >= W:
+        # Split ``remaining`` frames: first (remaining % W) ranks get one
+        # extra frame so no frame is wasted.
+        base = remaining // W
+        extras = remaining % W
+        n_rank = base + (1 if rank < extras else 0)
+        if rank < extras:
+            skip = rank * (base + 1)
+        else:
+            skip = extras * (base + 1) + (rank - extras) * base
+        partial_start = num_full * W * B + skip
+        off = len(local)
+        local.extend(sorted_frames[partial_start:partial_start + n_rank])
+        boundaries.append((off, off + n_rank))
+    elif remaining > 0:
+        # Fewer than W frames left — can't give every rank at least one,
+        # so these are unavoidably lost. At most W-1 frames.
+        dropped = remaining
+
+    if not boundaries:
+        raise RuntimeError(
+            f"dataset too small for bucket batching with DDP: got {n} frames "
+            f"and world_size={W}, need ≥ {W} frames so every rank has work.")
+
+    return local, boundaries, dropped
 
 
 
@@ -245,6 +286,14 @@ class GPUDataStore:
                                          else np.float64, copy=False)
         v_all = torch.from_numpy(v_cat).to(device=device, dtype=dtype,
                                             non_blocking=True)
+
+        # Per-frame cell volume (Å³) — needed for stress RMSE. Same order as
+        # frames, so a batch slice follows the same indexing as .energy etc.
+        vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
+                             dtype=np.float32 if dtype == torch.float32
+                             else np.float64)
+        self.volumes = torch.from_numpy(vol_cat).to(device=device, dtype=dtype,
+                                                     non_blocking=True)
 
         if config is not None:
             dr_all = torch.norm(rij_r_all, dim=-1)
@@ -333,12 +382,15 @@ class GPUDataStore:
         natoms = torch.tensor([self.natoms[i] for i in indices],
                               dtype=self.dtype, device=self.device)
 
+        volumes = self.volumes[torch.as_tensor(indices, device=self.device,
+                                                dtype=torch.long)]
+
         batch = {
             "N": N_total, "num_structures": B,
             "atom_types": atom_types, "struct_idx": struct_idx,
             "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
             "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-            "energy": energy, "natoms": natoms,
+            "energy": energy, "natoms": natoms, "volumes": volumes,
         }
 
         batch["energy_mask"] = torch.tensor(
@@ -388,6 +440,7 @@ def _preprocess_one_frame(args):
     s = {
         "natoms": frame["natoms"],
         "atom_types": atom_types,
+        "volume": float(abs(np.linalg.det(cell))),   # Å³, used for stress RMSE
         "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
         "rij_rad": rij[rad_mask].astype(dtype),
         "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
@@ -649,8 +702,9 @@ def train_nep(
     _log(f"  {len(frames)} structures")
 
     # Sort by natoms + bucket for stable batch compute (see _sort_and_shard).
-    frames, num_buckets, _dropped = _sort_and_shard(
+    frames, boundaries, _dropped = _sort_and_shard(
         frames, rank=0, world_size=1, batch_size=batch_size)
+    num_buckets = len(boundaries)
     _log(f"  {num_buckets} buckets (sorted by natoms, batch_size={batch_size})")
 
     # slim_types: detect which element types actually appear in the data and
@@ -797,8 +851,8 @@ def train_nep(
     loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
     loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
     if loss_log_mode == "w":
-        loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
-                       "rmse_v(meV/atom)  gnorm\n")
+        loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+                       "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
 
     backend_str = {
         "loop": "PyTorch type-pair loop",
@@ -839,6 +893,7 @@ def train_nep(
             bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = 0.0
+            sum_ls = 0.0                     # (eV/Å³)² accumulator for stress
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             max_gn = 0.0
 
@@ -859,8 +914,7 @@ def train_nep(
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
             for bi in bucket_perm:
-                start = bi * batch_size
-                end = min(start + batch_size, n_structs)
+                start, end = boundaries[bi]
                 idx = list(range(start, end))
                 batch = data_store.collate(idx)
 
@@ -914,7 +968,14 @@ def train_nep(
                             v_ref_pa = v_ref[v_mask] / na
                             loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
-                            sum_lv += ((v_pred_pa - v_ref_pa) ** 2).mean().item() * v_mask.sum().item()
+                            v_diff = v_pred_pa - v_ref_pa
+                            sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
+                            # Stress RMSE (eV/Å³): convert the same diff using
+                            # per-frame (natoms/volume). Sign cancels under MSE.
+                            scale = (batch["natoms"][v_mask]
+                                     / batch["volumes"][v_mask]).unsqueeze(-1)
+                            s_diff = v_diff * scale
+                            sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -948,14 +1009,18 @@ def train_nep(
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
             # where each MSE_X aggregates over all samples in the epoch.
+            from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
+            mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
                         + cur_pref_v * mse_v)
-            rmse_e = np.sqrt(mse_e) * 1000
+            # Output units: eV/atom (E, V), eV/Å (F), GPa (stress).
+            rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
-            rmse_v = np.sqrt(mse_v) * 1000
+            rmse_v = np.sqrt(mse_v)
+            rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
@@ -963,15 +1028,17 @@ def train_nep(
             elif not in_stage2:
                 lr_scheduler.step(avg_loss)
 
-            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} "
-                           f"{rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
+            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
+                           f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f} "
+                           f"{max_gn:.2f}\n")
             loss_log.flush()
 
             stage_str = "[S2] " if in_stage2 else ""
             cur_lr = optimizer.param_groups[0]['lr']
-            v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
+            v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
+                     if has_virial else "")
             line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
-                    f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A"
+                    f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                     f"{v_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:

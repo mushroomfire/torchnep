@@ -126,20 +126,25 @@ def _build_batch(structures, indices, calc, dtype, device):
 
 
 def _virial9_to_6(v9):
-    """Re-order a length-9 virial (xx,xy,xz,yx,yy,yz,zx,zy,zz)
-    into the GPUMD 6-vector (xx,yy,zz,xy,yz,zx).
+    """Re-order length-9 row-major virial (xx,xy,xz,yx,yy,yz,zx,zy,zz) into
+    the GPUMD 6-vector (xx,yy,zz,xy,yz,zx).
 
-    Off-diagonal entries are averaged with their symmetric partner
-    (0.5 * (xy + yx) etc.) — the per-frame virial is symmetric in principle,
-    but the per-atom construction ``-rij ⊗ f12`` is not, so averaging is
-    slightly more accurate than picking one entry arbitrarily."""
+    Picks single-triangular components to match GPUMD's per-atom virial
+    convention (src/main_nep/nep.cu: s_virial_xy = -r[0]*f[1], s_virial_yz
+    = -r[1]*f[2], s_virial_zx = -r[2]*f[0]). GPUMD does not average with
+    the symmetric partner — it stores only one entry of each off-diagonal
+    pair during force accumulation. Per-FRAME totals are still symmetric
+    because the sum Σ -r_α f_β over directed pairs equals Σ -r_β f_α by
+    Newton's 3rd law, so this choice is numerically equivalent to averaging
+    at the per-frame output level but gives cheaper bit-identical match
+    with GPUMD outputs."""
     out = np.empty((v9.shape[0], 6), dtype=v9.dtype)
-    out[:, 0] = v9[:, 0]                      # xx
-    out[:, 1] = v9[:, 4]                      # yy
-    out[:, 2] = v9[:, 8]                      # zz
-    out[:, 3] = 0.5 * (v9[:, 1] + v9[:, 3])   # xy, yx
-    out[:, 4] = 0.5 * (v9[:, 5] + v9[:, 7])   # yz, zy
-    out[:, 5] = 0.5 * (v9[:, 2] + v9[:, 6])   # xz, zx
+    out[:, 0] = v9[:, 0]   # xx = -r_x f_x
+    out[:, 1] = v9[:, 4]   # yy = -r_y f_y
+    out[:, 2] = v9[:, 8]   # zz = -r_z f_z
+    out[:, 3] = v9[:, 1]   # xy = -r_x f_y
+    out[:, 4] = v9[:, 5]   # yz = -r_y f_z
+    out[:, 5] = v9[:, 6]   # zx = -r_z f_x
     return out
 
 
@@ -219,6 +224,8 @@ def predict_dataset(
     # 3) Concatenate everything once and move raw data to the GPU.
     t0 = time.time()
     natoms_arr = np.asarray([s["natoms"] for s in structures], dtype=np.int64)
+    volumes_arr = np.asarray([s.get("volume", 0.0) for s in structures],
+                             dtype=np.float64)
     nrad_arr = np.asarray([len(s["pair_i_rad"]) for s in structures],
                           dtype=np.int64)
     nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
@@ -270,13 +277,16 @@ def predict_dataset(
             v = np.asarray(v).flatten()
             inv_n = 1.0 / float(s["natoms"])
             if v.size == 9:
+                # Single-triangular pick to match GPUMD (see _virial9_to_6).
+                # Input XYZ virial is symmetric (DFT), so xy=yx etc., making
+                # this choice numerically equal to averaging.
                 virial_ref[i] = [
-                    v[0] * inv_n,                          # xx
-                    v[4] * inv_n,                          # yy
-                    v[8] * inv_n,                          # zz
-                    0.5 * (v[1] + v[3]) * inv_n,           # xy, yx
-                    0.5 * (v[5] + v[7]) * inv_n,           # yz, zy
-                    0.5 * (v[2] + v[6]) * inv_n,           # xz, zx
+                    v[0] * inv_n,   # xx
+                    v[4] * inv_n,   # yy
+                    v[8] * inv_n,   # zz
+                    v[1] * inv_n,   # xy
+                    v[5] * inv_n,   # yz
+                    v[6] * inv_n,   # zx
                 ]
             elif v.size >= 6:
                 virial_ref[i] = v[:6] * inv_n
@@ -392,10 +402,25 @@ def predict_dataset(
 
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
+
+    # Stress = virial_total / V × EV_PER_A3_TO_GPa  (GPa). Matches GPUMD's
+    # stress_train.out convention (src/main_nep/fitness.cu: the output is
+    # virial/volume with no sign flip, so torchnep's stress_predict.out is
+    # byte-comparable with GPUMD's stress_train.out). Since v_pred_arr and
+    # virial_ref are stored per-atom, multiply by natoms to recover totals.
+    from .constants import EV_PER_A3_TO_GPa
+    nat_col = natoms_arr.astype(np.float64)[:, None]
+    vol_col = volumes_arr[:, None]
+    vol_safe = np.where(vol_col > 0, vol_col, 1.0)
+    scale = nat_col / vol_safe * EV_PER_A3_TO_GPa
+    stress_pred = v_pred_arr * scale
+    stress_ref = virial_ref * scale
+    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
     _log(f"  write:       {time.time() - t0:5.1f}s")
 
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
-         f"→ {output_dir}/(energy|force|virial)_predict.out")
+         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")
 
 
 # ---------------------------------------------------------------------------
@@ -483,13 +508,14 @@ def predict_from_store(model, data_store, output_dir: str,
         if data_store.has_virial_flag[i]:
             v9 = data_store.virial[i].cpu().numpy().flatten()  # length-9
             n = float(nat_arr[i])
+            # Single-triangular pick to match GPUMD (see _virial9_to_6).
             virial_ref[i] = [
-                v9[0] / n,                    # xx
-                v9[4] / n,                    # yy
-                v9[8] / n,                    # zz
-                0.5 * (v9[1] + v9[3]) / n,    # xy, yx
-                0.5 * (v9[5] + v9[7]) / n,    # yz, zy
-                0.5 * (v9[2] + v9[6]) / n,    # xz, zx
+                v9[0] / n,   # xx
+                v9[4] / n,   # yy
+                v9[8] / n,   # zz
+                v9[1] / n,   # xy
+                v9[5] / n,   # yz
+                v9[6] / n,   # zx
             ]
 
     os.makedirs(output_dir, exist_ok=True)
@@ -500,5 +526,19 @@ def predict_from_store(model, data_store, output_dir: str,
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
+
+    # Stress (GPa) = virial_total / V × conversion. Matches GPUMD's
+    # stress_train.out convention (no sign flip) — see predict_dataset.
+    from .constants import EV_PER_A3_TO_GPa
+    vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
+    nat_col = nat_arr.astype(np.float64)[:, None]
+    vol_col = vol_arr[:, None]
+    vol_safe = np.where(vol_col > 0, vol_col, 1.0)
+    scale = nat_col / vol_safe * EV_PER_A3_TO_GPa
+    stress_pred = v_pred * scale
+    stress_ref = virial_ref * scale
+    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"→ {output_dir}/(energy|force|virial)_predict.out")
+         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")

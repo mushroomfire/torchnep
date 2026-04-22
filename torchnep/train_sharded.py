@@ -183,7 +183,12 @@ def train_nep_sharded(
     if not dist.is_initialized():
         world_size_env = int(os.environ.get("WORLD_SIZE", 1))
         ddp_backend = "nccl" if cuda_available and world_size_env <= n_gpus else "gloo"
-        dist.init_process_group(backend=ddp_backend)
+        # Pass device_id so NCCL can bind the rank to its CUDA device
+        # deterministically (silences "Guessing device ID based on global
+        # rank" and the collective-context warnings, and prevents hangs on
+        # heterogeneous rank→GPU mappings). gloo ignores device_id.
+        dist.init_process_group(backend=ddp_backend,
+                                device_id=dev if cuda_available else None)
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -264,19 +269,24 @@ def train_nep_sharded(
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
-    # Bucket sharding: sort globally by natoms, drop partial last bucket,
-    # assign rank r the r-th batch_size-block inside every bucket. This
-    # guarantees all ranks have identical n_local (= num_buckets × batch_size)
-    # and that iteration i on every rank draws from the same natoms quantile,
-    # so per-batch compute is matched across ranks.
-    local_frames, num_buckets, dropped = _sort_and_shard(
+    # Bucket sharding: sort globally by natoms, assign rank r the r-th
+    # batch_size-block inside every full bucket, then split any remaining
+    # frames as evenly as possible across ranks (the last iteration of the
+    # epoch may have a rank-dependent batch size; all ranks still do the
+    # same number of iterations, which is all DDP requires). Iteration i
+    # on every rank draws from the same natoms quantile, so per-batch
+    # compute is matched across ranks.
+    local_frames, boundaries, dropped = _sort_and_shard(
         frames, rank=rank, world_size=world_size,
         batch_size=config["batch_size"])
     n_local = len(local_frames)
+    num_buckets = len(boundaries)
+    drop_note = (f", {dropped} frames dropped (remainder < world_size)"
+                 if dropped else "")
     _log(f"  {n_total} structures total → "
          f"rank {rank} gets {n_local} (bucket-sharded across {world_size} ranks, "
          f"{num_buckets} buckets × batch_size={config['batch_size']}"
-         f"{', dropped ' + str(dropped) + ' frames from partial tail bucket' if dropped else ''})")
+         f"{drop_note})")
 
     _log("Building neighbor lists (local shard)...")
     t0 = time.time()
@@ -450,8 +460,8 @@ def train_nep_sharded(
         loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
         loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
         if loss_log_mode == "w":
-            loss_log.write("epoch  loss  rmse_e(meV/atom)  rmse_f(eV/A)  "
-                           "rmse_v(meV/atom)  gnorm\n")
+            loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+                           "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
 
     backend_str = {
         "loop": "PyTorch type-pair loop",
@@ -490,7 +500,7 @@ def train_nep_sharded(
             g.manual_seed(epoch)
             bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = 0.0
+            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/Å³)²
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             max_gn = 0.0
 
@@ -511,8 +521,8 @@ def train_nep_sharded(
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
             for bi in bucket_perm:
-                start = bi * batch_size
-                idx = list(range(start, start + batch_size))
+                start, end = boundaries[bi]
+                idx = list(range(start, end))
                 batch = data_store.collate(idx)
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
@@ -575,10 +585,16 @@ def train_nep_sharded(
                         na = batch["natoms"][v_mask].unsqueeze(-1)
                         v_pred_pa = v_sys[v_mask] / na
                         v_ref_pa = v_ref[v_mask] / na
-                        sum_sq_v = ((v_pred_pa - v_ref_pa) ** 2).sum()
+                        v_diff = v_pred_pa - v_ref_pa
+                        sum_sq_v = (v_diff ** 2).sum()
                         # 9 components per frame → divide by (9 × n_v_g)
                         loss = loss + cur_pref_v * sum_sq_v * ws / (9.0 * n_v_g)
                         sum_lv += (sum_sq_v.item() / 9.0)
+                        # Stress (eV/Å³) = -virial_total / V. Sign cancels in MSE.
+                        scale = (batch["natoms"][v_mask]
+                                 / batch["volumes"][v_mask]).unsqueeze(-1)
+                        sum_sq_s = ((v_diff * scale) ** 2).sum()
+                        sum_ls += (sum_sq_s.item() / 9.0)
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -611,28 +627,31 @@ def train_nep_sharded(
 
             # Aggregate metrics across all ranks
             metrics = torch.tensor(
-                [sum_le, sum_lf, sum_lv,
+                [sum_le, sum_lf, sum_lv, sum_ls,
                  float(sum_e_structs), float(sum_f_atoms),
                  float(sum_v_structs)],
                 device=dev)
             dist.all_reduce(metrics)
             gn_t = torch.tensor(max_gn, device=dev)
             dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
-            (sum_le, sum_lf, sum_lv,
+            (sum_le, sum_lf, sum_lv, sum_ls,
              sum_e_structs, sum_f_atoms, sum_v_structs) = metrics.tolist()
             max_gn = gn_t.item()
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
             # where each MSE_X aggregates over all samples in the epoch.
+            from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
+            mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
                         + cur_pref_v * mse_v)
-            rmse_e = np.sqrt(mse_e) * 1000
-            rmse_f = np.sqrt(mse_f)
-            rmse_v = np.sqrt(mse_v) * 1000
+            rmse_e = np.sqrt(mse_e)                           # eV/atom
+            rmse_f = np.sqrt(mse_f)                           # eV/Å
+            rmse_v = np.sqrt(mse_v)                           # eV/atom
+            rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
@@ -641,15 +660,17 @@ def train_nep_sharded(
                 lr_scheduler.step(avg_loss)
 
             if is_main:
-                loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.4f} "
-                               f"{rmse_f:.4f} {rmse_v:.4f} {max_gn:.2f}\n")
+                loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
+                               f"{rmse_f:.6f} {rmse_v:.6f} "
+                               f"{rmse_s_gpa:.4f} {max_gn:.2f}\n")
                 loss_log.flush()
 
                 stage_str = "[S2] " if in_stage2 else ""
                 cur_lr = optimizer.param_groups[0]['lr']
-                v_str = f" | V {rmse_v:.1f} meV/atom" if has_virial else ""
+                v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
+                         if has_virial else "")
                 line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
-                        f"E {rmse_e:.1f} meV/atom | F {rmse_f:.4f} eV/A"
+                        f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                         f"{v_str} | gnorm {max_gn:.1f} | "
                         f"lr {cur_lr:.2e} | {dt:.1f}s")
                 if epoch % print_interval == 0 or epoch == 1:
