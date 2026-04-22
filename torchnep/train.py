@@ -741,9 +741,8 @@ def train_nep(
             g.manual_seed(epoch)
             perm = torch.randperm(n_structs, generator=g)
 
-            sum_loss = sum_le = sum_lf = sum_lv = 0.0
+            sum_le = sum_lf = sum_lv = 0.0
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            n_batch = 0
             max_gn = 0.0
 
             in_stage2 = stage2 and epoch >= start_stage2
@@ -843,19 +842,22 @@ def train_nep(
                 if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
 
-                sum_loss += loss.item()
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
                 sum_v_structs += batch["virial_mask"].sum().item()
-                n_batch += 1
                 max_gn = max(max_gn, gn)
 
-            avg_loss = sum_loss / max(n_batch, 1)
-            rmse_e = np.sqrt(sum_le / max(sum_e_structs, 1)) * 1000
-            rmse_f = (np.sqrt(sum_lf / max(sum_f_atoms, 1))
-                      if sum_lf > 0 else 0.0)
-            rmse_v = (np.sqrt(sum_lv / max(sum_v_structs, 1)) * 1000
-                      if sum_lv > 0 else 0.0)
+            # Per-sample (not per-batch) averaging so avg_loss is self-
+            # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
+            # where each MSE_X aggregates over all samples in the epoch.
+            mse_e = sum_le / max(sum_e_structs, 1)
+            mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
+            mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
+            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
+                        + cur_pref_v * mse_v)
+            rmse_e = np.sqrt(mse_e) * 1000
+            rmse_f = np.sqrt(mse_f)
+            rmse_v = np.sqrt(mse_v) * 1000
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
@@ -922,9 +924,9 @@ def train_nep(
     # SWA-averaged model (only when user opted in and stage 2 ran).
     if swa_model is not None:
         swa_state = swa_model.module.state_dict()
-        # Separate copy of raw_model's state so we can restore it after
-        # writing the SWA file (so the end-of-training predict still sees
-        # the final-epoch weights, not the SWA ones).
+        # Keep a copy of the final-epoch weights so we can restore them
+        # after saving SWA — the end-of-training predict below must see
+        # final weights, not SWA-averaged ones.
         final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
         raw_model.load_state_dict(swa_state)
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
@@ -939,12 +941,13 @@ def train_nep(
     _log(f"\nDone. Best loss: {best_loss:.6e}")
     _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-    # End-of-training prediction: reuse the in-memory data_store (no re-read)
-    # and the final-epoch model weights — no file I/O for the model either.
+    # End-of-training predict reuses the in-memory data_store (no xyz re-read)
+    # and the final-epoch weights in raw_model (no model-file round-trip).
     _log("\nRunning prediction on training set (final-epoch model)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, backend=backend, verbose=False)
+                       batch_size=batch_size, backend=backend,
+                       verbose=False)
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     total_time = time.time() - total_t0

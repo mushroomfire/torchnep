@@ -11,7 +11,7 @@ import numpy as np
 from typing import List
 
 from .constants import (
-    ELEMENTS, PI, C3B, C4B, C5B, K_C_SP, ZBL_PARA, COVALENT_RADIUS,
+    ELEMENTS, C3B, C4B, C5B, COVALENT_RADIUS,
 )
 from . import ops
 
@@ -304,33 +304,36 @@ class NEPModel(nn.Module):
         Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1  # subtract shared output bias
 
-        # ZBL energy
+        # ZBL energy + forces (no trainable params; local autograd on rij_ang).
+        # enable_grad: end-of-training predict_from_store wraps this call in
+        # torch.no_grad(), under which Ei_zbl.requires_grad would be False
+        # and the ZBL force contribution would be silently dropped.
         zbl_forces = None
         zbl_virial = None
         if self.zbl is not None:
-            # ZBL has no trainable parameters — compute forces via a local autograd
-            # call without create_graph (no gradient flows to model params through ZBL).
-            rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
-            Ei_zbl = ops.compute_zbl(
-                batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
-                rij_zbl, N, self.atomic_numbers.tolist(),
-                self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
-                getattr(self, "zbl_rc_inner_per_type", None),
-                getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
+            with torch.enable_grad():
+                rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
+                Ei_zbl = ops.compute_zbl(
+                    batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
+                    rij_zbl, N, self.atomic_numbers.tolist(),
+                    self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
+                    getattr(self, "zbl_rc_inner_per_type", None),
+                    getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
+                if need_forces and Ei_zbl.requires_grad:
+                    g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
+                                                allow_unused=True)[0]
+                else:
+                    g_zbl = None
             Ei = Ei + Ei_zbl.detach()
-            if need_forces and Ei_zbl.requires_grad:
-                g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
-                                            allow_unused=True)[0]
-                if g_zbl is not None:
-                    # Accumulate ZBL forces via existing helper (angular pairs only)
-                    empty_i = torch.zeros(0, dtype=torch.long, device=device)
-                    empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
-                    zbl_forces, zbl_virial = ops.accumulate_forces_virial(
-                        N, empty_i, empty_i, empty_r, empty_r,
-                        batch["pair_i_ang"], batch["pair_j_ang"],
-                        batch["rij_ang"].detach(), g_zbl.detach(),
-                        dtype, device,
-                    )
+            if g_zbl is not None:
+                empty_i = torch.zeros(0, dtype=torch.long, device=device)
+                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
+                zbl_forces, zbl_virial = ops.accumulate_forces_virial(
+                    N, empty_i, empty_i, empty_r, empty_r,
+                    batch["pair_i_ang"], batch["pair_j_ang"],
+                    batch["rij_ang"].detach(), g_zbl.detach(),
+                    dtype, device,
+                )
 
         Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
         Etot.scatter_add_(0, batch["struct_idx"], Ei)
@@ -391,7 +394,11 @@ class NEPModel(nn.Module):
             except ValueError:
                 header_lines += 1
 
-        vals = [float(ln) for ln in lines[header_lines:]]
+        # Use float64 as the numpy transport dtype so we preserve every digit
+        # written to nep.txt; the target .copy_() downcasts to the parameter's
+        # actual dtype (float32 or float64) without going through float32 first.
+        vals = np.asarray([float(ln) for ln in lines[header_lines:]],
+                          dtype=np.float64)
         idx = 0
         dim = self.dim
         neurons = self.num_neurons
@@ -399,45 +406,42 @@ class NEPModel(nn.Module):
         for t in range(self.num_types):
             # w0 stored as (neurons, dim) row-major; model keeps (dim, neurons)
             n_w0 = neurons * dim
-            w0 = np.array(vals[idx:idx + n_w0]).reshape(neurons, dim).T
-            self.fitting_nets[t].w0.data.copy_(
-                torch.from_numpy(w0.astype(np.float32)))
+            w0 = vals[idx:idx + n_w0].reshape(neurons, dim).T
+            self.fitting_nets[t].w0.data.copy_(torch.from_numpy(w0.copy()))
             idx += n_w0
 
-            b0 = np.array(vals[idx:idx + neurons])
-            self.fitting_nets[t].b0.data.copy_(
-                torch.from_numpy(b0.astype(np.float32)))
+            b0 = vals[idx:idx + neurons]
+            self.fitting_nets[t].b0.data.copy_(torch.from_numpy(b0.copy()))
             idx += neurons
 
-            w1 = np.array(vals[idx:idx + neurons])
-            self.fitting_nets[t].w1.data.copy_(
-                torch.from_numpy(w1.astype(np.float32)))
+            w1 = vals[idx:idx + neurons]
+            self.fitting_nets[t].w1.data.copy_(torch.from_numpy(w1.copy()))
             idx += neurons
 
         # Shared output bias
-        self.b1.data.fill_(vals[idx])
+        self.b1.data.fill_(float(vals[idx]))
         idx += 1
 
         # c_param_2: saved as (n_rad+1, bs_rad+1, nt, nt), model: (nt, nt, n+1, b+1)
         nt = self.num_types
         n_c2 = (self.n_max_radial + 1) * (self.basis_size_radial + 1) * nt * nt
-        c2 = np.array(vals[idx:idx + n_c2]).reshape(
+        c2 = vals[idx:idx + n_c2].reshape(
             self.n_max_radial + 1, self.basis_size_radial + 1, nt, nt)
         self.c_param_2.data.copy_(
-            torch.from_numpy(np.transpose(c2, (2, 3, 0, 1)).astype(np.float32)))
+            torch.from_numpy(np.ascontiguousarray(np.transpose(c2, (2, 3, 0, 1)))))
         idx += n_c2
 
         if self.c_param_3 is not None:
             n_c3 = (self.n_max_angular + 1) * (self.basis_size_angular + 1) * nt * nt
-            c3 = np.array(vals[idx:idx + n_c3]).reshape(
+            c3 = vals[idx:idx + n_c3].reshape(
                 self.n_max_angular + 1, self.basis_size_angular + 1, nt, nt)
             self.c_param_3.data.copy_(
-                torch.from_numpy(np.transpose(c3, (2, 3, 0, 1)).astype(np.float32)))
+                torch.from_numpy(np.ascontiguousarray(np.transpose(c3, (2, 3, 0, 1)))))
             idx += n_c3
 
         # q_scaler (buffer — will be overwritten by compute_q_scaler on new data)
-        q_scaler = np.array(vals[idx:idx + dim])
-        self.q_scaler.copy_(torch.from_numpy(q_scaler.astype(np.float32)))
+        q_scaler = vals[idx:idx + dim]
+        self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
 
     def save_nep_txt(self, path: str, max_NN_radial: int = 0,
                      max_NN_angular: int = 0):

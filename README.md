@@ -7,8 +7,8 @@ A PyTorch implementation of [NEP4](https://gpumd.org/theory/nep.html) (Neuroevol
 - **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
 - **Two compute backends auto-picked by element count** — `"loop"` (Python type-pair loop, best for few types) and `"bmm"` (fancy-index + `torch.bmm`, best for ≥8 types). Both pure PyTorch; works on CPU / CUDA / MPS. Set `backend="auto"` and the trainer picks the right one.
 - **Two-stage training** — Stage 1: force-focused with ReduceLROnPlateau; Stage 2: energy fine-tuning with Stochastic Weight Averaging
-- **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`; each rank holds only `1/N` of the structures (single-node and multi-node SLURM templates included)
-- **Fine-tuning** — load any `nep.txt` or `best_model.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
+- **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`; each rank holds only `1/N` of the structures (single-node and multi-node SLURM launch snippets in the README)
+- **Fine-tuning** — load any `nep.txt` or `nep_best.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
 - **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`; resume with one flag
 - **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
 - **Batched prediction** — full-dataset prediction using pre-cached GPU basis, typically 10–50× faster than per-frame evaluation
@@ -90,8 +90,9 @@ torchrun --standalone --nproc_per_node=4 run_train.py    # 4 GPUs on this node
 
 ### Multi-GPU, multi-node (SLURM) — `train_nep_sharded` + sbatch
 
-For 1 node × N GPUs, see [example/run_1node_4gpu.sbatch](example/run_1node_4gpu.sbatch).
-For M nodes × N GPUs each, see [example/run_multi_node.sbatch](example/run_multi_node.sbatch). The key SLURM directives:
+For 1 node × N GPUs, use the `torchrun --standalone --nproc_per_node=N run_train.py`
+snippet above inside an `sbatch` script.  For M nodes × N GPUs each, the key
+SLURM directives are:
 
 ```bash
 #SBATCH --nodes=2                  # M nodes
@@ -301,7 +302,7 @@ train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
 import torch
 
 # Best model weights only
-state = torch.load("output/best_model.pt", map_location="cpu")
+state = torch.load("output/nep_best.pt", map_location="cpu")
 print(list(state.keys()))
 # ['c_param_2', 'c_param_3', 'fitting_nets.0.w0', ..., 'b1', 'q_scaler', ...]
 
@@ -323,7 +324,7 @@ train_nep(
     "nep.in",
     "new_data.xyz",
     output_dir="finetune_output",
-    finetune_from="pretrained/nep.txt",   # or "pretrained/best_model.pt"
+    finetune_from="pretrained/nep.txt",   # or "pretrained/nep_best.pt"
     lr=1e-3,
     num_epochs=200,
 )
@@ -331,7 +332,7 @@ train_nep(
 
 `finetune_from` accepts:
 - `nep.txt` — GPUMD text format (works with models trained by GPUMD or torchnep)
-- `best_model.pt` — PyTorch state dict
+- `nep_best.pt` — PyTorch state dict
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
 What happens internally:
@@ -466,7 +467,9 @@ L = λ_e · MSE(E_pred/N, E_ref/N)
   + λ_v · MSE(V_pred/N, V_ref/N)
 ```
 
-Huber loss can replace MSE via `huber_delta > 0`.
+The banner `loss` column printed every epoch equals this same weighted-MSE
+sum recomputed per-sample across the whole epoch (not a per-batch mean),
+so it is self-consistent with the `RMSE_E / RMSE_F / RMSE_V` columns.
 
 ---
 
@@ -483,7 +486,8 @@ torchnep/
   ops.py          — basis functions, descriptors, analytical forces (pure PyTorch)
   constants.py    — physical constants, element data, C3B/C4B/C5B, Z_COEFFICIENT
 example/
-  run_train.py            — typical entry point users edit
-  run_1node_4gpu.sbatch   — single-node multi-GPU SLURM template
-  run_multi_node.sbatch   — cross-node multi-GPU SLURM template
+  run_train.py      — typical single-GPU entry point users edit
+  run_fine_tune.py  — fine-tuning entry point (loads pretrained nep.txt)
+  nep*.in           — example hyperparameter files
+  train*.xyz        — example extxyz datasets
 ```

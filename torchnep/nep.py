@@ -13,6 +13,7 @@ import numpy as np
 from typing import Dict
 
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B
+from .data import build_neighbor_list_np
 from . import ops
 
 
@@ -188,14 +189,18 @@ class NEPCalculator:
         atom_types = torch.tensor(
             [self.type_names.index(s) for s in species],
             dtype=torch.long, device=self.device)
-        pos = torch.tensor(positions, dtype=self.dtype, device=self.device)
-        cell_t = torch.tensor(cell, dtype=self.dtype, device=self.device)
-        N = pos.shape[0]
+        pos_np = np.asarray(positions)
+        cell_np = np.asarray(cell)
+        N = pos_np.shape[0]
 
-        # Neighbor list
+        # Neighbor list (numpy; single implementation shared with training/prediction)
         max_rc = max(self.rc_radial, self.rc_angular)
-        pair_i, pair_j, rij, dij = ops.build_neighbor_list(
-            pos, cell_t, max_rc, self.device, self.dtype)
+        pi_np, pj_np, rij_np = build_neighbor_list_np(pos_np, cell_np, max_rc)
+        pair_i = torch.from_numpy(pi_np).to(self.device)
+        pair_j = torch.from_numpy(pj_np).to(self.device)
+        rij = torch.from_numpy(np.ascontiguousarray(rij_np)).to(
+            device=self.device, dtype=self.dtype)
+        dij = torch.norm(rij, dim=-1)
 
         rad_mask = dij < self.rc_radial
         ang_mask = dij < self.rc_angular

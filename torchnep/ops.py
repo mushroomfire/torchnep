@@ -50,49 +50,6 @@ def _select_contraction_funcs(backend: str):
 
 
 # ---------------------------------------------------------------------------
-# Neighbor list
-# ---------------------------------------------------------------------------
-
-def build_neighbor_list(
-    positions: torch.Tensor,
-    cell: torch.Tensor,
-    cutoff: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build periodic neighbor list.
-
-    Returns: pair_i, pair_j, rij (P,3), dij (P,).
-    """
-    N = positions.shape[0]
-    inv_cell = torch.linalg.inv(cell)
-
-    # Columns of inv_cell are reciprocal lattice vectors; 1/|col i| is the
-    # perpendicular distance between the two cell planes normal to direction i.
-    # Using rows silently undercounts replicas for triclinic cells.
-    n_rep = [int(torch.ceil(cutoff * torch.norm(inv_cell[:, i])).item())
-             for i in range(3)]
-
-    ranges = [torch.arange(-n, n + 1, device=device, dtype=dtype) for n in n_rep]
-    grid = torch.stack(torch.meshgrid(*ranges, indexing="ij"), dim=-1)
-    shifts_frac = grid.reshape(-1, 3)
-    shifts_cart = shifts_frac @ cell
-
-    S = shifts_cart.shape[0]
-    disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
-            - positions[:, None, None, :])
-    dist = torch.norm(disp, dim=-1)
-
-    zero_shift = shifts_frac.abs().sum(-1) == 0
-    self_mask = torch.eye(N, dtype=torch.bool, device=device)[:, :, None]
-    exclude = self_mask & zero_shift[None, None, :]
-    valid = (dist < cutoff) & (dist > 1e-10) & ~exclude
-
-    idx_i, idx_j, idx_s = torch.where(valid)
-    return idx_i, idx_j, disp[idx_i, idx_j, idx_s], dist[idx_i, idx_j, idx_s]
-
-
-# ---------------------------------------------------------------------------
 # Basis functions
 # ---------------------------------------------------------------------------
 
@@ -259,44 +216,26 @@ def compute_descriptors(
     n_max_radial, n_max_angular, l_max_3b, l_max_4b, l_max_5b,
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
     dtype, device,
-    backend: str = "loop",
+    backend: str = "auto",
 ) -> torch.Tensor:
-    """Compute NEP4 descriptors. Returns (N, dim).
+    """Compute NEP4 descriptors from raw pair geometry. Returns (N, dim).
 
-    The non-cached path has no CUDA dispatch, so only "loop" and "fast" apply
-    here. backend="cuda" falls through to "fast" (both use vectorised bmm).
+    This builds the Chebyshev/angular basis internally, unlike
+    ``compute_descriptors_cached`` which takes them as inputs. Used by the
+    non-training ASE-like path (NEPCalculator.compute).
     """
-    use_fast = backend in ("fast", "cuda")
-    ntypes = int(c2.shape[0]) if c2.shape[0] != n_max_radial + 1 else int(c2.shape[2])
+    backend = resolve_backend(backend, num_types=int(c2.shape[0]))
+    scatter_fn, type_fn = _select_contraction_funcs(backend)
 
     # --- Radial ---
     dij_rad = torch.norm(rij_rad, dim=-1)
     fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
-    t1r = atom_types[pi_rad]
-    t2r = atom_types[pj_rad]
-    q_rad = torch.zeros(N, n_max_radial + 1, dtype=dtype, device=device)
-    if use_fast:
-        # Vectorised: gather c[t1,t2] per pair, fused bmm, single scatter_add.
-        # Collapses the ntypes² python-launched kernels into one call — huge
-        # speed-up for large ntypes. Autograd through fancy index + bmm is fine.
-        c_p = c2[t1r, t2r]                                            # (P, N_out, K)
-        _gn = torch.bmm(c_p, fk_rad.unsqueeze(-1)).squeeze(-1)         # (P, N_out)
-        q_rad.scatter_add_(0, pi_rad.unsqueeze(-1).expand_as(_gn), _gn)
-    else:
-        # Type-pair matmul loop: lower peak memory, preferred for small ntypes.
-        for _t1 in range(ntypes):
-            for _t2 in range(ntypes):
-                _m = (t1r == _t1) & (t2r == _t2)
-                if not _m.any():
-                    continue
-                _gn = fk_rad[_m] @ c2[_t1, _t2].T
-                q_rad.scatter_add_(0, pi_rad[_m].unsqueeze(-1).expand_as(_gn), _gn)
+    q_rad = scatter_fn(fk_rad, pi_rad, pj_rad, atom_types, c2, N)
 
     parts = [q_rad]
 
-    # --- Angular (CUDA-accelerated when available) ---
+    # --- Angular ---
     n_ap1 = n_max_angular + 1
-    num_L_total = l_max_3b + (1 if l_max_4b > 0 else 0) + (1 if l_max_5b > 0 else 0)
 
     if l_max_3b > 0 and rij_ang.shape[0] == 0:
         # No angular neighbors (e.g. isolated atom / dimer). Emit zero-filled
@@ -310,20 +249,7 @@ def compute_descriptors(
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
         dij_ang = torch.norm(rij_ang, dim=-1)
         fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
-        t1a = atom_types[pi_ang]
-        t2a = atom_types[pj_ang]
-        if use_fast:
-            c3_p = c3[t1a, t2a]                                        # (P, N_out, K)
-            gn_ang = torch.bmm(c3_p, fk_ang.unsqueeze(-1)).squeeze(-1)  # (P, N_out)
-        else:
-            # Type-pair matmul loop.
-            gn_ang = torch.zeros(rij_ang.shape[0], n_ap1, dtype=dtype, device=device)
-            for _t1 in range(ntypes):
-                for _t2 in range(ntypes):
-                    _m = (t1a == _t1) & (t2a == _t2)
-                    if not _m.any():
-                        continue
-                    gn_ang[_m] = fk_ang[_m] @ c3[_t1, _t2].T
+        gn_ang = type_fn(fk_ang, pi_ang, pj_ang, atom_types, c3)
         d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
         blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,
                             rij_ang[:, 2]*d12inv, l_max_3b)
@@ -483,31 +409,6 @@ def compute_zbl(
     e_atom = torch.zeros(N, dtype=dtype, device=device)
     e_atom.scatter_add_(0, pi, 0.5 * e_pair)
     return e_atom
-
-
-# ---------------------------------------------------------------------------
-# Precomputation for analytical force training
-# ---------------------------------------------------------------------------
-
-def precompute_basis(rij, dij, rc, basis_size, l_max_3b=0):
-    """Precompute Chebyshev basis, derivative, and angular basis.
-
-    Call once at startup for fixed geometry. Returns dict of cached tensors.
-    """
-    fk, fkp = chebyshev_basis_and_deriv(dij, rc, basis_size)
-    result = {"fk": fk, "fkp": fkp, "dij": dij, "d12inv": 1.0 / dij}
-
-    if l_max_3b > 0:
-        d12inv = result["d12inv"]
-        x_hat = rij[:, 0] * d12inv
-        y_hat = rij[:, 1] * d12inv
-        z_hat = rij[:, 2] * d12inv
-        result["blm"] = angular_basis(x_hat, y_hat, z_hat, l_max_3b)
-        result["x_hat"] = x_hat
-        result["y_hat"] = y_hat
-        result["z_hat"] = z_hat
-
-    return result
 
 
 def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):

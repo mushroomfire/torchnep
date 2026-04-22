@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "torchnep"
@@ -15,8 +15,26 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest", "mdapy"]
 
-[tool.setuptools.packages.find]
-include = ["torchnep*"]
+[tool.hatch.version]
+path = "torchnep/__init__.py"
 
-[tool.setuptools.dynamic]
-version = {attr = "torchnep.__version__"}
+# Wheel: install only the torchnep/ package.
+[tool.hatch.build.targets.wheel]
+packages = ["torchnep"]
+
+# sdist (tar.gz): library code + README + pyproject.toml only.
+# tests/, example/, my_test/ are dev-only and never shipped.
+[tool.hatch.build.targets.sdist]
+include = [
+    "torchnep/**/*.py",
+    "README.md",
+    "pyproject.toml",
+]
+exclude = [
+    ".gitignore",
+    "tests",
+    "example",
+    "my_test",
+    ".claude",
+    ".github",
+]

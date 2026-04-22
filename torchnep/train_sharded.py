@@ -1,19 +1,19 @@
 """
 Data-sharded distributed NEP training.
 
-Each GPU rank loads only 1/N of the training structures, so the total
-GPU memory scales as 1/N instead of being replicated.  Gradients are
-still all-reduced by DDP; q_scaler statistics and per-epoch metrics are
-all-reduced explicitly.
+Each rank loads only 1/N of the training structures, so data-store memory
+scales as 1/N instead of being replicated.  Gradients are all-reduced by
+DDP; q_scaler statistics and per-epoch metrics are all-reduced explicitly.
 
-Usage (must be launched with torchrun):
+Usage (typical multi-GPU launch via torchrun):
 
     torchrun --nproc_per_node=N run_train.py
 
 where run_train.py calls ``train_nep_sharded(...)`` instead of ``train_nep``.
 
-Single-GPU (N=1) works but is identical to ``train_nep`` in that case;
-the function enforces torchrun launch so that dist is always initialised.
+Backend is chosen automatically: NCCL when every rank has its own CUDA
+device, otherwise gloo (covers CPU-only testing and the GPU-sharing case).
+Single-rank (N=1) runs but offers nothing over ``train_nep`` in that case.
 """
 
 import os
@@ -27,12 +27,47 @@ from typing import List, Dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
+import torch.nn as nn
 from .model import NEPModel
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_dataset
 from .model import slim_model
+
+
+class _NEPDDPShim(nn.Module):
+    """Thin wrapper whose forward calls compute_properties{_cached}.
+
+    Why this exists: DDP's gradient all-reduce is armed inside
+    ``DistributedDataParallel.forward`` (it calls
+    ``reducer.prepare_for_backward`` on the output). Calling
+    ``self.module.compute_properties_cached(...)`` directly — even though the
+    parameters live in the module — bypasses DDP's forward and therefore the
+    reducer. Each rank then keeps its local gradient; weights drift per-rank
+    and only rank 0's overfit copy is saved. Putting the compute call inside
+    this shim's ``forward`` puts it on the DDP path.
+    """
+
+    def __init__(self, model: NEPModel):
+        super().__init__()
+        self.model = model
+
+    def forward(self, batch, use_autograd_forces: bool,
+                need_forces: bool, need_virial: bool, backend: str):
+        if use_autograd_forces:
+            return self.model.compute_properties(
+                batch["rij_rad"], batch["rij_ang"],
+                batch["pair_i_rad"], batch["pair_j_rad"],
+                batch["pair_i_ang"], batch["pair_j_ang"],
+                batch["atom_types"], batch["N"],
+                batch["struct_idx"], batch["num_structures"],
+                need_forces=need_forces, need_virial=need_virial,
+                backend=backend)
+        return self.model.compute_properties_cached(
+            batch, need_forces=need_forces, need_virial=need_virial,
+            backend=backend)
+
 from .train import (
     _BANNER, _AUTHOR,
     _backend_info, _default_device,
@@ -105,21 +140,24 @@ def train_nep_sharded(
     checkpoint_interval: int = 100,
     prediction_interval: int = 20,
     finetune_from: str = None,
+    reset_lr: float = None,
     slim_types: bool = False,
 ):
-    """Data-sharded NEP training.  Must be launched via torchrun.
+    """Data-sharded NEP training.  Launch via torchrun (or any launcher that
+    sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
 
     All hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / ...)
     come from ``config_file`` — see README for the nep.in reference.
 
-    Each rank loads structures[rank::world_size] only, so total GPU memory
-    for the data store scales as 1/world_size.  Gradients are all-reduced by
-    DDP; q_scaler and epoch metrics are all-reduced explicitly.
+    Each rank loads structures[rank::world_size] only, so data-store memory
+    scales as 1/world_size.  Gradients are all-reduced by DDP; q_scaler and
+    epoch metrics are all-reduced explicitly.
 
         torchrun --nproc_per_node=N run_train.py
 
-    Parameters are the same as ``train_nep``; the only runtime-exclusive
-    differences are DDP launch + distributed q_scaler/metric aggregation.
+    Parameters mirror ``train_nep``; the only runtime-exclusive differences
+    are the DDP launch, CUDA/gloo backend auto-select, and distributed
+    q_scaler/metric aggregation.
     """
     # ---- Distributed init ------------------------------------------------
     # Wrap local_rank around the number of visible GPUs — lets several
@@ -127,13 +165,18 @@ def train_nep_sharded(
     # NCCL refuses to share a GPU across ranks, so fall back to gloo (slower
     # but correct) when world_size > available GPUs.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    n_gpus = max(1, torch.cuda.device_count())
-    gpu_id = local_rank % n_gpus
-    torch.cuda.set_device(gpu_id)
-    dev = torch.device(f"cuda:{gpu_id}")
+    cuda_available = torch.cuda.is_available()
+    n_gpus = torch.cuda.device_count() if cuda_available else 0
+    if cuda_available:
+        gpu_id = local_rank % max(1, n_gpus)
+        torch.cuda.set_device(gpu_id)
+        dev = torch.device(f"cuda:{gpu_id}")
+    else:
+        gpu_id = None
+        dev = torch.device("cpu")
     if not dist.is_initialized():
         world_size_env = int(os.environ.get("WORLD_SIZE", 1))
-        ddp_backend = "nccl" if world_size_env <= n_gpus else "gloo"
+        ddp_backend = "nccl" if cuda_available and world_size_env <= n_gpus else "gloo"
         dist.init_process_group(backend=ddp_backend)
 
     rank = dist.get_rank()
@@ -247,7 +290,8 @@ def train_nep_sharded(
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
-    torch.cuda.synchronize()
+    if cuda_available:
+        torch.cuda.synchronize()
     _log(f"  Loaded ({time.time() - t0:.1f}s)")
 
     # Aggregate data counts across all ranks for the banner
@@ -319,21 +363,29 @@ def train_nep_sharded(
     t_qs = time.time()
     q_min, q_max = _compute_q_scaler_sharded(model, data_store, backend=backend)
     model.set_q_scaler(q_min, q_max)
-    torch.cuda.synchronize()
+    if cuda_available:
+        torch.cuda.synchronize()
     _log(f"  Done in {time.time() - t_qs:.1f}s")
 
     if use_compile and hasattr(torch, "compile"):
         _log("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # All per-type nets are always touched in NEPModel.forward (dummy pass for
-    # types absent in a given batch) so DDP sees every parameter in every step
-    # — no need for find_unused_parameters, and no implicit grad dilution for
-    # rare types.
-    model = DDP(model, device_ids=[gpu_id], find_unused_parameters=False)
-    raw_model = (model.module._orig_mod
-                 if hasattr(model.module, "_orig_mod")
-                 else model.module)
+    # Wrap in a shim whose forward calls compute_properties{_cached} — this
+    # keeps the force/virial compute on DDP's forward path so the reducer can
+    # arm backward all-reduce. See _NEPDDPShim docstring.
+    shim = _NEPDDPShim(model)
+    # All per-type nets are always touched in compute_properties_cached (dummy
+    # pass for types absent in a given batch) so DDP sees every parameter in
+    # every step — no need for find_unused_parameters, and no implicit grad
+    # dilution for rare types.
+    model = DDP(shim,
+                device_ids=[gpu_id] if cuda_available else None,
+                find_unused_parameters=False)
+    # raw_model: unwrap DDP → shim → (optional torch.compile) → NEPModel
+    _shim = model.module
+    inner = _shim.model
+    raw_model = inner._orig_mod if hasattr(inner, "_orig_mod") else inner
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=lambda_2, amsgrad=True)
@@ -360,12 +412,17 @@ def train_nep_sharded(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
-    if restart and os.path.exists(ckpt_path):
+    if restart and os.path.exists(ckpt_path) and finetune_from is None:
         start_epoch, best_loss = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
         _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}")
+
+    if reset_lr is not None:
+        for pg in optimizer.param_groups:
+            pg["lr"] = reset_lr
+        _log(f"LR reset to {reset_lr:.2e}")
 
     n_local = data_store.n
     has_forces = global_has_forces and pref_f > 0
@@ -414,9 +471,8 @@ def train_nep_sharded(
             g.manual_seed(epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g)
 
-            sum_loss = sum_le = sum_lf = sum_lv = 0.0
+            sum_le = sum_lf = sum_lv = 0.0
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            n_batch = 0
             max_gn = 0.0
 
             in_stage2 = stage2 and epoch >= start_stage2
@@ -439,19 +495,10 @@ def train_nep_sharded(
                 idx = perm[start:start + batch_size].tolist()
                 batch = data_store.collate(idx)
 
-                if use_autograd_forces:
-                    result = raw_model.compute_properties(
-                        batch["rij_rad"], batch["rij_ang"],
-                        batch["pair_i_rad"], batch["pair_j_rad"],
-                        batch["pair_i_ang"], batch["pair_j_ang"],
-                        batch["atom_types"], batch["N"],
-                        batch["struct_idx"], batch["num_structures"],
-                        need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
-                else:
-                    result = raw_model.compute_properties_cached(
-                        batch, need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                # Go through DDP wrapper (not raw_model.compute_*) so the
+                # reducer arms backward all-reduce for this step.
+                result = model(batch, use_autograd_forces,
+                               has_forces, has_virial, backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
@@ -537,33 +584,35 @@ def train_nep_sharded(
                 if in_stage2 and swa_model is not None and is_main:
                     swa_model.update_parameters(raw_model)
 
-                sum_loss += loss.item()
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
                 sum_v_structs += batch["virial_mask"].sum().item()
-                n_batch += 1
                 max_gn = max(max_gn, gn)
 
             # Aggregate metrics across all ranks
             metrics = torch.tensor(
-                [sum_loss, sum_le, sum_lf, sum_lv,
+                [sum_le, sum_lf, sum_lv,
                  float(sum_e_structs), float(sum_f_atoms),
-                 float(sum_v_structs), float(n_batch)],
+                 float(sum_v_structs)],
                 device=dev)
             dist.all_reduce(metrics)
             gn_t = torch.tensor(max_gn, device=dev)
             dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
-            (sum_loss, sum_le, sum_lf, sum_lv,
-             sum_e_structs, sum_f_atoms, sum_v_structs,
-             n_batch) = metrics.tolist()
+            (sum_le, sum_lf, sum_lv,
+             sum_e_structs, sum_f_atoms, sum_v_structs) = metrics.tolist()
             max_gn = gn_t.item()
 
-            avg_loss = sum_loss / max(n_batch, 1)
-            rmse_e = np.sqrt(sum_le / max(sum_e_structs, 1)) * 1000
-            rmse_f = (np.sqrt(sum_lf / max(sum_f_atoms, 1))
-                      if sum_lf > 0 else 0.0)
-            rmse_v = (np.sqrt(sum_lv / max(sum_v_structs, 1)) * 1000
-                      if sum_lv > 0 else 0.0)
+            # Per-sample (not per-batch) averaging so avg_loss is self-
+            # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
+            # where each MSE_X aggregates over all samples in the epoch.
+            mse_e = sum_le / max(sum_e_structs, 1)
+            mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
+            mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
+            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
+                        + cur_pref_v * mse_v)
+            rmse_e = np.sqrt(mse_e) * 1000
+            rmse_f = np.sqrt(mse_f)
+            rmse_v = np.sqrt(mse_v) * 1000
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
