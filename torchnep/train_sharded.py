@@ -36,7 +36,7 @@ from .model import NEPModel
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
-from .predict import predict_dataset
+from .predict import predict_from_store_sharded
 from .model import slim_model
 
 
@@ -276,7 +276,7 @@ def train_nep_sharded(
     # same number of iterations, which is all DDP requires). Iteration i
     # on every rank draws from the same natoms quantile, so per-batch
     # compute is matched across ranks.
-    local_frames, boundaries, dropped = _sort_and_shard(
+    local_frames, boundaries, local_global_idx, dropped = _sort_and_shard(
         frames, rank=rank, world_size=world_size,
         batch_size=config["batch_size"])
     n_local = len(local_frames)
@@ -439,6 +439,7 @@ def train_nep_sharded(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
+    stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if restart and os.path.exists(ckpt_path) and finetune_from is None:
         start_epoch, best_loss = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
@@ -508,14 +509,25 @@ def train_nep_sharded(
             if in_stage2:
                 cur_pref_e, cur_pref_f, cur_pref_v = (
                     stage2_pref_e, stage2_pref_f, stage2_pref_v)
-                if epoch == start_stage2:
+                # Apply stage 2 lr + reset the first time we hit stage 2 in
+                # THIS run — covers both the natural transition and resuming
+                # from a stage-1 checkpoint whose start_epoch has already
+                # crossed into stage 2 (``epoch == start_stage2`` would miss
+                # the second case, leaving the optimizer on stage-1 lr).
+                if not stage2_lr_applied:
+                    stage2_lr_applied = True
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
-                    _log(f"Stage 2 started at epoch {epoch}: "
+                    tag = ("Stage 2 started" if epoch == start_stage2
+                           else f"Stage 2 resumed (from checkpoint)")
+                    _log(f"{tag} at epoch {epoch}: "
                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                          f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
                     _log(f"{'='*72}")
+                    # Stage 2 uses different loss weights — old best_loss is
+                    # on a different scale, so reset it whichever way we
+                    # entered.
                     best_loss = float("inf")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
@@ -691,33 +703,27 @@ def train_nep_sharded(
                     _save_checkpoint(ckpt_path, model, optimizer,
                                      lr_scheduler, epoch, best_loss)
 
-                # Interim predict — rank 0 only, reads nep_best.txt from disk.
-                # Each rank has only 1/N of the structures so the in-memory
-                # data_store can't give a full dataset prediction; we fall back
-                # to the file-based predict_dataset here. Skip on the last
-                # epoch — the end-of-training predict runs right after.
-                if (prediction_interval > 0
-                        and epoch % prediction_interval == 0
-                        and epoch != num_epochs
-                        and os.path.exists(os.path.join(output_dir,
-                                                         "nep_best.txt"))):
-                    predict_dataset(
-                        os.path.join(output_dir, "nep_best.txt"),
-                        data_file, output_dir=output_dir,
-                        dtype=precision, device=str(dev),
-                        backend=backend, verbose=False,
-                        energy_key=energy_key)
+            # Interim predict — uses the CURRENT-epoch weights (not nep_best)
+            # so the predict loss matches the line just logged for this epoch:
+            # it should fall between this epoch's and the next epoch's
+            # displayed loss. Each rank predicts its own data_store shard;
+            # arrays are gathered onto rank 0, which writes the output files
+            # in input-xyz order. No xyz re-read, no temp model file, no
+            # neighbor-list rebuild.
+            # Skip on the final epoch — the end-of-training predict runs
+            # right after and would overwrite this output anyway.
+            if (prediction_interval > 0
+                    and epoch % prediction_interval == 0
+                    and epoch != num_epochs):
+                predict_from_store_sharded(
+                    raw_model, data_store, local_global_idx,
+                    n_total_frames=n_total,
+                    output_dir=output_dir,
+                    batch_size=batch_size, backend=backend,
+                    verbose=False)
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
-
-    # Free every rank's data_store BEFORE rank 0 runs end-of-training predict
-    # (which re-reads full xyz). This matters for simulated multi-process-on-
-    # single-GPU testing; on real multi-GPU it is free extra memory for the
-    # predict pass.
-    del data_store
-    if dev.type == "cuda":
-        torch.cuda.empty_cache()
 
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
@@ -738,17 +744,28 @@ def train_nep_sharded(
         _log(f"\nDone. Best loss: {best_loss:.6e}")
         _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-        # End-of-training predict: rank 0 only. In sharded mode each rank holds
-        # only 1/N of the structures, so reusing the local store would miss
-        # the other ranks' frames — simpler to re-read the full xyz on rank 0.
         _log("\nRunning prediction on training set (final-epoch model)...")
-        pred_t0 = time.time()
-        predict_dataset(os.path.join(output_dir, "nep_final.txt"),
-                        data_file, output_dir=output_dir,
-                        dtype=precision, device=str(dev),
-                        backend=backend, energy_key=energy_key)
+
+    # End-of-training predict: every rank still holds its data_store shard,
+    # so we reuse it — no xyz re-read, no neighbor-list rebuild, no model-
+    # file round-trip. Each rank predicts its own shard; rank 0 gathers the
+    # per-frame arrays via all_gather_object and writes the output files.
+    pred_t0 = time.time()
+    predict_from_store_sharded(
+        raw_model, data_store, local_global_idx,
+        n_total_frames=n_total,
+        output_dir=output_dir,
+        batch_size=batch_size, backend=backend,
+        verbose=is_main)
+    if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
+    # data_store is no longer needed — free it now that predict is done.
+    del data_store
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if is_main:
         total_time = time.time() - total_t0
         h, rem = divmod(total_time, 3600)
         m_, s = divmod(rem, 60)

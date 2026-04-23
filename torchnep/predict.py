@@ -546,3 +546,203 @@ def predict_from_store(model, data_store, output_dir: str,
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
          f"→ {output_dir}/(energy|force|virial|stress)_predict.out")
+
+
+# ---------------------------------------------------------------------------
+# Sharded variant: each DDP rank predicts its own data_store shard, then all
+# per-frame arrays are gathered to rank 0 and written out in input-xyz order.
+# No xyz re-read, no temp nep.txt, no second neighbor-list build.
+# ---------------------------------------------------------------------------
+
+def _compute_local_predictions(model, data_store, batch_size, backend):
+    """Run prediction on one rank's local data_store → numpy arrays.
+
+    Returns a dict of per-frame / per-atom arrays (pred and ref) plus the
+    natoms and volume metadata needed to merge + write on rank 0.
+    """
+    dev   = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    n_struct = data_store.n
+    backend = ops.resolve_backend(backend, num_types=model.num_types)
+
+    nat_arr = np.asarray(data_store.natoms, dtype=np.int64)
+    nat_cum = np.concatenate([[0], np.cumsum(nat_arr)])
+    N_atoms_local = int(nat_cum[-1])
+
+    e_pred = np.zeros(n_struct, dtype=np.float64)
+    f_pred = np.zeros((N_atoms_local, 3), dtype=np.float64)
+    v_pred = np.zeros((n_struct, 6), dtype=np.float64)
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_struct, batch_size):
+            end = min(start + batch_size, n_struct)
+            B = end - start
+            batch = data_store.collate(list(range(start, end)))
+            r = model.compute_properties_cached(
+                batch, need_forces=True, need_virial=True, backend=backend)
+
+            nat_slice = nat_arr[start:end].astype(np.float64)
+            e_pred[start:end] = r["Etot"].cpu().numpy() / nat_slice
+
+            v_per = torch.zeros(B, 9, dtype=dtype, device=dev)
+            v_per.scatter_add_(
+                0, batch["struct_idx"].unsqueeze(-1).expand(-1, 9), r["virial"])
+            v_pred[start:end] = (_virial9_to_6(v_per.cpu().numpy())
+                                 / nat_slice[:, None])
+
+            a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
+            f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
+    if was_training:
+        model.train()
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Reference values (only fill where the flag is set)
+    energy_ref = np.array(
+        [data_store.energy[i] if data_store.has_energy_flag[i] else np.nan
+         for i in range(n_struct)], dtype=np.float64)
+    e_ref_pa = energy_ref / nat_arr.astype(np.float64)
+
+    forces_ref = np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+    for i in range(n_struct):
+        if data_store.has_forces_flag[i]:
+            a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
+            forces_ref[a_lo:a_hi] = data_store.forces[i].cpu().numpy()
+
+    virial_ref = np.full((n_struct, 6), np.nan, dtype=np.float64)
+    for i in range(n_struct):
+        if data_store.has_virial_flag[i]:
+            v9 = data_store.virial[i].cpu().numpy().flatten()
+            n = float(nat_arr[i])
+            virial_ref[i] = [v9[0] / n, v9[4] / n, v9[8] / n,
+                             v9[1] / n, v9[5] / n, v9[6] / n]
+
+    vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
+    return {
+        "natoms":    nat_arr,
+        "volumes":   vol_arr,
+        "e_pred":    e_pred,    "e_ref":    e_ref_pa,
+        "f_pred":    f_pred,    "f_ref":    forces_ref,
+        "v_pred":    v_pred,    "v_ref":    virial_ref,
+    }
+
+
+def _write_predictions(output_dir: str, n_total_frames: int,
+                       natoms, volumes,
+                       e_pred, e_ref, f_pred, f_ref, v_pred, v_ref):
+    """Write the four *_predict.out files in frame-order. All arrays are
+    already in global input-xyz order (frame 0 first)."""
+    from .constants import EV_PER_A3_TO_GPa
+    os.makedirs(output_dir, exist_ok=True)
+
+    np.savetxt(os.path.join(output_dir, "energy_predict.out"),
+               np.column_stack([e_pred, e_ref]), fmt="%.10g")
+    np.savetxt(os.path.join(output_dir, "force_predict.out"),
+               np.column_stack([f_pred, f_ref]), fmt="%.10g")
+    np.savetxt(os.path.join(output_dir, "virial_predict.out"),
+               np.column_stack([v_pred, v_ref]), fmt="%.10g")
+
+    nat_col = natoms.astype(np.float64)[:, None]
+    vol_col = volumes[:, None]
+    vol_safe = np.where(vol_col > 0, vol_col, 1.0)
+    scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
+    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+               np.column_stack([v_pred * scale, v_ref * scale]), fmt="%.10g")
+
+
+def predict_from_store_sharded(model, data_store, local_global_idx,
+                                n_total_frames: int, output_dir: str,
+                                batch_size: int = 1000,
+                                backend: str = "auto",
+                                verbose: bool = True):
+    """DDP equivalent of ``predict_from_store``: each rank predicts its local
+    data-store shard, arrays are gathered to rank 0, rank 0 writes the four
+    ``*_predict.out`` files in input-xyz order.
+
+    No xyz re-read, no neighbor-list rebuild, no temp nep.txt model file.
+
+    Parameters
+    ----------
+    model : NEPModel  (DDP replica — parameters are in sync across ranks).
+    data_store : GPUDataStore  (this rank's local shard).
+    local_global_idx : list[int]  original xyz-frame index for each local
+        frame (length == ``data_store.n``). Supplied by ``_sort_and_shard``.
+    n_total_frames : int  total frames across all ranks (pre-drop).
+    """
+    import torch.distributed as dist
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    is_main = rank == 0
+
+    def _log(msg):
+        if verbose and is_main:
+            print(msg)
+
+    t_compute = time.time()
+    local = _compute_local_predictions(model, data_store, batch_size, backend)
+    local["global_idx"] = np.asarray(local_global_idx, dtype=np.int64)
+    _log(f"  compute:  {time.time() - t_compute:5.1f}s")
+
+    # Gather per-rank arrays onto rank 0. all_gather_object stays on the
+    # object-pickle path (cheap for our sizes: the per-rank arrays together
+    # are the same size as the full dataset).
+    t_gather = time.time()
+    if world_size > 1:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, local)
+    else:
+        gathered = [local]
+    if is_main:
+        _log(f"  gather:   {time.time() - t_gather:5.1f}s")
+
+    if not is_main:
+        return
+
+    # Allocate global arrays and scatter each rank's contribution into the
+    # slots given by its global_idx. Dropped frames (last-bucket overflow
+    # below world_size) show up as untouched rows → NaN.
+    natoms_g = np.zeros(n_total_frames, dtype=np.int64)
+    volumes_g = np.zeros(n_total_frames, dtype=np.float64)
+    e_pred_g = np.full(n_total_frames, np.nan)
+    e_ref_g  = np.full(n_total_frames, np.nan)
+    v_pred_g = np.full((n_total_frames, 6), np.nan)
+    v_ref_g  = np.full((n_total_frames, 6), np.nan)
+
+    # First pass: frame-level arrays + natoms (to size the atom-level arrays).
+    for part in gathered:
+        gi = part["global_idx"]
+        natoms_g[gi]  = part["natoms"]
+        volumes_g[gi] = part["volumes"]
+        e_pred_g[gi]  = part["e_pred"]
+        e_ref_g[gi]   = part["e_ref"]
+        v_pred_g[gi]  = part["v_pred"]
+        v_ref_g[gi]   = part["v_ref"]
+
+    # Global per-atom offsets are determined by input-xyz order so they match
+    # what predict_dataset / predict_from_store would emit.
+    nat_cum_g = np.concatenate([[0], np.cumsum(natoms_g)])
+    N_atoms_global = int(nat_cum_g[-1])
+    f_pred_g = np.full((N_atoms_global, 3), np.nan)
+    f_ref_g  = np.full((N_atoms_global, 3), np.nan)
+
+    for part in gathered:
+        gi = part["global_idx"]
+        # Local atom offsets in the rank's concatenated arrays:
+        nat_part = part["natoms"]
+        part_cum = np.concatenate([[0], np.cumsum(nat_part)])
+        for li, gidx in enumerate(gi):
+            la, lb = int(part_cum[li]),  int(part_cum[li + 1])
+            ga, gb = int(nat_cum_g[gidx]), int(nat_cum_g[gidx + 1])
+            f_pred_g[ga:gb] = part["f_pred"][la:lb]
+            f_ref_g[ga:gb]  = part["f_ref"][la:lb]
+
+    t_write = time.time()
+    _write_predictions(output_dir, n_total_frames,
+                       natoms_g, volumes_g,
+                       e_pred_g, e_ref_g,
+                       f_pred_g, f_ref_g,
+                       v_pred_g, v_ref_g)
+    _log(f"  write:    {time.time() - t_write:5.1f}s   "
+         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")

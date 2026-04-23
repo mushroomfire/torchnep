@@ -142,6 +142,10 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
                    is all DDP requires. The loss normalisation already uses
                    global sample counts, so unequal rank batch sizes are
                    accounted for.
+    global_idx   : list[int] — for each entry of ``local_frames``, the index
+                   it held in the input ``frames`` list (i.e. its xyz-file
+                   row). Needed by sharded prediction to emit output files in
+                   input order after gathering ranks' results.
     dropped      : number of frames dropped. Only non-zero when the trailing
                    partial bucket has fewer than ``world_size`` frames total
                    (at most W-1 frames — unavoidable because every rank needs
@@ -151,13 +155,17 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
     B = batch_size
     W = world_size
 
-    sorted_frames = sorted(frames, key=lambda f: f["natoms"])
+    # Sort by natoms while carrying along each frame's original index so a
+    # rank can later recover which xyz row each of its local frames came from.
+    paired = sorted(enumerate(frames), key=lambda it: it[1]["natoms"])
+    sorted_idx   = [i for i, _ in paired]
+    sorted_frames = [f for _, f in paired]
 
     # ----- Single-GPU: one bucket per B-sized slice; trailing one may be partial.
     if W == 1:
         boundaries = [(b * B, min((b + 1) * B, n))
                       for b in range((n + B - 1) // B)]
-        return sorted_frames, boundaries, 0
+        return sorted_frames, boundaries, sorted_idx, 0
 
     # ----- DDP: pack full buckets of W*B frames, then split the leftover
     # evenly across ranks (possibly unequal by 1). Ranks all do the same
@@ -170,6 +178,7 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
         remaining = n - num_full * W * B
 
     local = []
+    local_idx = []
     boundaries = []
 
     for b in range(num_full):
@@ -177,6 +186,7 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
         rank_start = bucket_start + rank * B
         off = len(local)
         local.extend(sorted_frames[rank_start:rank_start + B])
+        local_idx.extend(sorted_idx[rank_start:rank_start + B])
         boundaries.append((off, off + B))
 
     dropped = 0
@@ -193,6 +203,7 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
         partial_start = num_full * W * B + skip
         off = len(local)
         local.extend(sorted_frames[partial_start:partial_start + n_rank])
+        local_idx.extend(sorted_idx[partial_start:partial_start + n_rank])
         boundaries.append((off, off + n_rank))
     elif remaining > 0:
         # Fewer than W frames left — can't give every rank at least one,
@@ -204,7 +215,7 @@ def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
             f"dataset too small for bucket batching with DDP: got {n} frames "
             f"and world_size={W}, need ≥ {W} frames so every rank has work.")
 
-    return local, boundaries, dropped
+    return local, boundaries, local_idx, dropped
 
 
 
@@ -702,7 +713,7 @@ def train_nep(
     _log(f"  {len(frames)} structures")
 
     # Sort by natoms + bucket for stable batch compute (see _sort_and_shard).
-    frames, boundaries, _dropped = _sort_and_shard(
+    frames, boundaries, _global_idx, _dropped = _sort_and_shard(
         frames, rank=0, world_size=1, batch_size=batch_size)
     num_buckets = len(boundaries)
     _log(f"  {num_buckets} buckets (sorted by natoms, batch_size={batch_size})")
@@ -830,7 +841,7 @@ def train_nep(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
-    best_state = None  # cached state_dict of the best-loss model so far
+    stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if restart and os.path.exists(ckpt_path) and finetune_from is None:
         start_epoch, best_loss = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
@@ -901,14 +912,25 @@ def train_nep(
             if in_stage2:
                 cur_pref_e, cur_pref_f, cur_pref_v = (
                     stage2_pref_e, stage2_pref_f, stage2_pref_v)
-                if epoch == start_stage2:
+                # Apply stage 2 lr + reset the first time we hit stage 2 in
+                # THIS run — covers both the natural transition and resuming
+                # from a stage-1 checkpoint whose start_epoch has already
+                # crossed into stage 2 (``epoch == start_stage2`` would miss
+                # the second case, leaving the optimizer on stage-1 lr).
+                if not stage2_lr_applied:
+                    stage2_lr_applied = True
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
-                    _log(f"Stage 2 started at epoch {epoch}: "
+                    tag = ("Stage 2 started" if epoch == start_stage2
+                           else f"Stage 2 resumed (from checkpoint)")
+                    _log(f"{tag} at epoch {epoch}: "
                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                          f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
                     _log(f"{'='*72}")
+                    # Stage 2 uses different loss weights — old best_loss is
+                    # on a different scale, so reset it whichever way we
+                    # entered.
                     best_loss = float("inf")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
@@ -1054,31 +1076,28 @@ def train_nep(
                     max_NN_rad, max_NN_ang)
                 torch.save(raw_model.state_dict(),
                            os.path.join(output_dir, "nep_best.pt"))
-                # Cache the best state for interim predicts (no file round-trip).
-                best_state = {k: v.detach().clone()
-                              for k, v in raw_model.state_dict().items()}
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
                 _save_checkpoint(ckpt_path, model, optimizer,
                                  lr_scheduler, epoch, best_loss)
 
-            # Interim predict on the current nep_best weights — overwrites the
-            # same output files, so users can refresh the parity plot live.
+            # Interim predict — overwrites the same output files, so users can
+            # refresh the parity plot live. Runs on the CURRENT-epoch weights
+            # (not nep_best) so the predict loss matches what was just logged
+            # for this epoch: it should fall between this epoch's and the next
+            # epoch's displayed loss (current weights = end-of-epoch, whereas
+            # the screen average covers weights that were still improving
+            # throughout the epoch).
             # Skip on the final epoch — the end-of-training predict (below)
             # immediately overwrites these files with the final-epoch result.
             if (prediction_interval > 0
                     and epoch % prediction_interval == 0
-                    and epoch != num_epochs
-                    and best_state is not None):
+                    and epoch != num_epochs):
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
-                current_state = {k: v.detach().clone()
-                                 for k, v in raw_model.state_dict().items()}
-                raw_model.load_state_dict(best_state)
                 predict_from_store(raw_model, data_store, output_dir,
                                    batch_size=batch_size, backend=backend,
                                    verbose=False)
-                raw_model.load_state_dict(current_state)
     finally:
         if loss_log is not None:
             loss_log.close()
