@@ -6,10 +6,12 @@ A PyTorch implementation of [NEP4](https://gpumd.org/theory/nep.html) (Neuroevol
 
 - **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
 - **Two compute backends auto-picked by element count** — `"loop"` (Python type-pair loop, best for few types) and `"bmm"` (fancy-index + `torch.bmm`, best for ≥8 types). Both pure PyTorch; works on CPU / CUDA / MPS. Set `backend="auto"` and the trainer picks the right one.
-- **Two-stage training** — Stage 1: force-focused with ReduceLROnPlateau; Stage 2: energy fine-tuning with Stochastic Weight Averaging
+- **Two-stage training** — Stage 1: force-focused; Stage 2: energy fine-tuning (optional Stochastic Weight Averaging). An `nep_stage1.pt` / `nep_stage1.txt` snapshot is written the instant Stage 2 kicks in, so you can restart from end-of-Stage-1 with different Stage-2 weights if the first choice was wrong.
+- **Two LR scheduler modes** — `plateau` (ReduceLROnPlateau — default, drops LR after N epochs with no improvement) or `step` (StepLR — drops LR every N epochs at a fixed rate). Stage 1 and Stage 2 share the mode.
+- **Channel weights can be zero** — setting `lambda_f` or `lambda_v` to 0 **skips the corresponding forward + backward entirely** (faster epoch, less memory). Stage 2 can turn a channel back on: per-epoch compute eligibility is re-evaluated from the active stage's weights, so Stage 1 `lambda_v=0` → Stage 2 `stage2_lambda_v>0` trains virial only in Stage 2.
 - **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`; each rank holds only `1/N` of the structures (single-node and multi-node SLURM launch snippets in the README)
 - **Fine-tuning** — load any `nep.txt` or `nep_best.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
-- **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`; resume with one flag
+- **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`; resume with one flag. Loss weights are stored in the checkpoint; if you edit them in `nep.in` between runs, `best_loss` is reset automatically so the new scale can establish a new best.
 - **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
 - **Batched prediction** — full-dataset prediction using pre-cached GPU basis, typically 10–50× faster than per-frame evaluation
 
@@ -260,10 +262,12 @@ All parameters can be set in `nep.in` or passed as keyword arguments to `train_n
 | `lambda_1` | `0.0` | L1 regularisation |
 | `lambda_2` | `0.0` | L2 regularisation (weight decay) |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
-| `scheduler_patience` | `50` | Epochs without improvement before LR reduction |
-| `scheduler_factor` | `0.8` | LR reduction factor |
+| `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode. |
+| `scheduler_patience` | `50` | `plateau` mode: epochs without improvement before LR reduction |
+| `scheduler_factor` | `0.8` | LR reduction factor — multiplied on each decay in both modes |
+| `step_size` | `100` | `step` mode: epochs between LR decays |
 
-Loss is plain MSE. Hyperparameters are **read from `nep.in` only** — no function-argument override.
+Loss is plain MSE. A loss weight of `0` (e.g. `lambda_v 0`) **skips** that channel's forward and backward entirely — no output accumulation, no autograd edges, no gradient contribution. Use this to speed up Stage 1 runs that only need E+F, or to leave virial compute off until Stage 2 turns it back on with `stage2_lambda_v`. Hyperparameters are **read from `nep.in` only** — no function-argument override.
 
 ### Stage 2 (energy fine-tuning, optional)
 
@@ -335,10 +339,12 @@ launch time:
 |------|----------|
 | `nep_best.txt`     | **Best-loss** model (GPUMD-compatible) — rewritten whenever `avg_loss < best_loss` |
 | `nep_best.pt`      | Same weights as PyTorch state_dict |
+| `nep_stage1.txt`   | **End-of-Stage-1** snapshot (only when `stage2=1`) — written the instant Stage 2 kicks in; lets you restart from there with different Stage-2 weights |
+| `nep_stage1.pt`    | Same Stage-1-end weights as PyTorch state_dict |
 | `nep_final.txt`    | Model at the **last** epoch (used for the end-of-training predict) |
 | `nep_average.txt`  | **SWA-averaged** model — only when `use_swa=True` |
 | `nep_average.pt`   | SWA weights as PyTorch state_dict |
-| `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch |
+| `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch + loss weights |
 | `output.log`       | Full training log |
 | `loss.out`         | Per-epoch loss / RMSE (for plotting) |
 | `energy_predict.out`, `force_predict.out`, `virial_predict.out` | Interim parity plot (every `prediction_interval` epochs, **nep_best weights**), replaced at end of training by final-epoch prediction |
@@ -362,20 +368,46 @@ Works correctly regardless of which stage was active when training stopped.
 
 ### What you can safely change on restart
 
+`nep.in` is re-parsed every run, so editing it between runs just works for
+value-only changes. Structural changes (architecture, shapes) are not safe.
+
 | Parameter | Safe to change? | Notes |
 |-----------|----------------|-------|
-| `num_epochs` | Yes | Extend training by increasing this |
-| `pref_e/f/v` | Yes | New loss weights take effect next epoch |
-| `batch_size` | Yes | — |
-| `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it |
-| `lr` | **No** | Overridden by saved optimizer state |
-| Architecture (neuron, cutoff, …) | **No** | Dimensions are fixed |
+| `epoch` | Yes | Extend training by increasing this |
+| `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. Changing any of them triggers an auto-reset of `best_loss` so the new scale can establish a new best (instead of staying gated by the old-scale number stored in `checkpoint.pt`). |
+| `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. Especially useful: restart from `nep_stage1.pt` with different Stage-2 weights by copying it to `nep_best.pt` (or passing it via `finetune_from`) and editing `nep.in`. |
+| `batch` | Yes | — |
+| `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
+| `stage2_lr` | Yes | Re-applied when Stage 2 resumes (overrides optimizer state) |
+| `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
+| `scheduler_patience` / `scheduler_factor` / `step_size` | Yes | Applied immediately |
+| `lr` (Stage 1) | **No** directly | Overridden by saved optimizer state — pass `reset_lr=<new>` to override |
+| Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
-To force a new learning rate after resuming (e.g. LR has decayed to `stop_lr`):
+To force a new Stage-1 learning rate after resuming (e.g. LR has decayed to `stop_lr`):
 
 ```python
 train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
 ```
+
+### Restarting from end-of-Stage-1
+
+When `stage2=1`, the trainer writes `nep_stage1.pt` + `nep_stage1.txt` the
+instant Stage 2 kicks in (before any Stage-2 optimizer step). If the Stage-2
+weights turn out wrong, you do not have to rerun Stage 1:
+
+```python
+# edit stage2_lambda_* in nep.in, then:
+train_nep(
+    "nep.in", "train.xyz",
+    output_dir="output_v2",
+    finetune_from="output/nep_stage1.pt",
+)
+```
+
+`finetune_from` re-runs Stage 1 from those weights; to skip Stage 1 entirely
+and jump straight into Stage 2 on the new weights, set `start_stage2=1` in
+`nep.in` (or any value ≤ the first epoch of the new run).
 
 ### Inspecting checkpoint files
 

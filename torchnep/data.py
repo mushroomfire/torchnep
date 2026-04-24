@@ -307,6 +307,15 @@ def parse_nep_in(filename: str) -> Dict:
                 params["scheduler_factor"] = float(parts[1])
             elif key == "stop_lr":
                 params["stop_lr"] = float(parts[1])
+            elif key == "lr_scheduler":
+                # "plateau" (default, ReduceLROnPlateau) or "step" (StepLR)
+                mode = parts[1].lower()
+                if mode not in ("plateau", "step"):
+                    raise ValueError(
+                        f"lr_scheduler must be 'plateau' or 'step', got {parts[1]!r}")
+                params["lr_scheduler"] = mode
+            elif key == "step_size":
+                params["step_size"] = int(parts[1])
             elif key == "max_grad_norm":
                 params["max_grad_norm"] = float(parts[1])
             elif key == "stage2":
@@ -340,6 +349,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("stop_lr", 1e-6)
     params.setdefault("scheduler_patience", 50)
     params.setdefault("scheduler_factor", 0.8)
+    params.setdefault("lr_scheduler", "plateau")
+    params.setdefault("step_size", 100)
     params.setdefault("max_grad_norm", 10.0)
     params.setdefault("lambda_e", 1.0)
     params.setdefault("lambda_f", 100.0)

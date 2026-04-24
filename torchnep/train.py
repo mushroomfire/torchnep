@@ -569,10 +569,42 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
 
 
 # ---------------------------------------------------------------------------
+# LR scheduler helpers
+# ---------------------------------------------------------------------------
+
+def _make_lr_scheduler(optimizer, mode, factor, patience, step_size, min_lr):
+    """Build the LR scheduler — "plateau" (default) or "step".
+
+    "plateau" → ReduceLROnPlateau(factor, patience, min_lr=min_lr).
+    "step"    → StepLR(step_size, gamma=factor); min_lr enforced manually
+                after each step() via _scheduler_step (StepLR has no min_lr).
+    """
+    if mode == "step":
+        return torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=factor)
+    # default: plateau
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=factor,
+        patience=patience, min_lr=min_lr)
+
+
+def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
+    """Advance the scheduler; for 'step' mode, clamp LR at min_lr manually."""
+    if mode == "step":
+        scheduler.step()
+        for pg in optimizer.param_groups:
+            if pg["lr"] < min_lr:
+                pg["lr"] = min_lr
+    else:
+        scheduler.step(avg_loss)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss):
+def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
+                     loss_weights=None):
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
     state = {
@@ -583,18 +615,33 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss):
     }
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
+    if loss_weights is not None:
+        state["loss_weights"] = loss_weights
     torch.save(state, path)
 
 
 def _load_checkpoint(path, model, optimizer, scheduler, device):
+    """Load checkpoint.
+
+    Returns (start_epoch, best_loss, saved_loss_weights). The third element is
+    the dict of loss weights active when the checkpoint was saved (or None for
+    pre-feature checkpoints). Callers compare against current nep.in weights to
+    decide whether to reset best_loss.
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
     m.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
     if scheduler is not None and "scheduler_state" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state"])
-    return ckpt["epoch"], ckpt["best_loss"]
+        # Scheduler class may have changed between runs (user switched
+        # lr_scheduler mode). Tolerate that by skipping the state load —
+        # scheduler just starts fresh this run.
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+        except (KeyError, ValueError, TypeError):
+            pass
+    return ckpt["epoch"], ckpt["best_loss"], ckpt.get("loss_weights")
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +741,8 @@ def train_nep(
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
     scheduler_factor   = config["scheduler_factor"]
+    lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
+    step_size          = config["step_size"]        # only used when mode=="step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
@@ -822,9 +871,9 @@ def train_nep(
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.75))
 
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=scheduler_factor,
-        patience=scheduler_patience, min_lr=stop_lr)
+    lr_scheduler = _make_lr_scheduler(
+        optimizer, lr_scheduler_mode, scheduler_factor,
+        scheduler_patience, step_size, stop_lr)
 
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
@@ -832,22 +881,37 @@ def train_nep(
     swa_model = None
     stage2_scheduler = None
     if stage2:
-        stage2_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=scheduler_factor,
-            patience=scheduler_patience, min_lr=stop_lr)
+        stage2_scheduler = _make_lr_scheduler(
+            optimizer, lr_scheduler_mode, scheduler_factor,
+            scheduler_patience, step_size, stop_lr)
         if use_swa:
             swa_model = AveragedModel(raw_model)
+
+    # Snapshot of current loss weights — saved in checkpoint so a restart can
+    # detect that the user edited nep.in and reset best_loss (otherwise the
+    # old-scale best_loss would keep the new run from ever saving a new best).
+    cur_loss_weights = {
+        "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
+        "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
+        "stage2_pref_v": stage2_pref_v,
+    }
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if restart and os.path.exists(ckpt_path) and finetune_from is None:
-        start_epoch, best_loss = _load_checkpoint(
+        start_epoch, best_loss, saved_loss_weights = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
         _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}")
+        if saved_loss_weights is not None and saved_loss_weights != cur_loss_weights:
+            _log("Loss weights changed since checkpoint was saved — "
+                 "resetting best_loss so the new scale can establish a new best.")
+            _log(f"  saved:   {saved_loss_weights}")
+            _log(f"  current: {cur_loss_weights}")
+            best_loss = float("inf")
 
     # Override LR after checkpoint load (useful when resuming with a new lr)
     if reset_lr is not None:
@@ -856,8 +920,9 @@ def train_nep(
         _log(f"LR reset to {reset_lr:.2e}")
 
     n_structs = data_store.n
-    has_forces = data_store.has_forces and pref_f > 0
-    has_virial = data_store.has_virial and pref_v > 0
+    # has_forces / has_virial are recomputed per-epoch inside the loop using
+    # the CURRENT stage's weights — so a stage-1 weight of 0 can still enable
+    # computation in stage 2 (and vice versa). Do NOT latch them here.
 
     loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
     loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
@@ -876,12 +941,17 @@ def train_nep(
          f"batch={batch_size}, dtype={precision}")
     _log(f"Backend: {backend_str} | forces: {force_str} | "
          f"{clip_str} | loss: MSE")
-    _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
-         f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    if lr_scheduler_mode == "step":
+        sched_desc = (f"StepLR(step_size={step_size}, gamma={scheduler_factor})"
+                      f", stop_lr={stop_lr}")
+    else:
+        sched_desc = (f"ReduceLROnPlateau(patience={scheduler_patience}, "
+                      f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    _log(f"LR: {lr}, {sched_desc}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
     if stage2:
         _log(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
-             f"lr={stage2_lr}, ReduceLROnPlateau, "
+             f"lr={stage2_lr}, {sched_desc}, "
              f"SWA={'ON' if use_swa else 'OFF'}")
         _log(f"Stage 2 weights: E={stage2_pref_e}  "
              f"F={stage2_pref_f}  V={stage2_pref_v}")
@@ -919,6 +989,20 @@ def train_nep(
                 # the second case, leaving the optimizer on stage-1 lr).
                 if not stage2_lr_applied:
                     stage2_lr_applied = True
+                    # Save an end-of-stage-1 snapshot BEFORE applying stage-2
+                    # weights/lr, so the user can restart from this point with
+                    # different stage-2 settings. Guard: only save if we
+                    # actually trained through stage 1 in this run; if we
+                    # resumed from a mid-stage-2 checkpoint, the current state
+                    # isn't stage-1 state and we mustn't overwrite.
+                    if start_epoch <= start_stage2:
+                        raw_model.save_nep_txt(
+                            os.path.join(output_dir, "nep_stage1.txt"),
+                            max_NN_rad, max_NN_ang)
+                        torch.save(raw_model.state_dict(),
+                                   os.path.join(output_dir, "nep_stage1.pt"))
+                        _log(f"\nSaved end-of-stage-1 snapshot: "
+                             f"nep_stage1.pt / nep_stage1.txt")
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
@@ -934,6 +1018,13 @@ def train_nep(
                     best_loss = float("inf")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
+
+            # Per-epoch compute eligibility: a weight of 0 means "don't compute
+            # this channel". This is recomputed every epoch so a stage-1 zero
+            # weight doesn't block stage-2 computation (see stage transition
+            # above) — and so pref_v=0 really skips virial compute/backward.
+            has_forces = data_store.has_forces and cur_pref_f > 0
+            has_virial = data_store.has_virial and cur_pref_v > 0
 
             for bi in bucket_perm:
                 start, end = boundaries[bi]
@@ -1046,9 +1137,11 @@ def train_nep(
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
-                stage2_scheduler.step(avg_loss)
+                _scheduler_step(stage2_scheduler, avg_loss,
+                                lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                lr_scheduler.step(avg_loss)
+                _scheduler_step(lr_scheduler, avg_loss,
+                                lr_scheduler_mode, optimizer, stop_lr)
 
             loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
                            f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f} "
@@ -1079,7 +1172,8 @@ def train_nep(
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
                 _save_checkpoint(ckpt_path, model, optimizer,
-                                 lr_scheduler, epoch, best_loss)
+                                 lr_scheduler, epoch, best_loss,
+                                 loss_weights=cur_loss_weights)
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights

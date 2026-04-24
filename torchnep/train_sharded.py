@@ -79,6 +79,7 @@ from .train import (
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _sort_and_shard,
+    _make_lr_scheduler, _scheduler_step,
 )
 
 
@@ -236,6 +237,8 @@ def train_nep_sharded(
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
     scheduler_factor   = config["scheduler_factor"]
+    lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
+    step_size          = config["step_size"]        # only used when mode=="step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
@@ -420,9 +423,9 @@ def train_nep_sharded(
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.75))
 
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=scheduler_factor,
-        patience=scheduler_patience, min_lr=stop_lr)
+    lr_scheduler = _make_lr_scheduler(
+        optimizer, lr_scheduler_mode, scheduler_factor,
+        scheduler_patience, step_size, stop_lr)
 
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
@@ -430,22 +433,37 @@ def train_nep_sharded(
     swa_model = None
     stage2_scheduler = None
     if stage2:
-        stage2_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=scheduler_factor,
-            patience=scheduler_patience, min_lr=stop_lr)
+        stage2_scheduler = _make_lr_scheduler(
+            optimizer, lr_scheduler_mode, scheduler_factor,
+            scheduler_patience, step_size, stop_lr)
         if use_swa and is_main:
             swa_model = AveragedModel(raw_model)
+
+    # Snapshot of current loss weights — saved in checkpoint so a restart can
+    # detect that the user edited nep.in and reset best_loss (otherwise the
+    # old-scale best_loss would keep the new run from ever saving a new best).
+    cur_loss_weights = {
+        "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
+        "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
+        "stage2_pref_v": stage2_pref_v,
+    }
 
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if restart and os.path.exists(ckpt_path) and finetune_from is None:
-        start_epoch, best_loss = _load_checkpoint(
+        start_epoch, best_loss, saved_loss_weights = _load_checkpoint(
             ckpt_path, model, optimizer, lr_scheduler, dev)
         start_epoch += 1
         _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}")
+        if saved_loss_weights is not None and saved_loss_weights != cur_loss_weights:
+            _log("Loss weights changed since checkpoint was saved — "
+                 "resetting best_loss so the new scale can establish a new best.")
+            _log(f"  saved:   {saved_loss_weights}")
+            _log(f"  current: {cur_loss_weights}")
+            best_loss = float("inf")
 
     if reset_lr is not None:
         for pg in optimizer.param_groups:
@@ -453,8 +471,9 @@ def train_nep_sharded(
         _log(f"LR reset to {reset_lr:.2e}")
 
     n_local = data_store.n
-    has_forces = global_has_forces and pref_f > 0
-    has_virial = global_has_virial and pref_v > 0
+    # has_forces / has_virial are recomputed per-epoch inside the loop using
+    # the CURRENT stage's weights — so a stage-1 weight of 0 can still enable
+    # computation in stage 2 (and vice versa). Do NOT latch them here.
 
     loss_log = None
     if is_main:
@@ -475,12 +494,17 @@ def train_nep_sharded(
          f"batch={batch_size}, dtype={precision}")
     _log(f"Backend: {backend_str} | forces: {force_str} | "
          f"{clip_str} | loss: MSE")
-    _log(f"LR: {lr}, ReduceLROnPlateau(patience={scheduler_patience}, "
-         f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    if lr_scheduler_mode == "step":
+        sched_desc = (f"StepLR(step_size={step_size}, gamma={scheduler_factor})"
+                      f", stop_lr={stop_lr}")
+    else:
+        sched_desc = (f"ReduceLROnPlateau(patience={scheduler_patience}, "
+                      f"factor={scheduler_factor}), stop_lr={stop_lr}")
+    _log(f"LR: {lr}, {sched_desc}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
     if stage2:
         _log(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
-             f"lr={stage2_lr}, ReduceLROnPlateau, "
+             f"lr={stage2_lr}, {sched_desc}, "
              f"SWA={'ON' if use_swa else 'OFF'}")
         _log(f"Stage 2 weights: E={stage2_pref_e}  "
              f"F={stage2_pref_f}  V={stage2_pref_v}")
@@ -516,6 +540,18 @@ def train_nep_sharded(
                 # the second case, leaving the optimizer on stage-1 lr).
                 if not stage2_lr_applied:
                     stage2_lr_applied = True
+                    # Save an end-of-stage-1 snapshot BEFORE applying stage-2
+                    # weights/lr, so the user can restart from this point with
+                    # different stage-2 settings. Rank 0 writes — ranks already
+                    # agree on the model state (DDP all-reduce after each step).
+                    if is_main and start_epoch <= start_stage2:
+                        raw_model.save_nep_txt(
+                            os.path.join(output_dir, "nep_stage1.txt"),
+                            max_NN_rad, max_NN_ang)
+                        torch.save(raw_model.state_dict(),
+                                   os.path.join(output_dir, "nep_stage1.pt"))
+                        _log(f"\nSaved end-of-stage-1 snapshot: "
+                             f"nep_stage1.pt / nep_stage1.txt")
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
@@ -531,6 +567,13 @@ def train_nep_sharded(
                     best_loss = float("inf")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
+
+            # Per-epoch compute eligibility: a weight of 0 means "don't compute
+            # this channel". Recomputed every epoch so a stage-1 zero weight
+            # doesn't block stage-2 computation — and so pref_v=0 really skips
+            # virial compute/backward.
+            has_forces = global_has_forces and cur_pref_f > 0
+            has_virial = global_has_virial and cur_pref_v > 0
 
             for bi in bucket_perm:
                 start, end = boundaries[bi]
@@ -667,9 +710,11 @@ def train_nep_sharded(
             dt = time.time() - t_epoch
 
             if in_stage2 and stage2_scheduler is not None:
-                stage2_scheduler.step(avg_loss)
+                _scheduler_step(stage2_scheduler, avg_loss,
+                                lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                lr_scheduler.step(avg_loss)
+                _scheduler_step(lr_scheduler, avg_loss,
+                                lr_scheduler_mode, optimizer, stop_lr)
 
             if is_main:
                 loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
@@ -701,7 +746,8 @@ def train_nep_sharded(
 
                 if epoch % checkpoint_interval == 0 or epoch == num_epochs:
                     _save_checkpoint(ckpt_path, model, optimizer,
-                                     lr_scheduler, epoch, best_loss)
+                                     lr_scheduler, epoch, best_loss,
+                                     loss_weights=cur_loss_weights)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:
