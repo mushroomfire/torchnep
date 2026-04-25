@@ -973,16 +973,10 @@ def train_nep(
             g.manual_seed(epoch)
             bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
-            # Loss / gnorm accumulators stay on GPU; .item() once at epoch end
-            # to avoid per-step GPU↔CPU sync (a major source of GPU-util sawtooth).
-            sum_le = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_lf = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_lv = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_ls = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_e_structs = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_f_atoms = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_v_structs = torch.zeros((), dtype=torch.float64, device=dev)
-            max_gn_t = torch.zeros((), dtype=torch.float64, device=dev)
+            sum_le = sum_lf = sum_lv = 0.0
+            sum_ls = 0.0                     # (eV/Å³)² accumulator for stress
+            sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            max_gn = 0.0
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1057,24 +1051,20 @@ def train_nep(
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
                 # sum_l* accumulates per-batch MSE so the rmse_* columns in
                 # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
-                # Accumulators stay GPU-side (no .item() in the hot loop).
-                # sum_le/lf/lv/ls accumulate ``mean_sq * count`` so the per-
-                # sample MSE recovered as sum / total_count is identical to
-                # before — just deferred-sync.
                 if e_mask.any():
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    loss_e = (diff_e ** 2).mean()
+                    loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
                     loss = loss + cur_pref_e * loss_e
-                    sum_le += loss_e.detach().to(torch.float64) * e_mask.sum().to(torch.float64)
+                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
 
                 if has_forces:
                     f_mask = batch["force_mask"]
                     if f_mask.any():
                         f_pred = result["forces"][f_mask]
                         f_ref = batch["forces"][f_mask]
-                        loss_f = ((f_pred - f_ref) ** 2).mean()
+                        loss_f = _loss_fn(f_pred, f_ref)
                         loss = loss + cur_pref_f * loss_f
-                        sum_lf += loss_f.detach().to(torch.float64) * f_mask.sum().to(torch.float64)
+                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
 
                 if has_virial and "virial" in result:
                     v_mask = batch["virial_mask"]
@@ -1089,16 +1079,16 @@ def train_nep(
                             na = batch["natoms"][v_mask].unsqueeze(-1)
                             v_pred_pa = v_sys[v_mask] / na
                             v_ref_pa = v_ref[v_mask] / na
-                            v_diff = v_pred_pa - v_ref_pa
-                            loss_v = (v_diff ** 2).mean()
+                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
-                            sum_lv += loss_v.detach().to(torch.float64) * v_mask.sum().to(torch.float64)
+                            v_diff = v_pred_pa - v_ref_pa
+                            sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
                             # Stress RMSE (eV/Å³): convert the same diff using
                             # per-frame (natoms/volume). Sign cancels under MSE.
                             scale = (batch["natoms"][v_mask]
                                      / batch["volumes"][v_mask]).unsqueeze(-1)
                             s_diff = v_diff * scale
-                            sum_ls += (s_diff ** 2).mean().detach().to(torch.float64) * v_mask.sum().to(torch.float64)
+                            sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -1107,16 +1097,13 @@ def train_nep(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # gn stays as a tensor — only `.item()` it when we need to
-                # branch on isfinite (one sync per step instead of two).
                 if max_grad_norm > 0:
-                    gn_t = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm)
+                    gn = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm).item()
                 else:
-                    gn_t = torch.sqrt(sum(
+                    gn = torch.sqrt(sum(
                         p.grad.norm()**2 for p in raw_model.parameters()
-                        if p.grad is not None))
-                gn = gn_t.item()
+                        if p.grad is not None)).item()
 
                 if not np.isfinite(gn):
                     optimizer.zero_grad(set_to_none=True)
@@ -1127,29 +1114,19 @@ def train_nep(
                 if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().to(torch.float64)
-                sum_f_atoms += batch["force_mask"].sum().to(torch.float64)
-                sum_v_structs += batch["virial_mask"].sum().to(torch.float64)
-                if gn_t.dtype != torch.float64:
-                    gn_t = gn_t.to(torch.float64)
-                max_gn_t = torch.maximum(max_gn_t, gn_t.detach())
+                sum_e_structs += batch["energy_mask"].sum().item()
+                sum_f_atoms += batch["force_mask"].sum().item()
+                sum_v_structs += batch["virial_mask"].sum().item()
+                max_gn = max(max_gn, gn)
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
             # where each MSE_X aggregates over all samples in the epoch.
             from .constants import EV_PER_A3_TO_GPa
-            # Single sync at epoch end: pull all GPU accumulators to host
-            # in one go (one `.tolist()`) instead of 4–6 .item() per step.
-            _vals = torch.stack([
-                sum_le, sum_lf, sum_lv, sum_ls,
-                sum_e_structs, sum_f_atoms, sum_v_structs, max_gn_t,
-            ]).tolist()
-            (sum_le, sum_lf, sum_lv, sum_ls,
-             sum_e_structs, sum_f_atoms, sum_v_structs, max_gn) = _vals
-            mse_e = sum_le / max(sum_e_structs, 1.0)
-            mse_f = sum_lf / max(sum_f_atoms, 1.0) if sum_lf > 0 else 0.0
-            mse_v = sum_lv / max(sum_v_structs, 1.0) if sum_lv > 0 else 0.0
-            mse_s = sum_ls / max(sum_v_structs, 1.0) if sum_ls > 0 else 0.0
+            mse_e = sum_le / max(sum_e_structs, 1)
+            mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
+            mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
+            mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
                         + cur_pref_v * mse_v)
             # Output units: eV/atom (E, V), eV/Å (F), GPa (stress).

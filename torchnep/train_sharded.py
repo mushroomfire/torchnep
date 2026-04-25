@@ -397,33 +397,6 @@ def train_nep_sharded(
         torch.cuda.synchronize()
     _log(f"  Done in {time.time() - t_qs:.1f}s")
 
-    # Pre-compute per-bucket global counts (n_e, n_f, n_v) once.
-    #
-    # Bucket membership is fixed across the entire run (only bucket ORDER is
-    # shuffled per epoch), and has_{energy,forces,virial}_flag are static
-    # data-loading attributes — so the per-bucket global counts are constants.
-    # The original code recomputed them every step via 6 GPU↔CPU `.item()`
-    # syncs + a `dist.all_reduce`, which was the dominant source of GPU-util
-    # sawtoothing in DDP runs. Folding them into a one-shot all_reduce here
-    # collapses N_steps × (6 .item() + 1 collective) into a single collective
-    # for the entire training run.
-    bucket_counts = torch.zeros((3, num_buckets), dtype=torch.float64, device=dev)
-    for bi, (bstart, bend) in enumerate(boundaries):
-        n_e = sum(1 for i in range(bstart, bend)
-                  if data_store.has_energy_flag[i])
-        n_f = sum(data_store.natoms[i] for i in range(bstart, bend)
-                  if data_store.has_forces_flag[i])
-        n_v = sum(1 for i in range(bstart, bend)
-                  if data_store.has_virial_flag[i])
-        bucket_counts[0, bi] = n_e
-        bucket_counts[1, bi] = n_f
-        bucket_counts[2, bi] = n_v
-    dist.all_reduce(bucket_counts)
-    _bn_e = [max(c, 1.0) for c in bucket_counts[0].tolist()]
-    _bn_f = [max(c, 1.0) for c in bucket_counts[1].tolist()]
-    _bn_v = [max(c, 1.0) for c in bucket_counts[2].tolist()]
-    del bucket_counts
-
     if use_compile and hasattr(torch, "compile"):
         _log("Compiling model with torch.compile...")
         model = torch.compile(model)
@@ -552,16 +525,9 @@ def train_nep_sharded(
             g.manual_seed(epoch)
             bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
 
-            # Loss / count / gnorm accumulators stay on GPU; one host-sync
-            # at epoch end (via stack→tolist) instead of 4–6 .item() per step.
-            sum_le = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_lf = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_lv = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_ls = torch.zeros((), dtype=torch.float64, device=dev)  # (eV/Å³)²
-            sum_e_structs = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_f_atoms = torch.zeros((), dtype=torch.float64, device=dev)
-            sum_v_structs = torch.zeros((), dtype=torch.float64, device=dev)
-            max_gn_t = torch.zeros((), dtype=torch.float64, device=dev)
+            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/Å³)²
+            sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            max_gn = 0.0
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -633,16 +599,18 @@ def train_nep_sharded(
                 # equal — which is NOT the case here because frames have
                 # different atom counts).
                 # Fix: each rank computes SUM-of-squared-errors, and we divide
-                # by the GLOBAL count. ``_bn_{e,f,v}[bi]`` are precomputed at
-                # startup (one collective for the entire run) — replacing the
-                # per-step all_reduce + 6 ``.item()`` syncs that used to be
-                # the dominant GPU-util sawtooth source.
-                # The × world_size factor still cancels DDP's /world_size
-                # averaging — giving a true global-mean loss regardless of
-                # how atoms are sharded.
-                n_e_g = _bn_e[bi]
-                n_f_g = _bn_f[bi]
-                n_v_g = _bn_v[bi]
+                # by the GLOBAL count (all-reduced per batch). The × world_size
+                # factor cancels DDP's /world_size averaging — giving a true
+                # global-mean loss regardless of how atoms are sharded.
+                counts = torch.tensor([
+                    float(e_mask.sum().item()),
+                    float(f_mask.sum().item()) if f_mask is not None else 0.0,
+                    float(v_mask.sum().item()) if v_mask is not None else 0.0,
+                ], device=dev, dtype=torch.float64)
+                dist.all_reduce(counts)
+                n_e_g = max(counts[0].item(), 1.0)
+                n_f_g = max(counts[1].item(), 1.0)
+                n_v_g = max(counts[2].item(), 1.0)
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
@@ -651,7 +619,7 @@ def train_nep_sharded(
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     sum_sq_e = (diff_e ** 2).sum()
                     loss = loss + cur_pref_e * sum_sq_e * ws / n_e_g
-                    sum_le += sum_sq_e.detach().to(torch.float64)
+                    sum_le += sum_sq_e.item()  # global sum-of-squared-errors
 
                 if f_mask is not None and f_mask.any():
                     f_pred = result["forces"][f_mask]
@@ -659,7 +627,7 @@ def train_nep_sharded(
                     sum_sq_f = ((f_pred - f_ref) ** 2).sum()
                     # 3 components per atom → divide by (3 × n_f_g)
                     loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
-                    sum_lf += sum_sq_f.detach().to(torch.float64) / 3.0
+                    sum_lf += (sum_sq_f.item() / 3.0)
 
                 if v_mask is not None and v_mask.any() and "virial" in result:
                     v_atom = result["virial"]
@@ -676,12 +644,12 @@ def train_nep_sharded(
                         sum_sq_v = (v_diff ** 2).sum()
                         # 9 components per frame → divide by (9 × n_v_g)
                         loss = loss + cur_pref_v * sum_sq_v * ws / (9.0 * n_v_g)
-                        sum_lv += sum_sq_v.detach().to(torch.float64) / 9.0
+                        sum_lv += (sum_sq_v.item() / 9.0)
                         # Stress (eV/Å³) = -virial_total / V. Sign cancels in MSE.
                         scale = (batch["natoms"][v_mask]
                                  / batch["volumes"][v_mask]).unsqueeze(-1)
                         sum_sq_s = ((v_diff * scale) ** 2).sum()
-                        sum_ls += sum_sq_s.detach().to(torch.float64) / 9.0
+                        sum_ls += (sum_sq_s.item() / 9.0)
 
                 if lambda_1 > 0:
                     l1 = sum(p.abs().sum() for p in model.parameters())
@@ -691,15 +659,12 @@ def train_nep_sharded(
                 loss.backward()
 
                 if max_grad_norm > 0:
-                    gn_t = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm)
+                    gn = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm).item()
                 else:
-                    gn_t = torch.sqrt(sum(
+                    gn = torch.sqrt(sum(
                         p.grad.norm() ** 2 for p in raw_model.parameters()
-                        if p.grad is not None))
-                # One sync per step here — unavoidable: the isfinite branch
-                # needs a Python boolean to decide whether to skip the step.
-                gn = gn_t.item()
+                        if p.grad is not None)).item()
 
                 if not np.isfinite(gn):
                     optimizer.zero_grad(set_to_none=True)
@@ -710,23 +675,23 @@ def train_nep_sharded(
                 if in_stage2 and swa_model is not None and is_main:
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().to(torch.float64)
-                sum_f_atoms += batch["force_mask"].sum().to(torch.float64)
-                sum_v_structs += batch["virial_mask"].sum().to(torch.float64)
-                max_gn_t = torch.maximum(max_gn_t,
-                                          gn_t.detach().to(torch.float64))
+                sum_e_structs += batch["energy_mask"].sum().item()
+                sum_f_atoms += batch["force_mask"].sum().item()
+                sum_v_structs += batch["virial_mask"].sum().item()
+                max_gn = max(max_gn, gn)
 
-            # Aggregate metrics across all ranks — one collective per epoch
-            # (the per-step all_reduce was eliminated by the precomputed
-            # ``_bn_{e,f,v}`` arrays above).
-            metrics = torch.stack([sum_le, sum_lf, sum_lv, sum_ls,
-                                    sum_e_structs, sum_f_atoms,
-                                    sum_v_structs])
+            # Aggregate metrics across all ranks
+            metrics = torch.tensor(
+                [sum_le, sum_lf, sum_lv, sum_ls,
+                 float(sum_e_structs), float(sum_f_atoms),
+                 float(sum_v_structs)],
+                device=dev)
             dist.all_reduce(metrics)
-            dist.all_reduce(max_gn_t, op=dist.ReduceOp.MAX)
+            gn_t = torch.tensor(max_gn, device=dev)
+            dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
             (sum_le, sum_lf, sum_lv, sum_ls,
              sum_e_structs, sum_f_atoms, sum_v_structs) = metrics.tolist()
-            max_gn = max_gn_t.item()
+            max_gn = gn_t.item()
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
