@@ -713,7 +713,9 @@ def train_nep(
                          "a" if restart else "w")
 
     def _log(msg=""):
-        print(msg)
+        # flush=True so sbatch / piped stdout doesn't block-buffer log lines
+        # (default block buffering hides progress between long-running steps)
+        print(msg, flush=True)
         _out_log_file.write(msg + "\n")
         _out_log_file.flush()
 

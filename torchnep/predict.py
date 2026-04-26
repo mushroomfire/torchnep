@@ -188,7 +188,7 @@ def predict_dataset(
 
     def _log(msg):
         if verbose:
-            print(msg)
+            print(msg, flush=True)
 
     t_total = time.time()
     calc = NEPCalculator(model_file, dtype=dt, device=device)
@@ -449,7 +449,7 @@ def predict_from_store(model, data_store, output_dir: str,
     """
     def _log(msg):
         if verbose:
-            print(msg)
+            print(msg, flush=True)
 
     dev   = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -678,7 +678,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
 
     def _log(msg):
         if verbose and is_main:
-            print(msg)
+            print(msg, flush=True)
 
     t_compute = time.time()
     local = _compute_local_predictions(model, data_store, batch_size, backend)

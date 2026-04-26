@@ -209,7 +209,9 @@ def train_nep_sharded(
     def _log(msg=""):
         if not is_main:
             return
-        print(msg)
+        # flush=True so sbatch / piped stdout doesn't block-buffer log lines
+        # (default block buffering hides progress between long-running steps)
+        print(msg, flush=True)
         _out_log_file.write(msg + "\n")
         _out_log_file.flush()
 
