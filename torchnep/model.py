@@ -439,9 +439,25 @@ class NEPModel(nn.Module):
         q_scaler = vals[idx:idx + dim]
         self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
 
-    def save_nep_txt(self, path: str, max_NN_radial: int = 0,
-                     max_NN_angular: int = 0):
-        """Save model to GPUMD nep4 nep.txt format."""
+    def save_nep_txt(self, path: str, max_NN_radial: int,
+                     max_NN_angular: int):
+        """Save model to GPUMD nep4 nep.txt format.
+
+        ``max_NN_radial`` / ``max_NN_angular`` are mandatory: GPUMD's nep.txt
+        parser requires the cutoff line to always carry 4 numbers
+        ``cutoff <rc_R> <rc_A> <max_NN_R> <max_NN_A>``. Both must be > 0.
+        Compute them from the training set via
+        :func:`torchnep.train.compute_max_neighbors`.
+        """
+        if max_NN_radial <= 0 or max_NN_angular <= 0:
+            raise ValueError(
+                "save_nep_txt requires max_NN_radial > 0 and "
+                "max_NN_angular > 0 (GPUMD's nep.txt format mandates the "
+                f"cutoff line to carry both); got "
+                f"max_NN_radial={max_NN_radial}, "
+                f"max_NN_angular={max_NN_angular}. "
+                "Use torchnep.train.compute_max_neighbors(structures) to "
+                "obtain them.")
         lines = []
         zbl_suffix = "_zbl" if self.zbl is not None else ""
         lines.append(f"nep4{zbl_suffix} {self.num_types} "
@@ -456,13 +472,14 @@ class NEPModel(nn.Module):
             else:
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out}")
 
-        # Format cutoff: integer if whole number (matches GPUMD style)
+        # Format cutoff: integer if whole number (matches GPUMD style).
+        # Always emit 4 fields — GPUMD's nep.txt parser requires both
+        # max_NN_radial and max_NN_angular on the cutoff line.
         def _fmt(v):
             return str(int(v)) if v == int(v) else str(v)
-        rc_str = f"cutoff {_fmt(self.rc_radial)} {_fmt(self.rc_angular)}"
-        if max_NN_radial > 0:
-            rc_str += f" {max_NN_radial} {max_NN_angular}"
-        lines.append(rc_str)
+        lines.append(
+            f"cutoff {_fmt(self.rc_radial)} {_fmt(self.rc_angular)} "
+            f"{max_NN_radial} {max_NN_angular}")
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")

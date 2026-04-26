@@ -486,7 +486,10 @@ model = NEPModel(config)
 model.load_weights_from_nep_txt("nep.txt")
 
 slimmed = slim_model(model, ["Cr", "Ni"])
-slimmed.save_nep_txt("nep_slim.txt")
+# max_NN_radial / max_NN_angular are required (GPUMD's nep.txt format
+# mandates both on the cutoff line). Read them from the source nep.txt's
+# cutoff line — slimming element types doesn't change neighbor counts.
+slimmed.save_nep_txt("nep_slim.txt", max_NN_radial=127, max_NN_angular=42)
 ```
 
 ---
