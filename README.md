@@ -552,7 +552,7 @@ Measured one-epoch training wall-time on RTX A2000, float32 (single-GPU, see `pr
 | Si (2474f, BS=64) | 1 | **~2 s** | ~13 s | loop |
 | AlO (2190f, BS=64) | 2 | **2.1 s** | 16.2 s | loop |
 | CrCoNi (3030f, BS=64) | 3 | **2.2 s** | 11.1 s | loop |
-| NEP89 (3000f, BS=100) | 53 | 26 s | **2.2 s** | bmm |
+| NEP53 (3000f, BS=100) | 53 | 26 s | **2.2 s** | bmm |
 
 Orthogonal force toggle: `use_autograd_forces=True` switches to autograd-through-rij forces (slower, used only as a gold standard in tests — the analytical path matches it to float precision).
 
