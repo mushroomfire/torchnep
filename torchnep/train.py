@@ -105,118 +105,6 @@ def _default_device() -> str:
     return "cpu"
 
 
-# ---------------------------------------------------------------------------
-# Bucket batching
-#
-# Frames are sorted by natoms, then cut into buckets of ``world_size × batch_size``
-# contiguous frames. Each rank's share from each bucket is a ``batch_size``-long
-# slice. Per-epoch, the BUCKET ORDER is shuffled (same seed on every rank), so
-# within any DDP iteration all ranks process frames from the same natoms
-# quantile of the dataset → per-batch atom counts are matched across ranks,
-# eliminating straggler waste.
-#
-# For single-GPU (world_size == 1) we still sort + bucket; the last bucket
-# may be partial. This gives a slight stability gain (within-batch natoms
-# variance is small) at zero compute cost.
-# ---------------------------------------------------------------------------
-
-def _sort_and_shard(frames: List[Dict], rank: int, world_size: int,
-                     batch_size: int):
-    """Sort frames by natoms and return this rank's local slice + bucket layout.
-
-    Parameters
-    ----------
-    frames       : list of frame dicts (as returned by read_xyz).
-    rank         : int in [0, world_size).
-    world_size   : int  ≥ 1.
-    batch_size   : int  per-rank batch size.
-
-    Returns
-    -------
-    local_frames : list of frames this rank should preprocess / store.
-    boundaries   : list of (start, end) tuples into ``local_frames``. One entry
-                   per bucket (== one per DDP iteration per epoch). All ranks
-                   agree on ``len(boundaries)``; for the last partial bucket
-                   different ranks may get slightly different batch sizes, but
-                   every rank still does the same number of iterations, which
-                   is all DDP requires. The loss normalisation already uses
-                   global sample counts, so unequal rank batch sizes are
-                   accounted for.
-    global_idx   : list[int] — for each entry of ``local_frames``, the index
-                   it held in the input ``frames`` list (i.e. its xyz-file
-                   row). Needed by sharded prediction to emit output files in
-                   input order after gathering ranks' results.
-    dropped      : number of frames dropped. Only non-zero when the trailing
-                   partial bucket has fewer than ``world_size`` frames total
-                   (at most W-1 frames — unavoidable because every rank needs
-                   at least one frame per iteration).
-    """
-    n = len(frames)
-    B = batch_size
-    W = world_size
-
-    # Sort by natoms while carrying along each frame's original index so a
-    # rank can later recover which xyz row each of its local frames came from.
-    paired = sorted(enumerate(frames), key=lambda it: it[1]["natoms"])
-    sorted_idx   = [i for i, _ in paired]
-    sorted_frames = [f for _, f in paired]
-
-    # ----- Single-GPU: one bucket per B-sized slice; trailing one may be partial.
-    if W == 1:
-        boundaries = [(b * B, min((b + 1) * B, n))
-                      for b in range((n + B - 1) // B)]
-        return sorted_frames, boundaries, sorted_idx, 0
-
-    # ----- DDP: pack full buckets of W*B frames, then split the leftover
-    # evenly across ranks (possibly unequal by 1). Ranks all do the same
-    # number of iterations; only the last iteration's batch size may differ.
-    num_full = n // (W * B)
-    if num_full == 0:
-        # No full bucket even once → dataset < W*B. Very rare.
-        remaining = n
-    else:
-        remaining = n - num_full * W * B
-
-    local = []
-    local_idx = []
-    boundaries = []
-
-    for b in range(num_full):
-        bucket_start = b * W * B
-        rank_start = bucket_start + rank * B
-        off = len(local)
-        local.extend(sorted_frames[rank_start:rank_start + B])
-        local_idx.extend(sorted_idx[rank_start:rank_start + B])
-        boundaries.append((off, off + B))
-
-    dropped = 0
-    if remaining >= W:
-        # Split ``remaining`` frames: first (remaining % W) ranks get one
-        # extra frame so no frame is wasted.
-        base = remaining // W
-        extras = remaining % W
-        n_rank = base + (1 if rank < extras else 0)
-        if rank < extras:
-            skip = rank * (base + 1)
-        else:
-            skip = extras * (base + 1) + (rank - extras) * base
-        partial_start = num_full * W * B + skip
-        off = len(local)
-        local.extend(sorted_frames[partial_start:partial_start + n_rank])
-        local_idx.extend(sorted_idx[partial_start:partial_start + n_rank])
-        boundaries.append((off, off + n_rank))
-    elif remaining > 0:
-        # Fewer than W frames left — can't give every rank at least one,
-        # so these are unavoidably lost. At most W-1 frames.
-        dropped = remaining
-
-    if not boundaries:
-        raise RuntimeError(
-            f"dataset too small for bucket batching with DDP: got {n} frames "
-            f"and world_size={W}, need ≥ {W} frames so every rank has work.")
-
-    return local, boundaries, local_idx, dropped
-
 
 
 # ---------------------------------------------------------------------------
@@ -763,11 +651,13 @@ def train_nep(
     frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  {len(frames)} structures")
 
-    # Sort by natoms + bucket for stable batch compute (see _sort_and_shard).
-    frames, boundaries, _global_idx, _dropped = _sort_and_shard(
-        frames, rank=0, world_size=1, batch_size=batch_size)
-    num_buckets = len(boundaries)
-    _log(f"  {num_buckets} buckets (sorted by natoms, batch_size={batch_size})")
+    # Single-GPU: per-epoch shuffle is done at iteration time via
+    # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
+    # — natoms-homogeneous minibatches are biased gradient estimates and
+    # converge significantly worse than i.i.d. shuffled minibatches (and
+    # torch.compile dislikes the wider spread of input shapes that sorting
+    # produces).
+    n_structs = len(frames)
 
     # slim_types: detect which element types actually appear in the data and
     # narrow config before building neighbor lists / GPUDataStore / model.
@@ -966,14 +856,12 @@ def train_nep(
             t_epoch = time.time()
             model.train()
 
-            # Bucket batching: frames in data_store are sorted by natoms;
-            # a "bucket" is a contiguous slice of ``batch_size`` frames and
-            # corresponds to one DDP iteration. Shuffling only the bucket
-            # ORDER keeps batches natoms-homogeneous while randomising the
-            # per-epoch iteration sequence.
+            # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
+            # epoch so reruns are reproducible and resumed runs continue
+            # along the same stream.
             g = torch.Generator()
             g.manual_seed(epoch)
-            bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
+            perm = torch.randperm(n_structs, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = 0.0
             sum_ls = 0.0                     # (eV/Å³)² accumulator for stress
@@ -1028,9 +916,8 @@ def train_nep(
             has_forces = data_store.has_forces and cur_pref_f > 0
             has_virial = data_store.has_virial and cur_pref_v > 0
 
-            for bi in bucket_perm:
-                start, end = boundaries[bi]
-                idx = list(range(start, end))
+            for start in range(0, n_structs, batch_size):
+                idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
 
                 if use_autograd_forces:

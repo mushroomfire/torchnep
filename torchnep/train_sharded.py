@@ -78,7 +78,6 @@ from .train import (
     GPUDataStore,
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
-    _sort_and_shard,
     _make_lr_scheduler, _scheduler_step,
 )
 
@@ -274,24 +273,31 @@ def train_nep_sharded(
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
-    # Bucket sharding: sort globally by natoms, assign rank r the r-th
-    # batch_size-block inside every full bucket, then split any remaining
-    # frames as evenly as possible across ranks (the last iteration of the
-    # epoch may have a rank-dependent batch size; all ranks still do the
-    # same number of iterations, which is all DDP requires). Iteration i
-    # on every rank draws from the same natoms quantile, so per-batch
-    # compute is matched across ranks.
-    local_frames, boundaries, local_global_idx, dropped = _sort_and_shard(
-        frames, rank=rank, world_size=world_size,
-        batch_size=config["batch_size"])
-    n_local = len(local_frames)
-    num_buckets = len(boundaries)
-    drop_note = (f", {dropped} frames dropped (remainder < world_size)"
-                 if dropped else "")
+    # Random sharding: shuffle globally with a fixed seed (identical on
+    # every rank → all ranks agree on the partition), then give rank r the
+    # r-th equal slice. To keep step counts identical across ranks (DDP
+    # collectives require lock-step iteration) AND keep every frame in the
+    # training/predict set, we pad the perm with duplicates from the head
+    # until it divides evenly. At most W-1 frames are seen twice in an
+    # epoch — global counts in the loss normalisation already account for
+    # this (the duplicated frames contribute their squared error twice in
+    # both numerator and denominator), and the predict scatter writes
+    # identical values into the duplicated slots, so output is loss-fair
+    # and complete.
+    shuffle_g = torch.Generator()
+    shuffle_g.manual_seed(0)
+    global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+    n_local = (n_total + world_size - 1) // world_size  # ceil
+    pad = n_local * world_size - n_total
+    if pad:
+        global_perm = global_perm + global_perm[:pad]
+    local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+    local_frames = [frames[i] for i in local_global_idx]
+    pad_note = (f", {pad} frame(s) duplicated for even split"
+                if pad else "")
     _log(f"  {n_total} structures total → "
-         f"rank {rank} gets {n_local} (bucket-sharded across {world_size} ranks, "
-         f"{num_buckets} buckets × batch_size={config['batch_size']}"
-         f"{drop_note})")
+         f"rank {rank} gets {n_local} (random shard across {world_size} ranks, "
+         f"batch_size={config['batch_size']}{pad_note})")
 
     _log("Building neighbor lists (local shard)...")
     t0 = time.time()
@@ -519,13 +525,14 @@ def train_nep_sharded(
             t_epoch = time.time()
             model.train()
 
-            # Bucket-order shuffle: same seed on every rank → identical
-            # bucket_perm across ranks. Each rank processes its own slice of
-            # each bucket, so iteration i on every rank draws from the same
-            # natoms quantile — per-batch compute stays balanced.
+            # Per-epoch local frame shuffle. Each rank independently
+            # permutes its own n_local frames (different seeds across ranks
+            # so each rank sees a fresh order). Step count = ceil(n_local /
+            # batch_size) is identical across ranks because n_local is —
+            # so DDP collectives stay in lock-step.
             g = torch.Generator()
-            g.manual_seed(epoch)
-            bucket_perm = torch.randperm(num_buckets, generator=g).tolist()
+            g.manual_seed(epoch * world_size + rank)
+            perm = torch.randperm(n_local, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/Å³)²
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
@@ -577,9 +584,8 @@ def train_nep_sharded(
             has_forces = global_has_forces and cur_pref_f > 0
             has_virial = global_has_virial and cur_pref_v > 0
 
-            for bi in bucket_perm:
-                start, end = boundaries[bi]
-                idx = list(range(start, end))
+            for start in range(0, n_local, batch_size):
+                idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the

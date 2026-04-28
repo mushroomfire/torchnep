@@ -668,7 +668,8 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     model : NEPModel  (DDP replica — parameters are in sync across ranks).
     data_store : GPUDataStore  (this rank's local shard).
     local_global_idx : list[int]  original xyz-frame index for each local
-        frame (length == ``data_store.n``). Supplied by ``_sort_and_shard``.
+        frame (length == ``data_store.n``). Supplied by the random shard
+        assignment in ``train_nep_sharded``.
     n_total_frames : int  total frames across all ranks (pre-drop).
     """
     import torch.distributed as dist
@@ -701,8 +702,10 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
         return
 
     # Allocate global arrays and scatter each rank's contribution into the
-    # slots given by its global_idx. Dropped frames (last-bucket overflow
-    # below world_size) show up as untouched rows → NaN.
+    # slots given by its global_idx. Padding duplicates (added in
+    # train_nep_sharded so n_total divides evenly across ranks) write the
+    # same value twice into the same slot — harmless. Every input frame
+    # appears in some rank, so the output has no NaN rows.
     natoms_g = np.zeros(n_total_frames, dtype=np.int64)
     volumes_g = np.zeros(n_total_frames, dtype=np.float64)
     e_pred_g = np.full(n_total_frames, np.nan)
