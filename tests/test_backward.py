@@ -9,7 +9,7 @@ is by construction the correct gradient. So we only need to confirm the
 closed-form analytical force / virial path agrees with autograd-on-rij,
 and that the training-path forward matches the predict-path forward.
 
-Two checks, per (fixture × device × dtype):
+Two checks, per (fixture * device * dtype):
 
   A. predict-path analytical (NEPCalculator.compute_batch, with the
      analytical chain rule) vs autograd on pair vectors (NEPCalculator.compute,
@@ -41,7 +41,7 @@ from _common import DTYPE_MAP, NP_DTYPE_MAP, FIXTURES, devices, dtypes
 
 
 # (A) analytical chain rule vs torch.autograd.grad — same context, formula
-# re-ordering only → tight bound. (B) train-vs-predict — different autograd
+# re-ordering only -> tight bound. (B) train-vs-predict — different autograd
 # contexts dispatch to different kernels with subtly different accumulation
 # order, hence the looser float64 bound.
 TOL_A = {
@@ -132,7 +132,7 @@ def test_analytical_vs_autograd(fixture, device, dtype_s):
 
     tol = TOL_A[dtype_s]
     msg = (f"[{fixture['name']:8s} {device:4s} {dtype_s:7s}]  "
-           f"|ΔF|={dF:.2e}  |ΔV|={dV:.2e}")
+           f"|dF|={dF:.2e}  |dV|={dV:.2e}")
     print("\n" + msg)
     assert dF < tol["F"], f"{msg}  (F tol={tol['F']})"
     assert dV < tol["V"], f"{msg}  (V tol={tol['V']})"
@@ -172,7 +172,7 @@ def test_train_vs_predict(fixture, device, dtype_s):
 
     tol = TOL_B[dtype_s]
     msg = (f"[{fixture['name']:8s} {device:4s} {dtype_s:7s}]  "
-           f"|ΔF|={dF:.2e}  |ΔV|={dV:.2e}")
+           f"|dF|={dF:.2e}  |dV|={dV:.2e}")
     print("\n" + msg)
     assert dF < tol["F"], f"{msg}  (F tol={tol['F']})"
     assert dV < tol["V"], f"{msg}  (V tol={tol['V']})"

@@ -53,7 +53,7 @@ TEST_DTYPE=float64 pytest tests/
 
 | file | covers |
 | --- | --- |
-| `test_forward.py` | Per-atom E, F, V (6 comp.), and **scaled descriptor** against frozen GPUMD outputs for three fixtures (typewise ZBL / fixed ZBL / full mixed-body). Three fixtures × 2 dtypes × 2 devices. |
+| `test_forward.py` | Per-atom E, F, V (6 comp.), and **scaled descriptor** against frozen GPUMD outputs for three fixtures (typewise ZBL / fixed ZBL / full mixed-body). Three fixtures * 2 dtypes * 2 devices. |
 | `test_backward.py` | (A) analytical force / virial vs autograd-on-rij; (B) `NEPModel.compute_properties_cached` (training path) vs `NEPCalculator.compute_batch` (predict path). Same fixture matrix. |
 | `test_descriptor_gradient.py` | `_angular_weight` (the hand-derived dEi/d(sum_fxyz) for every body order) matches `torch.autograd.grad` on the explicit q-vs-s polynomial. Pins down the new `q_112` / `q_1122` analytical gradients introduced for the mixed-body invariants. |
 | `test_angular_lmax8.py` | Solid-harmonics angular basis: L = 1..4 regression vs the old hand-coded formula; `_compute_dblm_dhat` matches autograd and finite differences for L = 1..8. |

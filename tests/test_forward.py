@@ -77,7 +77,7 @@ def test_forward_vs_gpumd(fixture, device, dtype_s):
         E_pa[i] = r["Etot"].item() / n
         # Virial: sum per-atom 9-vector, fold to GPUMD's 6 entries, divide by Na
         v9 = r["virial"].sum(0).cpu().numpy()
-        # GPUMD order (xx, yy, zz, xy, yz, zx) from the row-major 3×3 sum
+        # GPUMD order (xx, yy, zz, xy, yz, zx) from the row-major 3*3 sum
         V_pa[i] = np.array([v9[0], v9[4], v9[8],
                             v9[1], v9[5], v9[6]]) / n
         F[off:off + n] = r["forces"].cpu().numpy()
@@ -93,8 +93,8 @@ def test_forward_vs_gpumd(fixture, device, dtype_s):
 
     # Detailed message on failure
     msg = (f"[{fixture['name']:8s} {device:4s} {dtype_s:7s}]  "
-           f"|ΔE/atom|={dE:.2e}  |ΔF|={dF:.2e}  "
-           f"|ΔV/atom|={dV:.2e}  |ΔD|={dD:.2e}")
+           f"|dE/atom|={dE:.2e}  |dF|={dF:.2e}  "
+           f"|dV/atom|={dV:.2e}  |dD|={dD:.2e}")
     print("\n" + msg)
 
     assert dE < tol["E"], f"{msg}  (E tol={tol['E']})"

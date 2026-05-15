@@ -21,19 +21,17 @@ Single-rank (N=1) runs but offers nothing over ``train_nep`` in that case.
 """
 
 import os
-import platform
 import time
 import torch
 import torch.distributed as dist
 import numpy as np
 from datetime import datetime
-from typing import List, Dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
 from .model import NEPModel
-from .data import read_xyz, parse_nep_in, build_neighbor_list_np
+from .data import read_xyz, parse_nep_in
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
@@ -74,8 +72,7 @@ class _NEPDDPShim(nn.Module):
 
 from .train import (
     _BANNER, _AUTHOR,
-    _backend_info, _default_device,
-    GPUDataStore,
+    _backend_info, GPUDataStore,
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
@@ -188,7 +185,7 @@ def train_nep_sharded(
         # Pass device_id so NCCL can bind the rank to its CUDA device
         # deterministically (silences "Guessing device ID based on global
         # rank" and the collective-context warnings, and prevents hangs on
-        # heterogeneous rank→GPU mappings). gloo ignores device_id.
+        # heterogeneous rank->GPU mappings). gloo ignores device_id.
         dist.init_process_group(backend=ddp_backend,
                                 device_id=dev if cuda_available else None)
 
@@ -270,13 +267,13 @@ def train_nep_sharded(
             config = dict(orig_config)
             config["type_names"] = keep
             config["num_types"] = len(keep)
-            _log(f"  slim_types: {orig_config['type_names']} → {keep} "
+            _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
     # Random sharding: shuffle globally with a fixed seed (identical on
-    # every rank → all ranks agree on the partition), then give rank r the
+    # every rank -> all ranks agree on the partition), then give rank r the
     # r-th equal slice. To keep step counts identical across ranks (DDP
     # collectives require lock-step iteration) AND keep every frame in the
     # training/predict set, we pad the perm with duplicates from the head
@@ -297,7 +294,7 @@ def train_nep_sharded(
     local_frames = [frames[i] for i in local_global_idx]
     pad_note = (f", {pad} frame(s) duplicated for even split"
                 if pad else "")
-    _log(f"  {n_total} structures total → "
+    _log(f"  {n_total} structures total -> "
          f"rank {rank} gets {n_local} (random shard across {world_size} ranks, "
          f"batch_size={config['batch_size']}{pad_note})")
 
@@ -364,7 +361,7 @@ def train_nep_sharded(
             model.load_state_dict(slimmed.state_dict())
             del full_model, slimmed
             _log(f"Fine-tuning from: {finetune_from}  "
-                 f"[{orig_config['num_types']} → {config['num_types']} types]")
+                 f"[{orig_config['num_types']} -> {config['num_types']} types]")
         else:
             _load_weights(model, finetune_from)
             _log(f"Fine-tuning from: {finetune_from}")
@@ -398,7 +395,7 @@ def train_nep_sharded(
     backend = _resolve_backend(backend, num_types=model.num_types)
     _log(f"Compute backend: {backend}")
 
-    # q_scaler: local shard → all_reduce
+    # q_scaler: local shard -> all_reduce
     _log("Computing q_scaler (all-reduce across shards)...")
     t_qs = time.time()
     q_min, q_max = _compute_q_scaler_sharded(model, data_store, backend=backend)
@@ -422,7 +419,7 @@ def train_nep_sharded(
     model = DDP(shim,
                 device_ids=[gpu_id] if cuda_available else None,
                 find_unused_parameters=False)
-    # raw_model: unwrap DDP → shim → (optional torch.compile) → NEPModel
+    # raw_model: unwrap DDP -> shim -> (optional torch.compile) -> NEPModel
     _shim = model.module
     inner = _shim.model
     raw_model = inner._orig_mod if hasattr(inner, "_orig_mod") else inner
@@ -513,7 +510,7 @@ def train_nep_sharded(
     _log(f"LR: {lr}, {sched_desc}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
     if stage2:
-        _log(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
+        _log(f"Stage 2: epoch {start_stage2}->{num_epochs}, "
              f"lr={stage2_lr}, {sched_desc}, "
              f"SWA={'ON' if use_swa else 'OFF'}")
         _log(f"Stage 2 weights: E={stage2_pref_e}  "
@@ -536,7 +533,7 @@ def train_nep_sharded(
             g.manual_seed(epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/Å³)²
+            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             max_gn = 0.0
 
@@ -561,13 +558,13 @@ def train_nep_sharded(
                             max_NN_rad, max_NN_ang)
                         torch.save(raw_model.state_dict(),
                                    os.path.join(output_dir, "nep_stage1.pt"))
-                        _log(f"\nSaved end-of-stage-1 snapshot: "
-                             f"nep_stage1.pt / nep_stage1.txt")
+                        _log("\nSaved end-of-stage-1 snapshot: "
+                             "nep_stage1.pt / nep_stage1.txt")
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
                     tag = ("Stage 2 started" if epoch == start_stage2
-                           else f"Stage 2 resumed (from checkpoint)")
+                           else "Stage 2 resumed (from checkpoint)")
                     _log(f"{tag} at epoch {epoch}: "
                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                          f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -609,7 +606,7 @@ def train_nep_sharded(
                 # equal — which is NOT the case here because frames have
                 # different atom counts).
                 # Fix: each rank computes SUM-of-squared-errors, and we divide
-                # by the GLOBAL count (all-reduced per batch). The × world_size
+                # by the GLOBAL count (all-reduced per batch). The * world_size
                 # factor cancels DDP's /world_size averaging — giving a true
                 # global-mean loss regardless of how atoms are sharded.
                 counts = torch.tensor([
@@ -635,7 +632,7 @@ def train_nep_sharded(
                     f_pred = result["forces"][f_mask]
                     f_ref = batch["forces"][f_mask]
                     sum_sq_f = ((f_pred - f_ref) ** 2).sum()
-                    # 3 components per atom → divide by (3 × n_f_g)
+                    # 3 components per atom -> divide by (3 * n_f_g)
                     loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
                     sum_lf += (sum_sq_f.item() / 3.0)
 
@@ -652,10 +649,10 @@ def train_nep_sharded(
                         v_ref_pa = v_ref[v_mask] / na
                         v_diff = v_pred_pa - v_ref_pa
                         sum_sq_v = (v_diff ** 2).sum()
-                        # 9 components per frame → divide by (9 × n_v_g)
+                        # 9 components per frame -> divide by (9 * n_v_g)
                         loss = loss + cur_pref_v * sum_sq_v * ws / (9.0 * n_v_g)
                         sum_lv += (sum_sq_v.item() / 9.0)
-                        # Stress (eV/Å³) = -virial_total / V. Sign cancels in MSE.
+                        # Stress (eV/A**3) = -virial_total / V. Sign cancels in MSE.
                         scale = (batch["natoms"][v_mask]
                                  / batch["volumes"][v_mask]).unsqueeze(-1)
                         sum_sq_s = ((v_diff * scale) ** 2).sum()
@@ -704,7 +701,7 @@ def train_nep_sharded(
             max_gn = gn_t.item()
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
-            # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
+            # consistent with rmse_{e,f,v}: avg_loss == \Sigma pref_X * MSE_X
             # where each MSE_X aggregates over all samples in the epoch.
             from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
@@ -714,7 +711,7 @@ def train_nep_sharded(
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
                         + cur_pref_v * mse_v)
             rmse_e = np.sqrt(mse_e)                           # eV/atom
-            rmse_f = np.sqrt(mse_f)                           # eV/Å
+            rmse_f = np.sqrt(mse_f)                           # eV/A
             rmse_v = np.sqrt(mse_v)                           # eV/atom
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
             dt = time.time() - t_epoch

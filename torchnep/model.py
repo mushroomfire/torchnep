@@ -61,22 +61,16 @@ class NEPModel(nn.Module):
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
         self.basis_size_angular = config["basis_size_angular"]
-        # Angular descriptor flags.
-        # Accepts either the old 3-field ``l_max [L, l_max_4b, l_max_5b]`` form
-        # (where the 2nd/3rd entries were "max L used in 4b/5b" but treated as
-        # booleans), or the new 5-field ``l_max [L, has_q_222, has_q_1111,
-        # has_q_112, has_q_1122]``. Everything past index 0 is normalised to
-        # bool below — see /u/22/wuy33/unix/Study/GPUMD/src/main_nep/parameters.cu.
+        # ``l_max`` accepts both the legacy 3-field form (where positions
+        # 1, 2 were "max L for 4b / 5b" but used as booleans) and the new
+        # 5-field form (has_q_222, has_q_1111, has_q_112, has_q_1122).
+        # Everything past index 0 is normalised to a 0/1 flag here.
         lm = list(config["l_max"])
         self.l_max_3b = lm[0]
         self.has_q_222  = 1 if (len(lm) > 1 and lm[1] > 0) else 0
         self.has_q_1111 = 1 if (len(lm) > 2 and lm[2] > 0) else 0
         self.has_q_112  = 1 if (len(lm) > 3 and lm[3] > 0) else 0
         self.has_q_1122 = 1 if (len(lm) > 4 and lm[4] > 0) else 0
-        # Back-compat aliases — external code (and older save paths) still
-        # references these names. Both are pure booleans now.
-        self.l_max_4b = self.has_q_222
-        self.l_max_5b = self.has_q_1111
         self.num_neurons = config["neuron"]
 
         # ZBL
@@ -88,7 +82,7 @@ class NEPModel(nn.Module):
                                  torch.tensor(atomic_numbers, dtype=torch.long))
             tw = config.get("typewise_cutoff_zbl_factor", None)
             if tw is not None:
-                # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z → z-1.
+                # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z -> z-1.
                 rc_i = [tw * COVALENT_RADIUS[z - 1] for z in atomic_numbers]
                 self.register_buffer("zbl_rc_inner_per_type", torch.tensor(rc_i))
                 self.register_buffer("zbl_rc_outer_per_type",
@@ -247,9 +241,9 @@ class NEPModel(nn.Module):
         """Compute energy, forces, virial using precomputed basis.
 
         Uses fully analytical force computation — no create_graph=True needed.
-        Forces are differentiable through c2, c3 (via Fp→NN weights and via s→c3).
+        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
 
-        ``backend`` ∈ {"loop", "bmm"} — see torchnep.ops.resolve_backend.
+        ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -315,7 +309,7 @@ class NEPModel(nn.Module):
                 tanh_der = 1.0 - h * h
                 Fp[mask] = (net.w1 * tanh_der) @ net.w0.T
             else:
-                # Dummy forward (the × 0 below nulls the contribution but
+                # Dummy forward (the * 0 below nulls the contribution but
                 # keeps the net's parameters in the autograd graph).
                 z_d = dummy_q @ net.w0 - net.b0
                 h_d = torch.tanh(z_d)
@@ -511,9 +505,6 @@ class NEPModel(nn.Module):
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
-        # New GPUMD l_max line: 5 ints (L_max_3b, has_q_222, has_q_1111,
-        # has_q_112, has_q_1122). Old GPUMD versions accept 3-field form
-        # (L, l_max_4b, l_max_5b); GPUMD reads parts[1:] regardless of count.
         lines.append(
             f"l_max {self.l_max_3b} {self.has_q_222} {self.has_q_1111} "
             f"{self.has_q_112} {self.has_q_1122}")

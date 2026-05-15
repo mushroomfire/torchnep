@@ -17,11 +17,11 @@ from .constants import PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B
 #
 # Two concrete implementations of the type-pair contraction plus one meta:
 #   "loop" : pure PyTorch, nested for-loop over (t1, t2) type pairs. Wins when
-#            ntypes is small (≤ ~5) — the outer loop runs few times.
+#            ntypes is small (<= ~5) — the outer loop runs few times.
 #   "bmm"  : pure PyTorch, fancy index + torch.bmm (dispatched to cuBLAS on
-#            CUDA, MKL on CPU, MPS on Apple). Wins when ntypes ≥ ~8 — one
-#            batched GEMM replaces the O(ntypes²) python-level loop.
-#   "auto" : picks by num_types (≥ 8 → bmm, else loop).
+#            CUDA, MKL on CPU, MPS on Apple). Wins when ntypes >= ~8 — one
+#            batched GEMM replaces the O(ntypes**2) python-level loop.
+#   "auto" : picks by num_types (>= 8 -> bmm, else loop).
 #
 # Both backends are autograd-compatible and run on any PyTorch backend.
 # ---------------------------------------------------------------------------
@@ -33,8 +33,8 @@ def resolve_backend(backend: str = "auto",
                      num_types: Optional[int] = None) -> str:
     """Resolve "auto" into a concrete backend.
 
-    ntypes ≥ 8  → "bmm"   (fancy-index + batched GEMM wins)
-    otherwise   → "loop"  (few-types; inline Python loop is fastest)
+    ntypes >= 8  -> "bmm"   (fancy-index + batched GEMM wins)
+    otherwise   -> "loop"  (few-types; inline Python loop is fastest)
 
     Any non-"auto" string is returned unchanged (for explicit overrides).
     """
@@ -64,10 +64,10 @@ def chebyshev_basis(dij: torch.Tensor, rc: float,
     Parameters
     ----------
     dij : (P,) float
-        Pair distances in Å. P is the total number of pairs in the batch
+        Pair distances in A. P is the total number of pairs in the batch
         (so this works for one frame, many frames, or zero pairs).
     rc : float
-        Radial cutoff in Å. Basis is designed so f_k(rc) = 0.
+        Radial cutoff in A. Basis is designed so f_k(rc) = 0.
     basis_size : int
         Polynomial order (== NEP ``basis_size`` parameter).
 
@@ -94,9 +94,9 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
     Parameters
     ----------
     dij : (P,) float
-        Pair distances in Å.
+        Pair distances in A.
     rc : float
-        Radial cutoff in Å.
+        Radial cutoff in A.
     basis_size : int
         Polynomial order.
 
@@ -109,7 +109,7 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
     keeps only 4 sliding-window scalars (T_{k-2}, T_{k-1}, U_{k-2}, U_{k-1})
     in memory, instead of materializing all 2*(basis_size+1) intermediate
     tensors + a final torch.stack copy. On 19M pairs this avoids ~2 GB of
-    GPU→GPU traffic per call.
+    GPU->GPU traffic per call.
     """
     rcinv = 1.0 / rc
     arg = PI * dij * rcinv
@@ -124,12 +124,12 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
     fk  = torch.empty(P, B, dtype=dij.dtype, device=dij.device)
     fkp = torch.empty(P, B, dtype=dij.dtype, device=dij.device)
 
-    # k = 0: T_0 = 1, so fn_core = 1 → fk[..,0] = fc; fkp[..,0] = fcp
+    # k = 0: T_0 = 1, so fn_core = 1 -> fk[..,0] = fc; fkp[..,0] = fcp
     fk[:, 0] = fc
     fkp[:, 0] = fcp
 
     if B >= 2:
-        # k = 1: T_1 = x, U_0 = 1 → dT_1/dx = 1
+        # k = 1: T_1 = x, U_0 = 1 -> dT_1/dx = 1
         fn_core1 = 0.5 * (x + 1.0)
         fk[:, 1] = fn_core1 * fc
         fkp[:, 1] = 0.5 * dxdr * fc + fn_core1 * fcp
@@ -201,11 +201,11 @@ def _z_factor(z_pow, coeff_row, start, stop):
 
 def angular_basis(x: torch.Tensor, y: torch.Tensor,
                   z: torch.Tensor, l_max_3b: int) -> torch.Tensor:
-    """Solid-harmonics-style angular basis Y_{Ln1} for L = 1..l_max_3b.
+    r"""Solid-harmonics-style angular basis Y_{Ln1} for L = 1..l_max_3b.
 
-    Each basis element is z_factor(z) · {Re or Im}[(x + iy)^n1], using the
+    Each basis element is z_factor(z) * {Re or Im}[(x + iy)^n1], using the
     polynomial coefficients in ``Z_COEFFICIENT``. Bit-identical to the
-    previous hand-coded formulas for l_max_3b ≤ 4.
+    previous hand-coded formulas for l_max_3b <= 4.
 
     Parameters
     ----------
@@ -216,7 +216,7 @@ def angular_basis(x: torch.Tensor, y: torch.Tensor,
 
     Returns
     -------
-    blm : (P, num_lm) float, where num_lm = Σ_{L=1..l_max_3b} (2L + 1).
+    blm : (P, num_lm) float, where num_lm = \Sigma_{L=1..l_max_3b} (2L + 1).
     """
     if l_max_3b < 1:
         return torch.zeros(x.shape[0], 0, dtype=x.dtype, device=x.device)
@@ -257,7 +257,7 @@ def compute_descriptors(
     dtype, device,
     backend: str = "auto",
 ) -> torch.Tensor:
-    """Compute NEP4 descriptors from raw pair geometry. Returns (N, dim).
+    r"""Compute NEP4 descriptors from raw pair geometry. Returns (N, dim).
 
     This builds the Chebyshev/angular basis internally, unlike
     ``compute_descriptors_cached`` which takes them as inputs. Used by the
@@ -265,25 +265,25 @@ def compute_descriptors(
 
     Parameters
     ----------
-    rij_rad : (P_rad, 3) float   radial displacement vectors (Å).
-    rij_ang : (P_ang, 3) float   angular displacement vectors (Å); may be
+    rij_rad : (P_rad, 3) float   radial displacement vectors (A).
+    rij_ang : (P_ang, 3) float   angular displacement vectors (A); may be
                                  empty for isolated atoms / dimers.
     pi_rad, pj_rad : (P_rad,) int64    central / neighbor atom indices.
     pi_ang, pj_ang : (P_ang,) int64    same, angular pairs.
-    atom_types     : (N,) int64        per-atom type id ∈ [0, ntypes).
+    atom_types     : (N,) int64        per-atom type id in [0, ntypes).
     N              : int               total atoms in the batch.
     c2             : (ntypes, ntypes, basis_size_radial+1, n_max_radial+1)
                                         radial type-pair expansion coeffs.
     c3             : (ntypes, ntypes, basis_size_angular+1, n_max_angular+1)
                                         angular type-pair expansion coeffs.
-    rc_radial, rc_angular : float      cutoffs (Å).
+    rc_radial, rc_angular : float      cutoffs (A).
     basis_size_radial, basis_size_angular : int
     n_max_radial, n_max_angular           : int
     l_max_3b       : int               max L for 3-body angular descriptors.
     has_q_222, has_q_1111, has_q_112, has_q_1122 : int (0/1)
         Boolean switches for the four optional mixed-body invariants.
         Each enabled flag adds an (n_max_angular+1)-sized block.
-    num_lm         : int               Σ_{L=1..l_max_3b}(2L+1).
+    num_lm         : int               \Sigma_{L=1..l_max_3b}(2L+1).
     c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs, c5b2_coeffs :
         per-body fixed coefficient tensors.
     dtype, device   : torch dtype / device for outputs.
@@ -348,11 +348,9 @@ def compute_descriptors(
         q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
         parts.append(q_3b)
 
-        # Mixed-body blocks. Each ``has_q_*`` flag turns on one (N, n_ap1) block.
-        # GPUMD orders them strictly as 222 → 1111 → 112 → 1122, see
-        # nep_utilities.cuh::find_q. Order MUST match save_nep_txt / NEPCalculator.
+        # Mixed-body blocks. Order (222 -> 1111 -> 112 -> 1122) must match
+        # GPUMD's nep_utilities.cuh::find_q and save_nep_txt below.
         if has_q_222 or has_q_112 or has_q_1122:
-            # L=2 moments are reused by 222, 112, 1122 — extract once.
             s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
             s22r, s22i = s[:, :, 6], s[:, :, 7]
         if has_q_1111 or has_q_112 or has_q_1122:
@@ -375,9 +373,6 @@ def compute_descriptors(
             parts.append(q5)
 
         if has_q_112:
-            # q_112 = C4B2[0]*a²*d + C4B2[1]*a(b*e+c*f) + C4B2[2]*d(b²+c²)
-            #       + C4B2[3]*g(b²-c²) + C4B2[4]*b*c*h
-            # with (a,b,c) = (s10,s11r,s11i) and (d,e,f,g,h) = L=2 moments.
             cb = c4b2_coeffs
             q112 = (cb[0]*s10*s10*s20
                     + cb[1]*s10*(s11r*s21r + s11i*s21i)
@@ -387,8 +382,6 @@ def compute_descriptors(
             parts.append(q112)
 
         if has_q_1122:
-            # q_1122 = 10-term combination of L=1, L=2 squares — see GPUMD
-            # nep_utilities.cuh::find_q for the exact expression.
             cb = c5b2_coeffs
             a2 = s10*s10; b2 = s11r*s11r; c2_ = s11i*s11i
             d2 = s20*s20; e2 = s21r*s21r; f2 = s21i*s21i
@@ -439,7 +432,7 @@ def apply_ann(
     Parameters
     ----------
     q          : (N, dim) float       scaled per-atom descriptors.
-    atom_types : (N,) int64           per-atom type id ∈ [0, num_types).
+    atom_types : (N,) int64           per-atom type id in [0, num_types).
     num_types  : int                  number of distinct element types.
     w0_list    : list[(neuron, dim)]  first-layer weights, one per type.
     b0_list    : list[(neuron,)]      first-layer biases, one per type.
@@ -479,11 +472,11 @@ def compute_zbl(
     ----------
     atom_types : (N,) int64
     pair_i, pair_j : (P,) int64   angular-list pairs (ZBL reuses them).
-    rij        : (P, 3) float     displacement vectors (Å).
+    rij        : (P, 3) float     displacement vectors (A).
     N          : int              total atoms in the batch.
     atomic_numbers_list : list[int] of length ntypes, Z per element.
     rc_inner_default, rc_outer_default : float
-        Global fallback switching window (Å) when typewise is off.
+        Global fallback switching window (A) when typewise is off.
     typewise_factor : float or None
     rc_inner_per_type, rc_outer_per_type : (ntypes,) float or None
         Per-element covalent-radius-based switching window; when both are
@@ -573,16 +566,16 @@ def compute_zbl(
 
 
 def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
-    """Type-pair loop: Σ_k c[t1, t2, n, k]·basis[p, k] then scatter_add into q.
+    r"""Type-pair loop: \Sigma_k c[t1, t2, n, k]*basis[p, k] then scatter_add into q.
 
-    The outer loop is O(ntypes²) python iterations. Preferred when ntypes is
+    The outer loop is O(ntypes**2) python iterations. Preferred when ntypes is
     small (few kernel launches, each matmul is fat) and peak memory matters.
 
     Inputs
     ------
     basis      : (P, K)                         K = basis_size + 1.
     pair_i, pair_j : (P,) int64                 central / neighbor indices.
-    atom_types : (N,) int64                     ∈ [0, ntypes).
+    atom_types : (N,) int64                     in [0, ntypes).
     c          : (ntypes, ntypes, N_out, K)     expansion coefficients.
     N          : int                            total atoms in the batch.
 
@@ -628,7 +621,7 @@ def _scatter_contraction_bmm(basis, pair_i, pair_j, atom_types, c, N):
     """Vectorised: gather c[t1, t2] per pair, one torch.bmm, scatter_add.
 
     Allocates a (P, N_out, K) intermediate so peak memory is higher, but
-    launches ~1 kernel instead of O(ntypes²). Wins when ntypes ≥ ~8."""
+    launches ~1 kernel instead of O(ntypes**2). Wins when ntypes >= ~8."""
     t1 = atom_types[pair_i]
     t2 = atom_types[pair_j]
     c_p = c[t1, t2]                                            # (P, N_out, K)
@@ -658,7 +651,7 @@ def compute_descriptors_cached(
     return_intermediates: bool = False,
     backend: str = "loop",
 ):
-    """Compute descriptors using precomputed basis functions.
+    r"""Compute descriptors using precomputed basis functions.
 
     Faster than compute_descriptors because Chebyshev/angular basis are cached.
     Differentiable through c2, c3 only (not rij).
@@ -671,20 +664,20 @@ def compute_descriptors_cached(
     blm    : (P_ang, num_lm) float  cached angular basis.
     pi_rad, pj_rad : (P_rad,) int64   radial central / neighbor indices.
     pi_ang, pj_ang : (P_ang,) int64   angular central / neighbor indices.
-    atom_types     : (N,) int64      per-atom type id ∈ [0, ntypes).
+    atom_types     : (N,) int64      per-atom type id in [0, ntypes).
     N              : int             total atoms in the batch.
     c2 : (ntypes, ntypes, basis_size_radial + 1, n_max_radial + 1).
     c3 : (ntypes, ntypes, basis_size_angular + 1, n_max_angular + 1).
     n_max_radial, n_max_angular, l_max_3b : int.
     has_q_222, has_q_1111, has_q_112, has_q_1122 : int (0/1) flags.
-    num_lm : int  = Σ_{L=1..l_max_3b}(2L + 1).
+    num_lm : int  = \Sigma_{L=1..l_max_3b}(2L + 1).
     c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs, c5b2_coeffs :
         body-order coefficient tensors (the latter two for q_112 / q_1122).
     dtype, device : torch dtype / device for outputs.
     return_intermediates : bool  also return s and gn_ang (needed by the
                                  analytical-force path).
     backend : "loop" | "bmm"  type-pair contraction implementation:
-        "loop" — pure-PyTorch ntypes² loop (few types)
+        "loop" — pure-PyTorch ntypes**2 loop (few types)
         "bmm"  — fancy-index + torch.bmm (many types)
 
     Returns
@@ -697,8 +690,6 @@ def compute_descriptors_cached(
         Both are ``None`` when l_max_3b == 0 or there are no angular pairs.
     """
     _scatter_fn, _type_fn = _select_contraction_funcs(backend)
-
-    ntypes = c2.shape[0]
 
     # Radial descriptor: type-lookup + contraction + scatter
     q_rad = _scatter_fn(fk_rad, pi_rad, pj_rad, atom_types, c2, N)
@@ -744,7 +735,6 @@ def compute_descriptors_cached(
         q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
         parts.append(q_3b)
 
-        # Pre-extract reusable moments
         if has_q_222 or has_q_112 or has_q_1122:
             s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
             s22r, s22i = s[:, :, 6], s[:, :, 7]
@@ -819,12 +809,12 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
     """Compute dEi/d(sum_fxyz)[N, n_ap1, num_lm] for ALL body orders.
 
     This is the "effective Fp" in sum_fxyz space needed for the analytical
-    angular force chain rule. Differentiable through s (→ c3) and Fp (→ NN weights).
+    angular force chain rule. Differentiable through s (-> c3) and Fp (-> NN weights).
     """
     N = s.shape[0]
     weight = torch.zeros_like(s)  # (N, n_ap1, num_lm)
 
-    # --- 3-body: q3b = sum_l c[m=0]*s[l,m=0]² + 2*sum_{m>0} c[m]*s[l,m]²
+    # --- 3-body: q3b = sum_l c[m=0]*s[l,m=0]**2 + 2*sum_{m>0} c[m]*s[l,m]**2
     # dq3b_l/ds[n,st+m] = 2*c3b[st]   *s[n,st]   for m=0
     #                    = 4*c3b[st+m] *s[n,st+m] for m>0
     Fp_3b = Fp[:, dim_r:dim_r + l_max_3b * n_ap1].reshape(N, l_max_3b, n_ap1)
@@ -835,23 +825,19 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         c = c3b_coeffs[st:st + nt]       # (nt,)
         s_lm = s[:, :, st:st + nt]        # (N, n_ap1, nt)
         Fp_l = Fp_3b[:, li, :].unsqueeze(-1)  # (N, n_ap1, 1)
-        dq_ds = 2.0 * c * s_lm            # m=0: 2c[0]*s; m>0: 2c[m]*s (×2 below)
+        dq_ds = 2.0 * c * s_lm            # m=0: 2c[0]*s; m>0: 2c[m]*s (*2 below)
         dq_ds[:, :, 1:] = dq_ds[:, :, 1:] * 2.0  # m>0 gets extra factor 2
         weight[:, :, st:st + nt] = weight[:, :, st:st + nt] + Fp_l * dq_ds
 
-    # Block ordering MUST match compute_descriptors / save_nep_txt:
-    #   q_222 → q_1111 → q_112 → q_1122
+    # Block ordering must match compute_descriptors / save_nep_txt:
+    # q_222 -> q_1111 -> q_112 -> q_1122.
     off = dim_r + l_max_3b * n_ap1
 
-    # Cache moments once (cheap views) — many blocks reuse them.
     s10, s11r, s11i = s[:, :, 0], s[:, :, 1], s[:, :, 2]
     if s.shape[2] >= 8:
         s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
         s22r, s22i = s[:, :, 6], s[:, :, 7]
-    else:
-        s20 = s21r = s21i = s22r = s22i = None  # safety, only used in 4b/5b paths
 
-    # --- q_222 ("4-body"): q4 = cb[0]*s20³ + cb[1]*s20*(s21r²+s21i²) + ...
     if has_q_222 and s.shape[2] >= 8:
         Fp_4b = Fp[:, off:off + n_ap1]; off += n_ap1
         cb = c4b_coeffs
@@ -866,7 +852,6 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         weight[:, :, 7] = weight[:, :, 7] + Fp_4b * (
             2*cb[2]*s20*s22i + cb[4]*s21r*s21i)
 
-    # --- q_1111 ("5-body"): q5 = cb5[0]*s0sq² + cb5[1]*s0sq*s1sq + cb5[2]*s1sq²
     if has_q_1111:
         Fp_5b = Fp[:, off:off + n_ap1]; off += n_ap1
         s0sq = s10**2; s1sq = s11r**2 + s11i**2
@@ -876,38 +861,34 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         weight[:, :, 1] = weight[:, :, 1] + Fp_5b * 2*s11r*factor_1sq
         weight[:, :, 2] = weight[:, :, 2] + Fp_5b * 2*s11i*factor_1sq
 
-    # --- q_112: q = C[0]*a²*d + C[1]*a*(b*e+c*f) + C[2]*d*(b²+c²)
-    #            + C[3]*g*(b²-c²) + C[4]*b*c*h
-    # (a,b,c) = (s10, s11r, s11i); (d,e,f,g,h) = (s20, s21r, s21i, s22r, s22i)
+    # q_112 / q_1122 gradients use shorthand (a,b,c)=L=1 moments,
+    # (d,e,f,g,h)=L=2 moments. Polynomial forms live in compute_descriptors_cached.
     if has_q_112 and s.shape[2] >= 8:
         Fp_b = Fp[:, off:off + n_ap1]; off += n_ap1
         cb = c4b2_coeffs
         a, b, c = s10, s11r, s11i
         d, e, f, g, h = s20, s21r, s21i, s22r, s22i
-        # ∂/∂a
+        # d/da
         weight[:, :, 0] = weight[:, :, 0] + Fp_b * (
             2*cb[0]*a*d + cb[1]*(b*e + c*f))
-        # ∂/∂b
+        # d/db
         weight[:, :, 1] = weight[:, :, 1] + Fp_b * (
             cb[1]*a*e + 2*cb[2]*d*b + 2*cb[3]*g*b + cb[4]*c*h)
-        # ∂/∂c
+        # d/dc
         weight[:, :, 2] = weight[:, :, 2] + Fp_b * (
             cb[1]*a*f + 2*cb[2]*d*c - 2*cb[3]*g*c + cb[4]*b*h)
-        # ∂/∂d
+        # d/dd
         weight[:, :, 3] = weight[:, :, 3] + Fp_b * (
             cb[0]*a*a + cb[2]*(b*b + c*c))
-        # ∂/∂e
+        # d/de
         weight[:, :, 4] = weight[:, :, 4] + Fp_b * (cb[1]*a*b)
-        # ∂/∂f
+        # d/df
         weight[:, :, 5] = weight[:, :, 5] + Fp_b * (cb[1]*a*c)
-        # ∂/∂g
+        # d/dg
         weight[:, :, 6] = weight[:, :, 6] + Fp_b * (cb[3]*(b*b - c*c))
-        # ∂/∂h
+        # d/dh
         weight[:, :, 7] = weight[:, :, 7] + Fp_b * (cb[4]*b*c)
 
-    # --- q_1122: 10-term combo of (a²,b²,c²) × (d²,e²,f²,g²,h²) plus 3 cross
-    # terms. ∂/∂{a..h} derived directly from the polynomial (see comment block
-    # at the head of the function for the full q_1122 expression).
     if has_q_1122 and s.shape[2] >= 8:
         Fp_b = Fp[:, off:off + n_ap1]; off += n_ap1
         cb = c5b2_coeffs
@@ -916,14 +897,14 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         a2, b2, c2_ = a*a, b*b, c*c
         d2, e2, f2 = d*d, e*e, f*f
         g2, h2 = g*g, h*h
-        # ∂/∂a
+        # d/da
         weight[:, :, 0] = weight[:, :, 0] + Fp_b * (
             2*cb[0]*a*d2
             + 2*cb[1]*(a*e2 + a*f2)
             + 2*cb[3]*(a*g2 + a*h2)
             + cb[7]*(b*d*e + c*d*f)
             + cb[8]*(b*e*g + b*f*h + c*e*h - c*f*g))
-        # ∂/∂b
+        # d/db
         weight[:, :, 1] = weight[:, :, 1] + Fp_b * (
             2*cb[1]*b*e2
             + 2*cb[2]*(b*g2 + b*h2)
@@ -933,7 +914,7 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
             + cb[7]*(a*d*e - c*d*h)
             + cb[8]*(a*e*g + a*f*h)
             + cb[9]*c*e*f)
-        # ∂/∂c
+        # d/dc
         weight[:, :, 2] = weight[:, :, 2] + Fp_b * (
             2*cb[1]*c*f2
             + 2*cb[2]*(c*g2 + c*h2)
@@ -943,33 +924,33 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
             + cb[7]*(a*d*f - b*d*h)
             + cb[8]*(a*e*h - a*f*g)
             + cb[9]*b*e*f)
-        # ∂/∂d
+        # d/dd
         weight[:, :, 3] = weight[:, :, 3] + Fp_b * (
             2*cb[0]*a2*d
             + 2*cb[5]*(b2 + c2_)*d
             + cb[6]*(c2_ - b2)*g
             + cb[7]*(a*b*e + a*c*f - b*c*h))
-        # ∂/∂e
+        # d/de
         weight[:, :, 4] = weight[:, :, 4] + Fp_b * (
             2*cb[1]*(a2 + b2)*e
             + 2*cb[4]*c2_*e
             + cb[7]*a*b*d
             + cb[8]*(a*b*g + a*c*h)
             + cb[9]*b*c*f)
-        # ∂/∂f
+        # d/df
         weight[:, :, 5] = weight[:, :, 5] + Fp_b * (
             2*cb[1]*(a2 + c2_)*f
             + 2*cb[4]*b2*f
             + cb[7]*a*c*d
             + cb[8]*(a*b*h - a*c*g)
             + cb[9]*b*c*e)
-        # ∂/∂g
+        # d/dg
         weight[:, :, 6] = weight[:, :, 6] + Fp_b * (
             2*cb[2]*(b2 + c2_)*g
             + 2*cb[3]*a2*g
             + cb[6]*(c2_ - b2)*d
             + cb[8]*(a*b*e - a*c*f))
-        # ∂/∂h
+        # d/dh
         weight[:, :, 7] = weight[:, :, 7] + Fp_b * (
             2*cb[2]*(b2 + c2_)*h
             + 2*cb[3]*a2*h
@@ -1007,7 +988,7 @@ def compute_analytical_forces(
     fkp_ang : (P_ang, basis_size_angular + 1) float   d(fk)/d(rij) for angular.
     blm     : (P_ang, num_lm) float                   cached angular basis.
     pi_rad, pj_rad : (P_rad,) int64
-    rij_rad        : (P_rad, 3) float  displacement vectors (Å).
+    rij_rad        : (P_rad, 3) float  displacement vectors (A).
     d12inv_rad     : (P_rad,) float    1 / |rij_rad|.
     pi_ang, pj_ang : (P_ang,) int64
     rij_ang        : (P_ang, 3) float
@@ -1026,11 +1007,11 @@ def compute_analytical_forces(
     Returns
     -------
     forces : (N, 3) float
-    virial : (N, 9) float or None  per-atom 3×3 virial flattened row-major.
+    virial : (N, 9) float or None  per-atom 3*3 virial flattened row-major.
 
     Geometry tensors (rij, fkp, d12inv, blm) are detached so PyTorch does not
     track gradients through them — they are not trainable parameters. Only Fp
-    (→ NN weights) and c2/c3 carry gradient information.
+    (-> NN weights) and c2/c3 carry gradient information.
     """
     _, _type_fn = _select_contraction_funcs(backend)
 
@@ -1070,7 +1051,7 @@ def compute_analytical_forces(
         # gnp_ang: radial distance derivative term (differentiable via c3)
         gnp_ang_v = _type_fn(fkp_ang, pi_ang, pj_ang, atom_types, c3)
 
-        # weight = dEi/d(sum_fxyz): all body orders, differentiable via s→c3 and Fp→NN
+        # weight = dEi/d(sum_fxyz): all body orders, differentiable via s->c3 and Fp->NN
         w_atom = _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
                                  has_q_222, has_q_1111, has_q_112, has_q_1122,
                                  c3b_coeffs, c4b_coeffs, c5b_coeffs,
@@ -1083,11 +1064,11 @@ def compute_analytical_forces(
         f12_gnp = (scalar_gnp * d12inv_ang).unsqueeze(-1) * rij_ang
 
         # Term 2: direction derivative — f12 = sum_n,lm w_i * gn * dblm/drij
-        # dblm/drij = (dblm/dhat - hat*(hat·dblm/dhat)) / dij
+        # dblm/drij = (dblm/dhat - hat*(hat*dblm/dhat)) / dij
         x_hat = rij_ang[:, 0] * d12inv_ang
         y_hat = rij_ang[:, 1] * d12inv_ang
         z_hat = rij_ang[:, 2] * d12inv_ang
-        # dblm_dhat depends only on geometry → no-grad context
+        # dblm_dhat depends only on geometry -> no-grad context
         with torch.no_grad():
             dblm_dhat = _compute_dblm_dhat(x_hat, y_hat, z_hat, l_max_3b)  # (P, num_lm, 3)
         hat = torch.stack([x_hat, y_hat, z_hat], dim=-1)
@@ -1108,21 +1089,21 @@ def compute_analytical_forces(
 
 
 def _compute_dblm_dhat(x, y, z, l_max_3b):
-    """Derivatives of ``angular_basis`` wrt unit direction (x̂, ŷ, ẑ).
+    """Derivatives of ``angular_basis`` wrt unit direction (xhat, yhat, zhat).
 
-    For a basis element blm = z_factor(z) · C(x, y) where
+    For a basis element blm = z_factor(z) * C(x, y) where
       C = 1              (n1 = 0)
       C = Re[(x+iy)^n1]  (n1 > 0, real  component)
       C = Im[(x+iy)^n1]  (n1 > 0, imag component)
     the gradients are:
-      ∂blm/∂x = z_factor(z)        · ∂C/∂x
-      ∂blm/∂y = z_factor(z)        · ∂C/∂y
-      ∂blm/∂z = z_factor'(z)       · C
-    with ∂Re_n/∂x =  n·Re_{n-1},  ∂Im_n/∂x =  n·Im_{n-1},
-         ∂Re_n/∂y = -n·Im_{n-1},  ∂Im_n/∂y =  n·Re_{n-1}.
+      d(blm)/dx = z_factor(z)        * d(C)/dx
+      d(blm)/dy = z_factor(z)        * d(C)/dy
+      d(blm)/dz = z_factor'(z)       * C
+    with d(Re_n)/dx =  n*Re_{n-1},  d(Im_n)/dx =  n*Im_{n-1},
+         d(Re_n)/dy = -n*Im_{n-1},  d(Im_n)/dy =  n*Re_{n-1}.
 
-    Returns: (P, num_lm, 3) where [..., 0/1/2] = d/d(x̂, ŷ, ẑ).
-    Bit-identical to the old hand-coded implementation for l_max_3b ≤ 4.
+    Returns: (P, num_lm, 3) where [..., 0/1/2] = d/d(xhat, yhat, zhat).
+    Bit-identical to the old hand-coded implementation for l_max_3b <= 4.
     """
     if l_max_3b < 1:
         return torch.zeros(x.shape[0], 0, 3, dtype=x.dtype, device=x.device)
@@ -1202,8 +1183,8 @@ def accumulate_forces_virial(
 
     Returns
     -------
-    forces : (N, 3) float  per-atom force in eV/Å.
-    virial : (N, 9) float  per-atom virial tensor (row-major 3×3) in eV.
+    forces : (N, 3) float  per-atom force in eV/A.
+    virial : (N, 9) float  per-atom virial tensor (row-major 3*3) in eV.
     """
     forces = torch.zeros(N, 3, dtype=dtype, device=device)
     virial = torch.zeros(N, 9, dtype=dtype, device=device)

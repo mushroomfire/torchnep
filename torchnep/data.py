@@ -9,13 +9,13 @@ Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 
 def _parse_properties_schema(comment: str):
     """Parse the extended-XYZ ``Properties=...`` field.
 
-    Returns a dict mapping field name → (type_code, token_offset, width).
+    Returns a dict mapping field name -> (type_code, token_offset, width).
     ``token_offset`` is the starting column in the FULL per-atom token list
     (so species and numeric fields share the same coordinate). This lets
     downstream parsing handle arbitrary field ordering, including the
@@ -188,7 +188,7 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
         if missing, the frame simply has no energy (handled downstream).
       - ``virial="..."`` and ``stress="..."`` are optional but, when present,
         must have exactly 9 components. If both are given, virial wins.
-        stress (eV/Å³) is converted to virial (eV) as
+        stress (eV/A**3) is converted to virial (eV) as
         ``virial = -stress * |det(lattice)|`` — opposite sign convention.
     """
     frame = {}
@@ -379,8 +379,8 @@ def build_neighbor_list_np(positions, cell, cutoff):
     """Build neighbor list using numpy (for preprocessing). Returns arrays.
 
     Cell is stored with lattice vectors as ROWS. The perpendicular distance
-    between planes spanned by (b,c), (a,c), (a,b) is V/|b×c|, V/|a×c|,
-    V/|a×b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
+    between planes spanned by (b,c), (a,c), (a,b) is V/|b*c|, V/|a*c|,
+    V/|a*b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
     reciprocal vectors). Using rows silently undercounts image replicas for
     heavily skewed triclinic cells and drops real neighbors — bug fixed 2025.
 

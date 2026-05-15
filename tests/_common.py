@@ -9,7 +9,6 @@ No third-party packages (mdapy / polars / etc.) — predictions are checked
 against frozen GPUMD-baked fixtures in ``data/*.gpumd.npz``.
 """
 import os
-import sys
 from pathlib import Path
 from typing import List
 
@@ -79,7 +78,7 @@ def load_reference(npz_path: Path) -> dict:
 
     Returns a dict with keys:
       ``E_per_atom``  : (Nframes,)            eV/atom
-      ``F``           : (Natoms, 3)           eV/Å
+      ``F``           : (Natoms, 3)           eV/A
       ``V_per_atom``  : (Nframes, 6)          eV, GPUMD-ordered (xx,yy,zz,xy,yz,zx)
       ``D_per_atom``  : (Natoms, dim) or None scaled descriptor (q * q_scaler);
                                               ``None`` if the fixture pre-dates
@@ -140,7 +139,7 @@ def parse_nep_header(nep_path: Path) -> dict:
             parts = ln.split()
             try:
                 float(parts[0])
-                break               # numeric body starts → header done
+                break               # numeric body starts -> header done
             except ValueError:
                 pass
             key = parts[0]
@@ -176,7 +175,7 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
     """Write a nep.in that mirrors the architecture of a nep.txt for GPUMD
     prediction mode.
 
-    ``output_descriptor`` ∈ {0, 1, 2}: 0 disables descriptor.out; 1 writes
+    ``output_descriptor`` in {0, 1, 2}: 0 disables descriptor.out; 1 writes
     one row per frame (averaged); 2 writes one row per atom.
     """
     lines = [

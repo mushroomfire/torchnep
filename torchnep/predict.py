@@ -126,7 +126,7 @@ def _build_batch(structures, indices, calc, dtype, device):
 
 
 def _virial9_to_6(v9):
-    """Re-order length-9 row-major virial (xx,xy,xz,yx,yy,yz,zx,zy,zz) into
+    r"""Re-order length-9 row-major virial (xx,xy,xz,yx,yy,yz,zx,zy,zz) into
     the GPUMD 6-vector (xx,yy,zz,xy,yz,zx).
 
     Picks single-triangular components to match GPUMD's per-atom virial
@@ -134,10 +134,10 @@ def _virial9_to_6(v9):
     = -r[1]*f[2], s_virial_zx = -r[2]*f[0]). GPUMD does not average with
     the symmetric partner — it stores only one entry of each off-diagonal
     pair during force accumulation. Per-FRAME totals are still symmetric
-    because the sum Σ -r_α f_β over directed pairs equals Σ -r_β f_α by
-    Newton's 3rd law, so this choice is numerically equivalent to averaging
-    at the per-frame output level but gives cheaper bit-identical match
-    with GPUMD outputs."""
+    because the sum \Sigma -r_\alpha f_\beta over directed pairs equals
+    \Sigma -r_\beta f_\alpha by Newton's 3rd law, so this choice is
+    numerically equivalent to averaging at the per-frame output level but
+    gives cheaper bit-identical match with GPUMD outputs."""
     out = np.empty((v9.shape[0], 6), dtype=v9.dtype)
     out[:, 0] = v9[:, 0]   # xx = -r_x f_x
     out[:, 1] = v9[:, 4]   # yy = -r_y f_y
@@ -181,7 +181,7 @@ def predict_dataset(
         1 — write per-frame averaged ``q * q_scaler`` to descriptor_predict.out.
         2 — write per-atom ``q * q_scaler`` to descriptor_predict.out.
 
-    ``backend`` ∈ {"auto", "loop", "bmm"} — see
+    ``backend`` in {"auto", "loop", "bmm"} — see
     ``torchnep.ops.resolve_backend``.
     """
     if device is None:
@@ -209,7 +209,7 @@ def predict_dataset(
     l_max_3b = calc.l_max_3b
     num_lm = calc.num_lm
 
-    # Resolve "auto" now that num_types is known (≥8 → "bmm", else "loop").
+    # Resolve "auto" now that num_types is known (>=8 -> "bmm", else "loop").
     backend = ops.resolve_backend(backend, num_types=calc.num_types)
     _log(f"  backend: {backend}")
 
@@ -325,8 +325,8 @@ def predict_dataset(
     v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
 
     # Descriptor buffer (only allocated when requested).
-    #   mode 1 → (n_struct, dim)         per-frame averaged scaled descriptor
-    #   mode 2 → (N_atoms_total, dim)    per-atom scaled descriptor
+    #   mode 1 -> (n_struct, dim)         per-frame averaged scaled descriptor
+    #   mode 2 -> (N_atoms_total, dim)    per-atom scaled descriptor
     d_pred_arr = None
     if output_descriptor == 1:
         d_pred_arr = np.empty((n_struct, calc.dim), dtype=np.float64)
@@ -436,9 +436,9 @@ def predict_dataset(
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
 
-    # Stress = -virial_total / V × EV_PER_A3_TO_GPa  (GPa). The negative
-    # sign makes the round-trip XYZ-stress ↔ output-stress consistent:
-    # data.py reads a stress= tag as virial = -stress × V, so emitting
+    # Stress = -virial_total / V * EV_PER_A3_TO_GPa  (GPa). The negative
+    # sign makes the round-trip XYZ-stress <-> output-stress consistent:
+    # data.py reads a stress= tag as virial = -stress * V, so emitting
     # stress_out = -virial / V cancels that flip and the user sees the
     # same sign on input and output (positive = tensile per torchnep/GPUMD
     # README). NOTE this differs from GPUMD's own stress_train.out by a
@@ -460,7 +460,7 @@ def predict_dataset(
     _log(f"  write:       {time.time() - t0:5.1f}s")
 
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
-         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +481,7 @@ def predict_from_store(model, data_store, output_dir: str,
     Writes GPUMD-format outputs in ``output_dir`` (same columns and format as
     ``predict_dataset``):
       energy_predict.out  — per-frame (pred, ref) in eV/atom
-      force_predict.out   — per-atom (fx,fy,fz pred, ref) in eV/Å
+      force_predict.out   — per-atom (fx,fy,fz pred, ref) in eV/A
       virial_predict.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
     """
     def _log(msg):
@@ -567,8 +567,8 @@ def predict_from_store(model, data_store, output_dir: str,
     np.savetxt(os.path.join(output_dir, "virial_predict.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
-    # Stress (GPa) = -virial_total / V × conversion. Sign picked so round-
-    # trip XYZ-stress ↔ output-stress is consistent (see predict_dataset
+    # Stress (GPa) = -virial_total / V * conversion. Sign picked so round-
+    # trip XYZ-stress <-> output-stress is consistent (see predict_dataset
     # for the derivation; differs from GPUMD's stress_train.out by a sign).
     from .constants import EV_PER_A3_TO_GPa
     vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
@@ -582,7 +582,7 @@ def predict_from_store(model, data_store, output_dir: str,
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +592,7 @@ def predict_from_store(model, data_store, output_dir: str,
 # ---------------------------------------------------------------------------
 
 def _compute_local_predictions(model, data_store, batch_size, backend):
-    """Run prediction on one rank's local data_store → numpy arrays.
+    """Run prediction on one rank's local data_store -> numpy arrays.
 
     Returns a dict of per-frame / per-atom arrays (pred and ref) plus the
     natoms and volume metadata needed to merge + write on rank 0.
@@ -785,4 +785,4 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                        f_pred_g, f_ref_g,
                        v_pred_g, v_ref_g)
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"→ {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")

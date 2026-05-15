@@ -84,8 +84,8 @@ def test_q112_polynomial_gradient(seed):
     (Fp, s_lm) entry — only the 8 relevant lm indices get non-zero weight.
     """
     torch.manual_seed(seed)
-    n_ap1 = 5            # n_max_angular = 4 → 5 channels
-    num_lm = 24          # L=1..4 → 3+5+7+9 = 24
+    n_ap1 = 5            # n_max_angular = 4 -> 5 channels
+    num_lm = 24          # L=1..4 -> 3+5+7+9 = 24
     s = torch.randn(1, n_ap1, num_lm, dtype=DTYPE, requires_grad=True)
     Fp_block = torch.randn(1, n_ap1, dtype=DTYPE)
     c4b2 = torch.tensor(C4B2, dtype=DTYPE)
@@ -111,8 +111,8 @@ def test_q112_polynomial_gradient(seed):
         c5b2_coeffs=torch.tensor(C5B2, dtype=DTYPE))
 
     # q is built from s[n,lm] but only lm=0..7 contribute. dE/ds = Fp * dq/ds.
-    # _angular_weight currently emits 2 × (Fp · dq/ds) in the 3-body slot
-    # (factor of 2 reflects the s²·c sum / dq_3b convention), and 1 × elsewhere.
+    # _angular_weight currently emits 2 * (Fp * dq/ds) in the 3-body slot
+    # (factor of 2 reflects the s**2*c sum / dq_3b convention), and 1 * elsewhere.
     # Our test only enables q_112, so the 3-body contribution is zero and the
     # output equals dE/ds exactly.
     assert torch.allclose(w[:, :, :8], grad_auto[:, :, :8], atol=TOL)

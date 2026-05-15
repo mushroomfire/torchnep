@@ -44,7 +44,7 @@ def _hand_coded_lmax4(x, y, z):
 
 
 def test_regression_lmax4():
-    """New data-driven angular_basis matches old hand-coded formula for L ≤ 4."""
+    """New data-driven angular_basis matches old hand-coded formula for L <= 4."""
     torch.manual_seed(0)
     x = torch.randn(50, dtype=torch.float64)
     y = torch.randn(50, dtype=torch.float64)
@@ -55,7 +55,7 @@ def test_regression_lmax4():
         # ref is always full L=4; slice to matching num_lm for lower L
         num_lm_L = sum(2 * ll + 1 for ll in range(1, L + 1))
         diff = (new - ref[:, :num_lm_L]).abs().max().item()
-        # Different summation order → FP roundoff at the last few bits; tolerate.
+        # Different summation order -> FP roundoff at the last few bits; tolerate.
         assert diff < 1e-12, f"L={L}: new != hand-coded, max diff = {diff:.3e}"
 
 
@@ -115,14 +115,14 @@ def test_dblm_matches_finite_diff(L_max):
 
         diff = (analytical - fd).abs().max().item()
         rel = diff / max(fd.abs().max().item(), 1e-12)
-        # FD is noisier (~eps² + rounding); allow 1e-6
+        # FD is noisier (~eps**2 + rounding); allow 1e-6
         assert diff < 1e-6 or rel < 1e-6, (
             f"L_max={L_max}: FD disagrees with analytical dblm. "
             f"max abs diff = {diff:.3e}, rel = {rel:.3e}")
 
 
 def test_num_lm_shape():
-    """Output width follows num_lm = Σ(2L+1) for L=1..L_max."""
+    r"""Output width follows num_lm = \Sigma(2L+1) for L=1..L_max."""
     for L_max in range(1, 9):
         x = torch.randn(5, dtype=torch.float64)
         y = torch.randn(5, dtype=torch.float64)

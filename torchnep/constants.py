@@ -56,7 +56,7 @@ assert len(C3B) == sum(2 * L + 1 for L in range(1, MAX_L3B + 1))  # 80
 # angular basis element equals z_factor(z) * (x+iy)^n1, where
 #   z_factor(z) = sum_{n2} Z_COEFFICIENT[L][n1][n2] * z^n2
 # (only n2 with (L+n1) parity match the sum; others are stored as 0).
-# Matches NEP_CPU's Z_COEFFICIENT_1..8 tables; rows/cols padded to (L+1) × (L+1).
+# Matches NEP_CPU's Z_COEFFICIENT_1..8 tables; rows/cols padded to (L+1) * (L+1).
 Z_COEFFICIENT = [
     None,  # L=0 unused
     [[0.0, 1.0], [1.0, 0.0]],
@@ -123,7 +123,7 @@ C5B2 = [0.008204309788260,
 
 K_C_SP = 14.399645  # Coulomb constant (eV*Angstrom)
 
-# Unit conversion: 1 eV/Å³ = 160.21766208 GPa  (CODATA 2018 e = 1.602176634e-19 C)
+# Unit conversion: 1 eV/A**3 = 160.21766208 GPa  (CODATA 2018 e = 1.602176634e-19 C)
 EV_PER_A3_TO_GPa = 160.21766208
 
 ZBL_PARA = [0.18175, 3.1998, 0.50986, 0.94229, 0.28022, 0.4029, 0.02817, 0.20162]
@@ -131,18 +131,18 @@ ZBL_PARA = [0.18175, 3.1998, 0.50986, 0.94229, 0.28022, 0.4029, 0.02817, 0.20162
 # Covalent radii in Angstrom, indexed by Z-1.
 #
 # Z = 1–94:   from GPUMD (src/utilities/nep_utilities.cuh::COVALENT_RADIUS),
-#             which stores Grimme's DFT-D3 covalent radii × 4/3 (k2 scaling).
+#             which stores Grimme's DFT-D3 covalent radii * 4/3 (k2 scaling).
 #             Reference: Grimme, Antony, Ehrlich, Krieg, J. Chem. Phys. 132,
 #             154104 (2010), Table I (itself derived from Pyykkö & Atsumi
 #             2009 with Li/Be/B/etc. empirical adjustments). GPUMD hard-codes
-#             these × 4/3 for ZBL typewise cutoffs; we reproduce them exactly
+#             these * 4/3 for ZBL typewise cutoffs; we reproduce them exactly
 #             for bit-compatibility.
 # Z = 95–118: Pyykkö, "Additive Covalent Radii for Single-, Double-, and
 #             Triple-Bonded Molecules and Tetrahedrally Bonded Crystals: A
 #             Summary", J. Phys. Chem. A 119, 2326 (2015), single-bond
 #             radii. Grimme D3 only tabulates up to Z=94 (Pu), so this block
 #             fills the gap from a different reference — there is a minor
-#             scale discontinuity at the Z=94 → 95 boundary.
+#             scale discontinuity at the Z=94 -> 95 boundary.
 COVALENT_RADIUS = [
     0.426667, 0.613333, 1.6, 1.25333, 1.02667, 1.0, 0.946667, 0.84,
     0.853333, 0.893333, 1.86667, 1.66667, 1.50667, 1.38667, 1.46667, 1.36,

@@ -34,7 +34,7 @@ from .model import NEPModel, slim_model
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
-from .predict import predict_dataset, predict_from_store
+from .predict import predict_from_store
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ def _backend_info(dev: torch.device, world_size: int = 1) -> List[str]:
 
 
 def _default_device() -> str:
-    """Select best available device: CUDA/ROCm → XPU → MPS → CPU.
+    """Select best available device: CUDA/ROCm -> XPU -> MPS -> CPU.
 
     PyTorch-ROCm routes AMD GPUs through the cuda namespace, so the cuda
     probe catches both. Other torch backends (e.g. XPU for Intel) are
@@ -186,7 +186,7 @@ class GPUDataStore:
         v_all = torch.from_numpy(v_cat).to(device=device, dtype=dtype,
                                             non_blocking=True)
 
-        # Per-frame cell volume (Å³) — needed for stress RMSE. Same order as
+        # Per-frame cell volume (A**3) — needed for stress RMSE. Same order as
         # frames, so a batch slice follows the same indexing as .energy etc.
         vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
                              dtype=np.float32 if dtype == torch.float32
@@ -249,7 +249,7 @@ class GPUDataStore:
         self.has_virial = self.n_virial > 0
 
     def collate(self, indices: List[int]) -> Dict:
-        """Fast GPU-side batch collation. No CPU→GPU transfer."""
+        """Fast GPU-side batch collation. No CPU->GPU transfer."""
         offsets = [0]
         for i in indices:
             offsets.append(offsets[-1] + self.natoms[i])
@@ -339,7 +339,7 @@ def _preprocess_one_frame(args):
     s = {
         "natoms": frame["natoms"],
         "atom_types": atom_types,
-        "volume": float(abs(np.linalg.det(cell))),   # Å³, used for stress RMSE
+        "volume": float(abs(np.linalg.det(cell))),   # A**3, used for stress RMSE
         "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
         "rij_rad": rij[rad_mask].astype(dtype),
         "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
@@ -465,8 +465,8 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
 def _make_lr_scheduler(optimizer, mode, factor, patience, step_size, min_lr):
     """Build the LR scheduler — "plateau" (default) or "step".
 
-    "plateau" → ReduceLROnPlateau(factor, patience, min_lr=min_lr).
-    "step"    → StepLR(step_size, gamma=factor); min_lr enforced manually
+    "plateau" -> ReduceLROnPlateau(factor, patience, min_lr=min_lr).
+    "step"    -> StepLR(step_size, gamma=factor); min_lr enforced manually
                 after each step() via _scheduler_step (StepLR has no min_lr).
     """
     if mode == "step":
@@ -570,9 +570,9 @@ def train_nep(
     device : "cuda" | "cpu" | "mps" — auto-detected if omitted.
     precision : "float32" (default) or "float64".
     backend : "auto" | "loop" | "bmm" — see torchnep.ops.resolve_backend.
-    use_autograd_forces : True → autograd-through-rij forces (slower, gold
-        standard); False (default) → analytical chain rule.
-    use_swa : True → maintain an averaged model during stage 2 and save it
+    use_autograd_forces : True -> autograd-through-rij forces (slower, gold
+        standard); False (default) -> analytical chain rule.
+    use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` / ``nep_average.pt`` at the end.
     use_compile : wrap model in torch.compile (~10 % extra speedup).
     print_interval : log a line to screen every N epochs (all epochs still
@@ -641,7 +641,7 @@ def train_nep(
     pref_v             = config["lambda_v"]
     # Optional stage-2 block
     stage2             = config["stage2"]
-    start_stage2       = config.get("start_stage2")  # may be None → auto 0.75·num_epochs
+    start_stage2       = config.get("start_stage2")  # may be None -> auto 0.75*num_epochs
     stage2_lr          = config["stage2_lr"]
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
@@ -674,7 +674,7 @@ def train_nep(
             config = dict(orig_config)
             config["type_names"] = keep
             config["num_types"] = len(keep)
-            _log(f"  slim_types: {orig_config['type_names']} → {keep} "
+            _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
             _log("  slim_types: all types present in data, nothing to remove")
@@ -724,7 +724,7 @@ def train_nep(
             model.load_state_dict(slimmed.state_dict())
             del full_model, slimmed
             _log(f"Fine-tuning from: {ft_path}  "
-                 f"[{orig_config['num_types']} → {config['num_types']} types]")
+                 f"[{orig_config['num_types']} -> {config['num_types']} types]")
         else:
             _load_weights(model, ft_path)
             _log(f"Fine-tuning from: {ft_path}")
@@ -844,7 +844,7 @@ def train_nep(
     _log(f"LR: {lr}, {sched_desc}")
     _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
     if stage2:
-        _log(f"Stage 2: epoch {start_stage2}→{num_epochs}, "
+        _log(f"Stage 2: epoch {start_stage2}->{num_epochs}, "
              f"lr={stage2_lr}, {sched_desc}, "
              f"SWA={'ON' if use_swa else 'OFF'}")
         _log(f"Stage 2 weights: E={stage2_pref_e}  "
@@ -866,7 +866,7 @@ def train_nep(
             perm = torch.randperm(n_structs, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = 0.0
-            sum_ls = 0.0                     # (eV/Å³)² accumulator for stress
+            sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             max_gn = 0.0
 
@@ -893,13 +893,13 @@ def train_nep(
                             max_NN_rad, max_NN_ang)
                         torch.save(raw_model.state_dict(),
                                    os.path.join(output_dir, "nep_stage1.pt"))
-                        _log(f"\nSaved end-of-stage-1 snapshot: "
-                             f"nep_stage1.pt / nep_stage1.txt")
+                        _log("\nSaved end-of-stage-1 snapshot: "
+                             "nep_stage1.pt / nep_stage1.txt")
                     for pg in optimizer.param_groups:
                         pg['lr'] = stage2_lr
                     _log(f"\n{'='*72}")
                     tag = ("Stage 2 started" if epoch == start_stage2
-                           else f"Stage 2 resumed (from checkpoint)")
+                           else "Stage 2 resumed (from checkpoint)")
                     _log(f"{tag} at epoch {epoch}: "
                          f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                          f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -974,7 +974,7 @@ def train_nep(
                             loss = loss + cur_pref_v * loss_v
                             v_diff = v_pred_pa - v_ref_pa
                             sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
-                            # Stress RMSE (eV/Å³): convert the same diff using
+                            # Stress RMSE (eV/A**3): convert the same diff using
                             # per-frame (natoms/volume). Sign cancels under MSE.
                             scale = (batch["natoms"][v_mask]
                                      / batch["volumes"][v_mask]).unsqueeze(-1)
@@ -1011,7 +1011,7 @@ def train_nep(
                 max_gn = max(max_gn, gn)
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
-            # consistent with rmse_{e,f,v}: avg_loss == Σ pref_X · MSE_X
+            # consistent with rmse_{e,f,v}: avg_loss == \Sigma pref_X * MSE_X
             # where each MSE_X aggregates over all samples in the epoch.
             from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
@@ -1020,7 +1020,7 @@ def train_nep(
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
                         + cur_pref_v * mse_v)
-            # Output units: eV/atom (E, V), eV/Å (F), GPa (stress).
+            # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)

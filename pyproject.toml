@@ -48,6 +48,5 @@ exclude = [
     "tests",
     "example",
     "my_test",
-    ".claude",
     ".github",
 ]

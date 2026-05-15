@@ -94,18 +94,14 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
-        # Accepts 3-field (legacy: L, l_max_4b, l_max_5b), 4-field (with
-        # has_q_112), or 5-field (full new form). All trailing flags map to
-        # booleans — GPUMD writes ints but uses them as 0/1 switches.
+        # ``l_max`` line accepts 3 / 4 / 5 trailing flags (legacy -> new form).
+        # All trailing fields are normalised to 0/1.
         parts = lines[idx].split()
         self.l_max_3b   = int(parts[1])
         self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0
         self.has_q_1111 = 1 if (len(parts) > 3 and int(parts[3]) > 0) else 0
         self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
         self.has_q_1122 = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
-        # Back-compat aliases for predict.py / external scripts
-        self.l_max_4b = self.has_q_222
-        self.l_max_5b = self.has_q_1111
         idx += 1
 
         # ANN
@@ -114,7 +110,7 @@ class NEPCalculator:
         idx += 1
 
         # Descriptor dimension — order must match GPUMD save layout:
-        # radial → 3-body → q_222 → q_1111 → q_112 → q_1122.
+        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_1122.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b   = n_ap1 * self.l_max_3b
@@ -290,7 +286,7 @@ class NEPCalculator:
         pair_i_rad, pair_j_rad, rij_rad, pair_i_ang, pair_j_ang, rij_ang,
         atom_types, struct_idx, N, num_structures.
 
-        ``backend`` ∈ {"loop", "bmm"} — see ops.resolve_backend.
+        ``backend`` in {"loop", "bmm"} — see ops.resolve_backend.
         """
         dtype, device = self.dtype, self.device
         N = batch["N"]
