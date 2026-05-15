@@ -16,7 +16,7 @@ import torch
 import numpy as np
 from typing import Dict
 
-from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B
+from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2, C5B2
 from .data import build_neighbor_list_np
 from . import ops
 
@@ -94,10 +94,18 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
+        # Accepts 3-field (legacy: L, l_max_4b, l_max_5b), 4-field (with
+        # has_q_112), or 5-field (full new form). All trailing flags map to
+        # booleans — GPUMD writes ints but uses them as 0/1 switches.
         parts = lines[idx].split()
-        self.l_max_3b = int(parts[1])
-        self.l_max_4b = int(parts[2])
-        self.l_max_5b = int(parts[3])
+        self.l_max_3b   = int(parts[1])
+        self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0
+        self.has_q_1111 = 1 if (len(parts) > 3 and int(parts[3]) > 0) else 0
+        self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
+        self.has_q_1122 = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
+        # Back-compat aliases for predict.py / external scripts
+        self.l_max_4b = self.has_q_222
+        self.l_max_5b = self.has_q_1111
         idx += 1
 
         # ANN
@@ -105,13 +113,18 @@ class NEPCalculator:
         self.num_neurons = int(parts[1])
         idx += 1
 
-        # Descriptor dimension
+        # Descriptor dimension — order must match GPUMD save layout:
+        # radial → 3-body → q_222 → q_1111 → q_112 → q_1122.
+        n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
-        self.dim_angular_3b = (self.n_max_angular + 1) * self.l_max_3b
-        self.dim_angular_4b = (self.n_max_angular + 1) if self.l_max_4b > 0 else 0
-        self.dim_angular_5b = (self.n_max_angular + 1) if self.l_max_5b > 0 else 0
+        self.dim_angular_3b   = n_ap1 * self.l_max_3b
+        self.dim_angular_4b   = n_ap1 if self.has_q_222  else 0
+        self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
+        self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
+        self.dim_angular_1122 = n_ap1 if self.has_q_1122 else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
-                    self.dim_angular_4b + self.dim_angular_5b)
+                    self.dim_angular_4b + self.dim_angular_5b +
+                    self.dim_angular_112 + self.dim_angular_1122)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         # Parse data
@@ -162,9 +175,11 @@ class NEPCalculator:
         di += self.dim
 
         # Pre-build constants
-        self._c3b = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
-        self._c4b = torch.tensor(C4B, dtype=self.dtype, device=self.device)
-        self._c5b = torch.tensor(C5B, dtype=self.dtype, device=self.device)
+        self._c3b  = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
+        self._c4b  = torch.tensor(C4B,  dtype=self.dtype, device=self.device)
+        self._c5b  = torch.tensor(C5B,  dtype=self.dtype, device=self.device)
+        self._c4b2 = torch.tensor(C4B2, dtype=self.dtype, device=self.device)
+        self._c5b2 = torch.tensor(C5B2, dtype=self.dtype, device=self.device)
 
     def compute(
         self,
@@ -221,8 +236,10 @@ class NEPCalculator:
             self.rc_radial, self.rc_angular,
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
-            self.l_max_3b, self.l_max_4b, self.l_max_5b,
+            self.l_max_3b,
+            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
             self.num_lm, self._c3b, self._c4b, self._c5b,
+            self._c4b2, self._c5b2,
             self.dtype, self.device,
         )
 
@@ -286,8 +303,10 @@ class NEPCalculator:
             batch["atom_types"], N,
             self.c2, getattr(self, "c3", None),
             self.n_max_radial, self.n_max_angular,
-            self.l_max_3b, self.l_max_4b, self.l_max_5b,
+            self.l_max_3b,
+            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
             self.num_lm, self._c3b, self._c4b, self._c5b,
+            self._c4b2, self._c5b2,
             dtype, device,
             return_intermediates=True,
             backend=backend,
@@ -362,8 +381,10 @@ class NEPCalculator:
             batch["rij_ang"], batch["d12inv_ang"],
             s, gn_ang,
             self.n_max_radial, self.n_max_angular,
-            self.l_max_3b, self.l_max_4b, self.l_max_5b,
+            self.l_max_3b,
+            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
             self.num_lm, self._c3b, self._c4b, self._c5b,
+            self._c4b2, self._c5b2,
             dtype, device,
             compute_virial=True,
             backend=backend,
@@ -373,7 +394,8 @@ class NEPCalculator:
             if zbl_virial is not None:
                 virial = virial + zbl_virial
 
-        return {"Ei": Ei, "Etot": Etot, "forces": forces, "virial": virial}
+        return {"Ei": Ei, "Etot": Etot, "forces": forces, "virial": virial,
+                "descriptor": q_scaled.detach()}
 
     def get_descriptor(self, species, positions, cell):
         """Compute scaled descriptors. Returns (N, dim) numpy."""

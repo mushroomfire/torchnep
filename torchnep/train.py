@@ -444,8 +444,10 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
             batch["atom_types"], batch["N"],
             model.c_param_2, model.c_param_3,
             model.n_max_radial, model.n_max_angular,
-            model.l_max_3b, model.l_max_4b, model.l_max_5b,
+            model.l_max_3b,
+            model.has_q_222, model.has_q_1111, model.has_q_112, model.has_q_1122,
             model.num_lm, model._c3b, model._c4b, model._c5b,
+            model._c4b2, model._c5b2,
             dtype, dev,
             backend=backend,
         )

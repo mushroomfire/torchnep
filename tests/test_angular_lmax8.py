@@ -11,8 +11,13 @@ Checks three things:
   3. ``_compute_dblm_dhat`` matches numerical finite differences for L = 1..8
      (independent cross-check, catches any drift in autograd trust).
 """
+import sys
+from pathlib import Path
 
+import pytest
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from torchnep.ops import angular_basis, _compute_dblm_dhat
 
@@ -54,10 +59,11 @@ def test_regression_lmax4():
         assert diff < 1e-12, f"L={L}: new != hand-coded, max diff = {diff:.3e}"
 
 
-def test_dblm_matches_autograd():
-    """_compute_dblm_dhat matches PyTorch autograd on angular_basis, for L = 1..8."""
-    for L_max in range(1, 9):
-        torch.manual_seed(100 + L_max)
+@pytest.mark.parametrize("L_max", list(range(1, 9)))
+def test_dblm_matches_autograd(L_max):
+    """_compute_dblm_dhat matches PyTorch autograd on angular_basis."""
+    torch.manual_seed(100 + L_max)
+    if True:
         n = 30
         x = torch.randn(n, dtype=torch.float64, requires_grad=True)
         y = torch.randn(n, dtype=torch.float64, requires_grad=True)
@@ -83,11 +89,12 @@ def test_dblm_matches_autograd():
             f"rel = {rel:.3e}")
 
 
-def test_dblm_matches_finite_diff():
-    """Sanity: numerical FD check (independent of autograd) for L = 1..8."""
+@pytest.mark.parametrize("L_max", list(range(1, 9)))
+def test_dblm_matches_finite_diff(L_max):
+    """Sanity: numerical FD check (independent of autograd)."""
     eps = 1e-6
-    for L_max in range(1, 9):
-        torch.manual_seed(200 + L_max)
+    torch.manual_seed(200 + L_max)
+    if True:
         n = 8
         x = torch.randn(n, dtype=torch.float64) * 0.8
         y = torch.randn(n, dtype=torch.float64) * 0.8
@@ -128,23 +135,5 @@ def test_num_lm_shape():
 def test_rejects_oob():
     """l_max_3b > 8 must raise."""
     x = torch.randn(3, dtype=torch.float64)
-    try:
+    with pytest.raises(ValueError):
         angular_basis(x, x, x, 9)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("angular_basis(L=9) should have raised")
-
-
-if __name__ == "__main__":
-    test_regression_lmax4()
-    print("regression L=1..4 OK")
-    test_num_lm_shape()
-    print("num_lm shapes OK")
-    test_dblm_matches_autograd()
-    print("dblm_dhat == autograd, L=1..8 OK")
-    test_dblm_matches_finite_diff()
-    print("dblm_dhat == finite-diff, L=1..8 OK")
-    test_rejects_oob()
-    print("oob rejection OK")
-    print("ALL PASS")

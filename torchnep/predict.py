@@ -158,6 +158,7 @@ def predict_dataset(
     verbose: bool = True,
     backend: str = "auto",
     energy_key: str = "energy",
+    output_descriptor: int = 0,
 ):
     """Run batched prediction on a full dataset and save GPUMD-format outputs.
 
@@ -165,9 +166,20 @@ def predict_dataset(
       - energy_predict.out:  e_pred  e_target              (eV/atom, per frame)
       - force_predict.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
       - virial_predict.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
+      - descriptor_predict.out (only when ``output_descriptor != 0``):
+          mode 1 — per-frame averaged scaled descriptor, one row per frame
+          mode 2 — per-atom scaled descriptor, one row per atom
+        Matches GPUMD's ``output_descriptor`` / ``descriptor.out`` schema.
 
     The format mirrors GPUMD's *_train.out files, so the two can be diffed
     column by column.
+
+    Parameters
+    ----------
+    output_descriptor : int
+        0 — disabled (default).
+        1 — write per-frame averaged ``q * q_scaler`` to descriptor_predict.out.
+        2 — write per-atom ``q * q_scaler`` to descriptor_predict.out.
 
     ``backend`` ∈ {"auto", "loop", "bmm"} — see
     ``torchnep.ops.resolve_backend``.
@@ -312,6 +324,15 @@ def predict_dataset(
                   if has_forces_global else None)
     v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
 
+    # Descriptor buffer (only allocated when requested).
+    #   mode 1 → (n_struct, dim)         per-frame averaged scaled descriptor
+    #   mode 2 → (N_atoms_total, dim)    per-atom scaled descriptor
+    d_pred_arr = None
+    if output_descriptor == 1:
+        d_pred_arr = np.empty((n_struct, calc.dim), dtype=np.float64)
+    elif output_descriptor == 2:
+        d_pred_arr = np.empty((N_atoms_total, calc.dim), dtype=np.float64)
+
     t0 = time.time()
     with torch.no_grad():
         for start in range(0, n_struct, batch_size):
@@ -381,6 +402,18 @@ def predict_dataset(
             if f_pred_arr is not None:
                 f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
 
+            if output_descriptor:
+                # ``compute_batch`` already returns ``q * q_scaler``.
+                desc_np = result["descriptor"].cpu().numpy()
+                if output_descriptor == 2:
+                    d_pred_arr[a_lo:a_hi] = desc_np
+                else:
+                    # Per-frame mean: scatter-sum onto frame index then /Na.
+                    sums = np.zeros((B, calc.dim), dtype=np.float64)
+                    si_np = struct_idx.cpu().numpy()
+                    np.add.at(sums, si_np, desc_np)
+                    d_pred_arr[start:end] = sums / natoms_arr[start:end][:, None]
+
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     _log(f"  compute:     {time.time() - t0:5.1f}s")
@@ -420,6 +453,10 @@ def predict_dataset(
     stress_ref = virial_ref * scale
     np.savetxt(os.path.join(output_dir, "stress_predict.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+
+    if d_pred_arr is not None:
+        np.savetxt(os.path.join(output_dir, "descriptor_predict.out"),
+                   d_pred_arr, fmt="%.10g")
     _log(f"  write:       {time.time() - t0:5.1f}s")
 
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "

@@ -1,52 +1,85 @@
 # torchnep tests
 
-Two correctness tests validated against `mdapy.NEP` (the reference NEP_CPU
-C++ backend). Every (device × dtype × model) combination is exercised.
+End-to-end pytest suite. Zero third-party dependencies beyond what
+torchnep itself uses (`numpy`, `torch`); GPUMD comparisons read frozen
+reference fixtures in [data/](data/) rather than invoking the GPUMD
+binary at test time.
 
-## Files
+## Layout
 
-| file | purpose |
+```
+tests/
+  conftest.py                    sys.path wiring (no install needed)
+  _common.py                     fixture catalogue, helpers, dtypes/devices
+
+  test_forward.py                E / F / V / Descriptor vs baked GPUMD
+  test_backward.py               analytical vs autograd; train vs predict
+  test_descriptor_gradient.py    q_112 / q_1122 dq/ds vs autograd
+  test_angular_lmax8.py          L = 1..8 angular basis self-consistency
+
+  bake_fixtures.py               regenerates data/<name>.gpumd.npz via GPUMD
+
+  data/
+    CrCoNi.xyz / nep_CrCoNi.txt        typewise ZBL,    l_max 4 2 1
+    PdCuNiP.xyz / nep_PdCuNiP.txt      fixed ZBL,       l_max 4 2 0
+    mixed.xyz / nep_mixed.txt          typewise ZBL,    l_max 4 1 1 1 1
+                                       (q_222 + q_1111 + q_112 + q_1122)
+    *.gpumd.npz                        frozen GPUMD reference (E/F/V/D)
+```
+
+## Running
+
+From the repo root:
+
+```bash
+pytest tests/
+```
+
+Common subsets:
+
+```bash
+# one file
+pytest tests/test_forward.py -v
+
+# specific fixture / device / dtype
+pytest tests/ -k "mixed and cuda and float64"
+
+# restrict device or dtype globally
+TEST_DEVICE=cpu pytest tests/
+TEST_DTYPE=float64 pytest tests/
+```
+
+## What each test covers
+
+| file | covers |
 | --- | --- |
-| `test_vs_mdapy.py` | forward pass: E / F / V vs NEP_CPU |
-| `test_backward.py` | backward pass: autograd force vs analytical force, and training-path vs predict-path consistency |
-| `nep_PdCuNiP.txt` | reference NEP4 model, **fixed-cutoff ZBL** (`zbl 0.9 1.8`) |
-| `nep_CrCoNi.txt` | reference NEP4 model, **typewise ZBL** (`zbl 1.25 2.5 0.7`) |
-| `PdCuNiP.xyz` | 500-atom configuration paired with `nep_PdCuNiP.txt` |
-| `CrCoNi.xyz` | 108-atom configuration paired with `nep_CrCoNi.txt` |
-| `test_angular_lmax8.py` | separate self-contained test for the extended L-up-to-8 angular basis |
+| `test_forward.py` | Per-atom E, F, V (6 comp.), and **scaled descriptor** against frozen GPUMD outputs for three fixtures (typewise ZBL / fixed ZBL / full mixed-body). Three fixtures × 2 dtypes × 2 devices. |
+| `test_backward.py` | (A) analytical force / virial vs autograd-on-rij; (B) `NEPModel.compute_properties_cached` (training path) vs `NEPCalculator.compute_batch` (predict path). Same fixture matrix. |
+| `test_descriptor_gradient.py` | `_angular_weight` (the hand-derived dEi/d(sum_fxyz) for every body order) matches `torch.autograd.grad` on the explicit q-vs-s polynomial. Pins down the new `q_112` / `q_1122` analytical gradients introduced for the mixed-body invariants. |
+| `test_angular_lmax8.py` | Solid-harmonics angular basis: L = 1..4 regression vs the old hand-coded formula; `_compute_dblm_dhat` matches autograd and finite differences for L = 1..8. |
 
-## test_vs_mdapy.py — forward
+## Tolerances
 
-Max-abs tolerances vs NEP_CPU:
+- **vs GPUMD fixtures** (forward, descriptor): `1e-3 .. 1e-4` abs.
+  GPUMD writes `%g` (~6 sig figs) and computes in float32 internally.
+- **Analytical vs autograd** (same context): `1e-10` in float64, `5e-3`
+  in float32 — only floating-point reorder.
+- **Train vs predict** (different autograd contexts): `5e-6` in float64
+  due to kernel-dispatch differences; not a correctness issue.
+- **Descriptor gradient vs autograd**: `1e-12` (float64, hand-derived).
 
-| dtype | E (eV/atom) | F (eV/Å) | V (eV) |
-| --- | --- | --- | --- |
-| float64 | 1e-10 | 1e-10 | 1e-10 |
-| float32 | 5e-4 | 1e-3 | 1e-3 |
+## Regenerating GPUMD reference fixtures
 
-```bash
-python test_vs_mdapy.py                         # full matrix
-TEST_DEVICE=cpu     python test_vs_mdapy.py     # pin device
-TEST_DTYPE=float64  python test_vs_mdapy.py     # pin dtype
-python test_vs_mdapy.py <nep.txt> <xyz>         # custom single case
-```
-
-## test_backward.py — backward
-
-Autograd is correct by construction once the forward is correct, so only
-the closed-form analytical paths need verification. Two checks per cell:
-
-**A. `compute_batch` (analytical) ≡ `compute` (autograd on rij)**
-Tight: float64 ≤ 1e-10, float32 ≤ 5e-3.
-
-**B. `NEPModel.compute_properties_cached` (training) vs
-`NEPCalculator.compute_batch` (predict)**
-Loose in float64 (≤ 5e-6) because the two call sites differ only in
-`requires_grad` state, and PyTorch dispatches to different matmul/einsum
-kernels for the two cases; their accumulation order gives ~1e-7 per element.
-Both results match NEP_CPU to float64 round-off (verified in Part A and in
-`test_vs_mdapy.py`).
+Only needed if a fixture `nep.txt` is updated or if the GPUMD output format
+changes. Requires a working GPUMD `nep` binary:
 
 ```bash
-python test_backward.py
+GPUMD_NEP=/path/to/GPUMD/src/nep python tests/bake_fixtures.py
 ```
+
+The default path is hard-wired to `/u/22/wuy33/unix/Study/GPUMD/src/nep`.
+
+> Note: GPUMD's parameter parser enforces `basis_size <= 8` by default
+> (internal `MAX_NUM_N` actually allows 16). The `mixed` fixture uses
+> `basis_size 12 12`, so re-baking it requires lifting that cap
+> (`src/main_nep/parameters.cu :: parse_basis_size`).

@@ -339,7 +339,10 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("n_max_angular", 4)
     params.setdefault("basis_size_radial", 12)
     params.setdefault("basis_size_angular", 12)
-    params.setdefault("l_max", [4, 2, 0])
+    # GPUMD default: L_max=4, has_q_222=1 (i.e. 4-body on), others off.
+    # Old 3-field default [4, 2, 0] is still accepted (the 2 is treated as
+    # boolean truthy for has_q_222).
+    params.setdefault("l_max", [4, 1, 0, 0, 0])
     params.setdefault("neuron", 40)
 
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
