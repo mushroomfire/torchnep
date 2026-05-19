@@ -105,6 +105,89 @@ def _default_device() -> str:
     return "cpu"
 
 
+def format_config_summary(config: dict) -> List[str]:
+    """Render the parsed nep.in config as printable lines.
+
+    Each value is prefixed with ``(input)`` if it appeared in nep.in or
+    ``(default)`` if ``parse_nep_in`` filled it in. Helps users verify the
+    parameters their run is actually using.
+
+    Reads ``config["_explicit"]`` (the set of keys present in nep.in before
+    defaults were applied); falls back to "(input)" for everything if that
+    marker is absent.
+    """
+    explicit = config.get("_explicit", None)
+    def tag(*keys):
+        # If any of the canonical keys for a grouped option is explicit
+        # (e.g. user wrote `cutoff 6 4`, which sets cutoff_radial AND
+        # cutoff_angular), mark the whole row as (input).
+        if explicit is None:
+            return "(input)  "
+        return "(input)  " if any(k in explicit for k in keys) else "(default)"
+
+    lines = []
+    lines.append("Model architecture")
+    lines.append("------------------")
+    lines.append(f"  {tag('type_names', 'num_types'):10}  types        "
+                 f"{config['num_types']}  {' '.join(config['type_names'])}")
+    lines.append(f"  {tag('cutoff_radial', 'cutoff_angular'):10}  cutoff       "
+                 f"{config['cutoff_radial']} {config['cutoff_angular']}")
+    lines.append(f"  {tag('n_max_radial', 'n_max_angular'):10}  n_max        "
+                 f"{config['n_max_radial']} {config['n_max_angular']}")
+    lines.append(f"  {tag('basis_size_radial', 'basis_size_angular'):10}  "
+                 f"basis_size   "
+                 f"{config['basis_size_radial']} {config['basis_size_angular']}")
+    lm_pad = (config['l_max'] + [0] * 5)[:5]
+    lines.append(f"  {tag('l_max'):10}  l_max        "
+                 f"{lm_pad[0]} {lm_pad[1]} {lm_pad[2]} {lm_pad[3]} {lm_pad[4]}  "
+                 f"(L_3b, has_q_222, has_q_1111, has_q_112, has_q_1122)")
+    lines.append(f"  {tag('neuron'):10}  neuron       {config['neuron']}")
+    if config.get("zbl") is not None:
+        zbl_extra = ""
+        if config.get("typewise_cutoff_zbl_factor") is not None:
+            zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
+        lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
+
+    lines.append("")
+    lines.append("Training schedule (Stage 1)")
+    lines.append("---------------------------")
+    lines.append(f"  {tag('num_epochs'):10}  epoch        {config['num_epochs']}")
+    lines.append(f"  {tag('batch_size'):10}  batch        {config['batch_size']}")
+    lines.append(f"  {tag('lr'):10}  lr           {config['lr']}")
+    lines.append(f"  {tag('stop_lr'):10}  stop_lr      {config['stop_lr']}")
+    lines.append(f"  {tag('lr_scheduler'):10}  lr_scheduler {config['lr_scheduler']}")
+    # `scheduler_patience` serves both modes: for plateau it is the number
+    # of non-improving epochs before LR reduction; for step it is the LR
+    # step interval (StepLR's `step_size`).
+    patience_label = ("step_size" if config['lr_scheduler'] == 'step'
+                      else "patience")
+    lines.append(f"  {tag('scheduler_patience'):10}  {patience_label:11}  "
+                 f"{config['scheduler_patience']}")
+    lines.append(f"  {tag('scheduler_factor'):10}  factor       "
+                 f"{config['scheduler_factor']}")
+    lines.append(f"  {tag('max_grad_norm'):10}  max_grad     {config['max_grad_norm']}")
+    lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
+    lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
+    lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
+    if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
+        lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
+        lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
+
+    if config.get("stage2"):
+        lines.append("")
+        lines.append("Training schedule (Stage 2)")
+        lines.append("---------------------------")
+        ss = config.get("start_stage2")
+        ss_str = f"{ss}" if ss is not None else f"auto (0.75 * {config['num_epochs']})"
+        lines.append(f"  {tag('start_stage2'):10}  start_stage2 {ss_str}")
+        lines.append(f"  {tag('stage2_lr'):10}  stage2_lr    {config['stage2_lr']}")
+        lines.append(f"  {tag('stage2_pref_e'):10}  stage2_lambda_e {config['stage2_pref_e']}")
+        lines.append(f"  {tag('stage2_pref_f'):10}  stage2_lambda_f {config['stage2_pref_f']}")
+        lines.append(f"  {tag('stage2_pref_v'):10}  stage2_lambda_v {config['stage2_pref_v']}")
+
+    return lines
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -462,16 +545,21 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
-def _make_lr_scheduler(optimizer, mode, factor, patience, step_size, min_lr):
+def _make_lr_scheduler(optimizer, mode, factor, patience, min_lr):
     """Build the LR scheduler — "plateau" (default) or "step".
 
     "plateau" -> ReduceLROnPlateau(factor, patience, min_lr=min_lr).
-    "step"    -> StepLR(step_size, gamma=factor); min_lr enforced manually
-                after each step() via _scheduler_step (StepLR has no min_lr).
+    "step"    -> StepLR(step_size=patience, gamma=factor); min_lr enforced
+                manually after each step() via _scheduler_step (StepLR has
+                no min_lr).
+
+    ``patience`` is shared between the two modes: for plateau it is the
+    number of non-improving epochs before LR is reduced; for step it is the
+    interval between scheduled reductions.
     """
     if mode == "step":
         return torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=step_size, gamma=factor)
+            optimizer, step_size=patience, gamma=factor)
     # default: plateau
     return torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=factor,
@@ -622,6 +710,9 @@ def train_nep(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
+    for line in format_config_summary(orig_config):
+        _log(line)
+    _log("")
     config = orig_config
     # Model regularisation coefficients
     lambda_1 = config["lambda_1"]
@@ -634,7 +725,6 @@ def train_nep(
     scheduler_patience = config["scheduler_patience"]
     scheduler_factor   = config["scheduler_factor"]
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
-    step_size          = config["step_size"]        # only used when mode=="step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
@@ -648,10 +738,11 @@ def train_nep(
     stage2_pref_v      = config["stage2_pref_v"]
 
     # ---- Data ------------------------------------------------------------
-    _log("Loading training data...")
-    _log(f"  energy label: {energy_key}")
+    _log("Data")
+    _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
-    _log(f"  {len(frames)} structures")
+    _log(f"  read {len(frames)} structures from {data_file} "
+         f"(energy label: {energy_key})")
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -679,27 +770,26 @@ def train_nep(
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
-    _log("Building neighbor lists...")
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
     structures = preprocess_structures(frames, config, np_dtype)
-    _log(f"  Done in {time.time() - t0:.1f}s")
+    _log(f"  built neighbor lists in {time.time() - t0:.1f}s")
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
 
-    _log(f"Pre-loading data to {dev} (with cached basis)...")
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
     if dev.type == "cuda":
         torch.cuda.synchronize()
-    _log(f"  Loaded ({time.time() - t0:.1f}s)")
-    _log(f"  Data: {data_store.n} structures, "
-         f"{data_store.n_energy} with energy, "
-         f"{data_store.n_forces} with forces, "
-         f"{data_store.n_virial} with virial")
+    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    _log(f"  coverage: {data_store.n_energy} E / "
+         f"{data_store.n_forces} F / {data_store.n_virial} V")
+    _log("")
 
     # ---- Model -----------------------------------------------------------
+    _log("Model")
+    _log("-----")
     model = NEPModel(config).to(dtype).to(dev)
 
     if finetune_from is not None:
@@ -723,12 +813,12 @@ def train_nep(
             slimmed = slim_model(full_model, config["type_names"])
             model.load_state_dict(slimmed.state_dict())
             del full_model, slimmed
-            _log(f"Fine-tuning from: {ft_path}  "
+            _log(f"  fine-tuning from {ft_path}  "
                  f"[{orig_config['num_types']} -> {config['num_types']} types]")
         else:
             _load_weights(model, ft_path)
-            _log(f"Fine-tuning from: {ft_path}")
-        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+            _log(f"  fine-tuning from {ft_path}")
+        _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
         mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
@@ -736,26 +826,26 @@ def train_nep(
                             if data_store.has_energy_flag[i]])
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
-        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+        _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # Resolve "auto" backend now that we know num_types (and the CUDA kernel
     # load attempt above has updated availability).
     from .ops import resolve_backend as _resolve_backend
     backend = _resolve_backend(backend, num_types=model.num_types)
-    _log(f"Compute backend: {backend}")
+    force_str = "autograd" if use_autograd_forces else "analytical"
+    _log(f"  backend: {backend}, forces: {force_str}")
 
-    _log("Computing q_scaler...")
     t0 = time.time()
     q_min, q_max = compute_q_scaler(model, data_store, backend=backend)
     model.set_q_scaler(q_min, q_max)
     if dev.type == "cuda":
         torch.cuda.synchronize()
-    _log(f"  Done in {time.time() - t0:.1f}s")
+    _log(f"  q_scaler in {time.time() - t0:.1f}s")
 
     if use_compile and hasattr(torch, "compile"):
-        _log("Compiling model with torch.compile...")
         model = torch.compile(model)
+        _log("  torch.compile: enabled")
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
@@ -767,7 +857,7 @@ def train_nep(
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
-        scheduler_patience, step_size, stop_lr)
+        scheduler_patience, stop_lr)
 
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
@@ -777,7 +867,7 @@ def train_nep(
     if stage2:
         stage2_scheduler = _make_lr_scheduler(
             optimizer, lr_scheduler_mode, scheduler_factor,
-            scheduler_patience, step_size, stop_lr)
+            scheduler_patience, stop_lr)
         if use_swa:
             swa_model = AveragedModel(raw_model)
 
@@ -824,32 +914,15 @@ def train_nep(
         loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                        "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
 
-    backend_str = {
-        "loop": "PyTorch type-pair loop",
-        "bmm":  "PyTorch fancy-index + torch.bmm (batched GEMM)",
-    }.get(backend, backend)
-    force_str = ("autograd (create_graph)" if use_autograd_forces
-                 else "analytical")
-    clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
-    _log(f"\nTraining: epochs {start_epoch}-{num_epochs}, "
-         f"batch={batch_size}, dtype={precision}")
-    _log(f"Backend: {backend_str} | forces: {force_str} | "
-         f"{clip_str} | loss: MSE")
-    if lr_scheduler_mode == "step":
-        sched_desc = (f"StepLR(step_size={step_size}, gamma={scheduler_factor})"
-                      f", stop_lr={stop_lr}")
-    else:
-        sched_desc = (f"ReduceLROnPlateau(patience={scheduler_patience}, "
-                      f"factor={scheduler_factor}), stop_lr={stop_lr}")
-    _log(f"LR: {lr}, {sched_desc}")
-    _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
-    if stage2:
-        _log(f"Stage 2: epoch {start_stage2}->{num_epochs}, "
-             f"lr={stage2_lr}, {sched_desc}, "
-             f"SWA={'ON' if use_swa else 'OFF'}")
-        _log(f"Stage 2 weights: E={stage2_pref_e}  "
-             f"F={stage2_pref_f}  V={stage2_pref_v}")
-    _log("-" * 72)
+    # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
+    # already printed by format_config_summary above; here we just announce
+    # the runtime epoch range — different from `epoch` in nep.in when
+    # resuming from a checkpoint.
+    stage2_tag = (f", Stage 2 from epoch {start_stage2} "
+                  f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
+    _log("")
+    _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
+    _log("=" * 72)
 
     train_t0 = time.time()
 

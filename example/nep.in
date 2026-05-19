@@ -5,27 +5,27 @@ use_typewise_cutoff_zbl 0.7
 cutoff     6 4
 n_max      8 8
 basis_size 12 12
-l_max      4 2 1
+l_max      4 1 1
 neuron     80
 
 # Stage 1 loss weights (same as GPUMD lambda_e/f/v)
 lambda_e   10.0
 lambda_f   100.0
-lambda_v   0.0
+lambda_v   1.0
 
 # Training parameters
-epoch      5           # number of epochs
-batch      64            # batch size
+epoch      400           # number of epochs
+batch      16            # batch size
 lr         1e-2         # initial learning rate
-stop_lr    1e-6          # minimum learning rate
-scheduler_patience 15    # epochs without improvement before LR reduction
+lr_scheduler step
+scheduler_patience 20    # epochs without improvement before LR reduction
 scheduler_factor   0.8   # LR reduction factor
 max_grad_norm      20.0  # gradient clipping
 
 # Stage 2: energy-focused fine-tuning (MACE-style)
-#stage2           1       # 1=enable, 0=disable
-#start_stage2     700     # epoch to start Stage 2
-#stage2_lr        1e-3    # Stage 2 learning rate
-#stage2_lambda_e  100.0  # Stage 2 energy weight
-#stage2_lambda_f  10.0   # Stage 2 force weight
-#stage2_lambda_v  0.0    # Stage 2 virial weight
+stage2           1       # 1=enable, 0=disable
+start_stage2     200     # epoch to start Stage 2
+stage2_lr        1e-3    # Stage 2 learning rate
+stage2_lambda_e  200.0  # Stage 2 energy weight
+stage2_lambda_f  10.0   # Stage 2 force weight
+stage2_lambda_v  10.0    # Stage 2 virial weight

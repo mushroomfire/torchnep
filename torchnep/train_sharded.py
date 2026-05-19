@@ -73,6 +73,7 @@ class _NEPDDPShim(nn.Module):
 from .train import (
     _BANNER, _AUTHOR,
     _backend_info, GPUDataStore,
+    format_config_summary,
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
@@ -228,6 +229,10 @@ def train_nep_sharded(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
+    if is_main:
+        for line in format_config_summary(orig_config):
+            _log(line)
+        _log("")
     config = orig_config
     lambda_1 = config["lambda_1"]
     lambda_2 = config["lambda_2"]
@@ -238,7 +243,6 @@ def train_nep_sharded(
     scheduler_patience = config["scheduler_patience"]
     scheduler_factor   = config["scheduler_factor"]
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
-    step_size          = config["step_size"]        # only used when mode=="step"
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
@@ -251,10 +255,12 @@ def train_nep_sharded(
     stage2_pref_v      = config["stage2_pref_v"]
 
     # ---- Data: each rank loads 1/world_size of structures ----------------
-    _log("Loading training data...")
-    _log(f"  energy label: {energy_key}")
+    _log("Data")
+    _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
     n_total = len(frames)
+    _log(f"  read {n_total} structures from {data_file} "
+         f"(energy label: {energy_key})")
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
     _slim_keep = None
@@ -294,15 +300,13 @@ def train_nep_sharded(
     local_frames = [frames[i] for i in local_global_idx]
     pad_note = (f", {pad} frame(s) duplicated for even split"
                 if pad else "")
-    _log(f"  {n_total} structures total -> "
-         f"rank {rank} gets {n_local} (random shard across {world_size} ranks, "
-         f"batch_size={config['batch_size']}{pad_note})")
+    _log(f"  sharded across {world_size} ranks: "
+         f"{n_local} frames per rank{pad_note}")
 
-    _log("Building neighbor lists (local shard)...")
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
     structures = preprocess_structures(local_frames, config, np_dtype)
-    _log(f"  Done in {time.time() - t0:.1f}s")
+    _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s")
 
     # max_NN: local max then all-reduce so rank-0 has the global value
     def _compute_max_neighbors_local(structures):
@@ -323,13 +327,12 @@ def train_nep_sharded(
     dist.all_reduce(nn_t, op=dist.ReduceOp.MAX)
     max_NN_rad, max_NN_ang = int(nn_t[0].item()), int(nn_t[1].item())
 
-    _log(f"Pre-loading local shard to {dev} (with cached basis)...")
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  Loaded ({time.time() - t0:.1f}s)")
+    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
@@ -338,10 +341,12 @@ def train_nep_sharded(
         dtype=torch.long, device=dev)
     dist.all_reduce(counts_t)
     g_n, g_ne, g_nf, g_nv = counts_t.tolist()
-    _log(f"  Global data: {g_n} structures, {g_ne} with energy, "
-         f"{g_nf} with forces, {g_nv} with virial")
+    _log(f"  coverage (global): {g_ne} E / {g_nf} F / {g_nv} V")
+    _log("")
 
     # ---- Model -----------------------------------------------------------
+    _log("Model")
+    _log("-----")
     model = NEPModel(config).to(dtype).to(dev)
 
     if finetune_from is not None:
@@ -360,12 +365,12 @@ def train_nep_sharded(
             slimmed = slim_model(full_model, config["type_names"])
             model.load_state_dict(slimmed.state_dict())
             del full_model, slimmed
-            _log(f"Fine-tuning from: {finetune_from}  "
+            _log(f"  fine-tuning from {finetune_from}  "
                  f"[{orig_config['num_types']} -> {config['num_types']} types]")
         else:
             _load_weights(model, finetune_from)
-            _log(f"Fine-tuning from: {finetune_from}")
-        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+            _log(f"  fine-tuning from {finetune_from}")
+        _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
         # mean_epa: weighted average across all ranks
@@ -379,7 +384,7 @@ def train_nep_sharded(
         mean_epa = float(epa_t[0] / epa_t[1]) if epa_t[1] > 0 else 0.0
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
-        _log(f"Model: {sum(p.numel() for p in model.parameters())} params, "
+        _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # has_forces / has_virial: OR across ranks
@@ -393,20 +398,20 @@ def train_nep_sharded(
     # Resolve "auto" backend now that we know num_types + kernel availability.
     from .ops import resolve_backend as _resolve_backend
     backend = _resolve_backend(backend, num_types=model.num_types)
-    _log(f"Compute backend: {backend}")
+    force_str = "autograd" if use_autograd_forces else "analytical"
+    _log(f"  backend: {backend}, forces: {force_str}")
 
     # q_scaler: local shard -> all_reduce
-    _log("Computing q_scaler (all-reduce across shards)...")
     t_qs = time.time()
     q_min, q_max = _compute_q_scaler_sharded(model, data_store, backend=backend)
     model.set_q_scaler(q_min, q_max)
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  Done in {time.time() - t_qs:.1f}s")
+    _log(f"  q_scaler in {time.time() - t_qs:.1f}s (all-reduce across shards)")
 
     if use_compile and hasattr(torch, "compile"):
-        _log("Compiling model with torch.compile...")
         model = torch.compile(model)
+        _log("  torch.compile: enabled")
 
     # Wrap in a shim whose forward calls compute_properties{_cached} — this
     # keeps the force/virial compute on DDP's forward path so the reducer can
@@ -432,7 +437,7 @@ def train_nep_sharded(
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
-        scheduler_patience, step_size, stop_lr)
+        scheduler_patience, stop_lr)
 
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
@@ -442,7 +447,7 @@ def train_nep_sharded(
     if stage2:
         stage2_scheduler = _make_lr_scheduler(
             optimizer, lr_scheduler_mode, scheduler_factor,
-            scheduler_patience, step_size, stop_lr)
+            scheduler_patience, stop_lr)
         if use_swa and is_main:
             swa_model = AveragedModel(raw_model)
 
@@ -490,32 +495,15 @@ def train_nep_sharded(
             loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                            "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
 
-    backend_str = {
-        "loop": "PyTorch type-pair loop",
-        "bmm":  "PyTorch fancy-index + torch.bmm (batched GEMM)",
-    }.get(backend, backend)
-    force_str = ("autograd (create_graph)" if use_autograd_forces
-                 else "analytical")
-    clip_str = f"grad_clip={max_grad_norm}" if max_grad_norm > 0 else "no grad clip"
-    _log(f"\nTraining: epochs {start_epoch}-{num_epochs}, "
-         f"batch={batch_size}, dtype={precision}")
-    _log(f"Backend: {backend_str} | forces: {force_str} | "
-         f"{clip_str} | loss: MSE")
-    if lr_scheduler_mode == "step":
-        sched_desc = (f"StepLR(step_size={step_size}, gamma={scheduler_factor})"
-                      f", stop_lr={stop_lr}")
-    else:
-        sched_desc = (f"ReduceLROnPlateau(patience={scheduler_patience}, "
-                      f"factor={scheduler_factor}), stop_lr={stop_lr}")
-    _log(f"LR: {lr}, {sched_desc}")
-    _log(f"Loss weights: E={pref_e}  F={pref_f}  V={pref_v}")
-    if stage2:
-        _log(f"Stage 2: epoch {start_stage2}->{num_epochs}, "
-             f"lr={stage2_lr}, {sched_desc}, "
-             f"SWA={'ON' if use_swa else 'OFF'}")
-        _log(f"Stage 2 weights: E={stage2_pref_e}  "
-             f"F={stage2_pref_f}  V={stage2_pref_v}")
-    _log("-" * 72)
+    # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
+    # already printed by format_config_summary above; here we just announce
+    # the runtime epoch range — different from `epoch` in nep.in when
+    # resuming from a checkpoint.
+    stage2_tag = (f", Stage 2 from epoch {start_stage2} "
+                  f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
+    _log("")
+    _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
+    _log("=" * 72)
 
     train_t0 = time.time()
 

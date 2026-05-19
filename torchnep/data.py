@@ -314,8 +314,6 @@ def parse_nep_in(filename: str) -> Dict:
                     raise ValueError(
                         f"lr_scheduler must be 'plateau' or 'step', got {parts[1]!r}")
                 params["lr_scheduler"] = mode
-            elif key == "step_size":
-                params["step_size"] = int(parts[1])
             elif key == "max_grad_norm":
                 params["max_grad_norm"] = float(parts[1])
             elif key == "stage2":
@@ -331,29 +329,33 @@ def parse_nep_in(filename: str) -> Dict:
             elif key == "stage2_lambda_v":
                 params["stage2_pref_v"] = float(parts[1])
 
+    # Snapshot the explicit (user-set) keys before applying defaults so the
+    # trainer can report which values came from nep.in vs which fell back
+    # to a default.
+    explicit = set(params.keys())
+
     # Defaults — model architecture
     params.setdefault("version", 4)
-    params.setdefault("cutoff_radial", 6.0)
-    params.setdefault("cutoff_angular", 6.0)
-    params.setdefault("n_max_radial", 4)
-    params.setdefault("n_max_angular", 4)
-    params.setdefault("basis_size_radial", 12)
-    params.setdefault("basis_size_angular", 12)
-    # GPUMD default: L_max=4, has_q_222=1 (i.e. 4-body on), others off.
-    # Old 3-field default [4, 2, 0] is still accepted (the 2 is treated as
-    # boolean truthy for has_q_222).
+    params.setdefault("cutoff_radial", 8.0)
+    params.setdefault("cutoff_angular", 4.0)
+    params.setdefault("n_max_radial", 6)
+    params.setdefault("n_max_angular", 6)
+    params.setdefault("basis_size_radial", 6)
+    params.setdefault("basis_size_angular", 6)
+    # Matches GPUMD default: L_max=4, has_q_222=1 (4-body on), others off.
+    # Legacy 3-field form `l_max <L> <l_max_4b> <l_max_5b>` is still accepted
+    # in nep.in — every trailing field is normalised to 0/1 in NEPModel.
     params.setdefault("l_max", [4, 1, 0, 0, 0])
-    params.setdefault("neuron", 40)
+    params.setdefault("neuron", 30)
 
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
-    params.setdefault("num_epochs", 200)
-    params.setdefault("batch_size", 1000)
+    params.setdefault("num_epochs", 300)
+    params.setdefault("batch_size", 32)
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
-    params.setdefault("scheduler_patience", 50)
-    params.setdefault("scheduler_factor", 0.8)
+    params.setdefault("scheduler_patience", 15)
+    params.setdefault("scheduler_factor", 0.7)
     params.setdefault("lr_scheduler", "plateau")
-    params.setdefault("step_size", 100)
     params.setdefault("max_grad_norm", 10.0)
     params.setdefault("lambda_e", 1.0)
     params.setdefault("lambda_f", 100.0)
@@ -363,11 +365,15 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("stage2", False)
     # Defaults for optional stage-2 parameters (only used if stage2=1)
     params.setdefault("stage2_lr", 1e-3)
-    params.setdefault("stage2_pref_e", 1000.0)
+    params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 100.0)
-    params.setdefault("stage2_pref_v", 10.0)
+    params.setdefault("stage2_pref_v", 1.0)
     # start_stage2 defaults to 0.75 * num_epochs if not set — handled in trainer
 
+    # Stash explicit-key set in the dict itself; consumers can read it (and
+    # safely ignore it). Leading underscore so it can't collide with nep.in
+    # tokens.
+    params["_explicit"] = explicit
     return params
 
 
