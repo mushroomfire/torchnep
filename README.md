@@ -5,15 +5,12 @@ A PyTorch implementation of [NEP4](https://gpumd.org/theory/nep.html) (Neuroevol
 ## Features
 
 - **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
-- **Two compute backends auto-picked by element count** — `"loop"` (Python type-pair loop, best for few types) and `"bmm"` (fancy-index + `torch.bmm`, best for ≥8 types). Both pure PyTorch; works on CPU / CUDA / MPS. Set `backend="auto"` and the trainer picks the right one.
-- **Two-stage training** — Stage 1: force-focused; Stage 2: energy fine-tuning (optional Stochastic Weight Averaging). An `nep_stage1.pt` / `nep_stage1.txt` snapshot is written the instant Stage 2 kicks in, so you can restart from end-of-Stage-1 with different Stage-2 weights if the first choice was wrong.
-- **Two LR scheduler modes** — `plateau` (ReduceLROnPlateau — default, drops LR after N epochs with no improvement) or `step` (StepLR — drops LR every N epochs at a fixed rate). Stage 1 and Stage 2 share the mode.
-- **Channel weights can be zero** — setting `lambda_f` or `lambda_v` to 0 **skips the corresponding forward + backward entirely** (faster epoch, less memory). Stage 2 can turn a channel back on: per-epoch compute eligibility is re-evaluated from the active stage's weights, so Stage 1 `lambda_v=0` → Stage 2 `stage2_lambda_v>0` trains virial only in Stage 2.
-- **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`; each rank holds only `1/N` of the structures (single-node and multi-node SLURM launch snippets in the README)
+- **Two-stage training** — Stage 1: force-focused; Stage 2: energy fine-tuning
+- **Two LR scheduler modes** — `plateau` (ReduceLROnPlateau — default, drops LR after N epochs with no improvement) or `step` (StepLR — drops LR every N epochs at a fixed rate). Stage 1 and Stage 2 share the mode
+- **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`
 - **Fine-tuning** — load any `nep.txt` or `nep_best.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
-- **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`; resume with one flag. Loss weights are stored in the checkpoint; if you edit them in `nep.in` between runs, `best_loss` is reset automatically so the new scale can establish a new best.
+- **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`
 - **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
-- **Batched prediction** — full-dataset prediction using pre-cached GPU basis, typically 10–50× faster than per-frame evaluation
 
 ---
 
@@ -24,8 +21,6 @@ pip install -e .
 ```
 
 Requirements: `torch >= 2.0`, `numpy`.
-
-Pure PyTorch — no native extensions to compile.
 
 ---
 
@@ -45,17 +40,7 @@ backend that PyTorch itself supports. The four that are handled explicitly
 
 Any other PyTorch device that behaves like a standard stream-based
 accelerator (exposes `.to(dev)` plus the usual tensor ops) should work if
-you pass it explicitly, e.g. `train_nep(..., device="<name>")`. The only
-device-specific code paths are `torch.cuda.synchronize()` /
-`torch.cuda.empty_cache()` calls used for timing accuracy on CUDA/ROCm;
-they are skipped on other backends, so correctness is unaffected but the
-reported per-epoch seconds may include a small amount of async queueing
-overhead.
-
-No custom kernels: both compute backends (`"loop"` and `"bmm"`) are pure
-PyTorch. `"bmm"` dispatches to whatever `torch.bmm` uses on your device
-(cuBLAS on CUDA, rocBLAS on ROCm, oneDNN on XPU, MKL/Accelerate on CPU,
-MPS on Apple).
+you pass it explicitly, e.g. `train_nep(..., device="<name>")`.
 
 ---
 
@@ -113,12 +98,6 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
   (full PBC makes this exact).
 - `force:R:3` or `forces:R:3` — reference force in eV/Å (optional).
 
-Example frame header:
-
-```text
-Lattice="5.43 0 0 0 5.43 0 0 0 5.43" Properties=species:S:1:pos:R:3:forces:R:3 energy=-123.45 stress="0.001 0 0 0 0.001 0 0 0 0.001" pbc="T T T"
-```
-
 ---
 
 ## Training
@@ -132,8 +111,6 @@ torchnep has **two entry points** with non-overlapping responsibilities:
 | Dataset per GPU | Full copy | `1/N` shard (linear scale-out) |
 | Use it when | Dataset fits on one card | Dataset too large for one card, or you want the speedup |
 
-Pick the one that matches your hardware. There is no `train_nep` multi-GPU mode any more — multi-GPU **must** go through `train_nep_sharded`.
-
 ### Single GPU / CPU / MPS — `train_nep`
 
 ```python
@@ -144,9 +121,6 @@ train_nep(
     config_file="nep.in",
     data_file="train.xyz",
     output_dir="output",
-    device="cuda",          # "cuda" | "xpu" | "mps" | "cpu" — auto-detected if omitted
-    backend="auto",         # "auto" | "loop" | "bmm" — see table below
-    use_compile=True,       # torch.compile (~10% extra speedup)
 )
 ```
 
@@ -156,7 +130,7 @@ python run_train.py
 
 ### Multi-GPU, single node — `train_nep_sharded`
 
-Each rank loads only `1/N` of the structures, so total GPU memory for the data store scales as `1/N` instead of being replicated. The descriptor normalization (`q_scaler`) and energy shift (`b1`) are all-reduced across ranks, gradients are all-reduced via DDP.
+Each rank loads only `1/N` of the structures, so total GPU memory for the data store scales as `1/N`.
 
 ```python
 # run_train.py
@@ -168,8 +142,6 @@ train_nep_sharded("nep.in", "train.xyz", output_dir="output")
 torchrun --standalone --nproc_per_node=4 run_train.py    # 4 GPUs on this node
 ```
 
-`--standalone` lets torchrun pick a free local port; no rendezvous configuration needed for one node. Plain `python run_train.py` will **not** work for the sharded entry point.
-
 ### Multi-GPU, multi-node (SLURM) — `train_nep_sharded` + sbatch
 
 For 1 node × N GPUs, use the `torchrun --standalone --nproc_per_node=N run_train.py`
@@ -178,9 +150,9 @@ SLURM directives are:
 
 ```bash
 #SBATCH --nodes=2                  # M nodes
-#SBATCH --ntasks-per-node=1        # 1 srun task per node; torchrun fans out to N GPUs
+#SBATCH --ntasks-per-node=1        # 1 srun task per node; torchrun fans out to all GPUs
 #SBATCH --gpus-per-node=4          # N GPUs per node
-#SBATCH --cpus-per-task=16         # CPU cores per node (preprocess workers share these)
+#SBATCH --cpus-per-task=16         # CPU cores per node (XYZ preprocessing pool shares these)
 ```
 
 and the launch line:
@@ -192,7 +164,7 @@ MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
 srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
   torchrun \
     --nnodes=$SLURM_NNODES \
-    --nproc_per_node=4 \
+    --nproc_per_node=\$SLURM_GPUS_ON_NODE \
     --node_rank=\$SLURM_NODEID \
     --rdzv_id=$SLURM_JOB_ID \
     --rdzv_backend=c10d \
@@ -201,50 +173,30 @@ srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
 "
 ```
 
-**Multi-node gotchas:**
+`\$SLURM_GPUS_ON_NODE` (set by `--gpus-per-node`) keeps `nproc_per_node` in
+sync with the allocation without hard-coding the GPU count. Backslash-escape
+the SLURM-task-local vars (`\$SLURM_NODEID`, `\$SLURM_GPUS_ON_NODE`) so they
+expand inside each `srun` task; bare `$` would substitute at sbatch parse time.
 
-- `--ntasks-per-node=1` (not `=N`): SLURM only launches torchrun once per node; torchrun handles the local fan-out. Mixing the two is a common deadlock source.
-- `\$SLURM_NODEID` keeps the backslash so each node's child shell evaluates it (gives node rank 0, 1, …, M-1). Without it both nodes get the same rank → rendezvous hangs.
-- `MASTER_ADDR` comes from `scontrol show hostnames` (expands SLURM's compressed nodelist like `gpu[01-02]`).
-- If the cluster has multiple network interfaces, you may need `export NCCL_SOCKET_IFNAME=^lo,docker` to avoid loopback / docker bridges.
-- No Infiniband? `export NCCL_IB_DISABLE=1` falls back to TCP.
-
-**How sharding interacts with batch size and learning rate:**
-
-- `batch` in `nep.in` is the **per-rank** batch size. With 4 GPUs and `batch 64`, the effective global batch is `4 × 64 = 256`.
-- After scaling up the global batch, the learning rate often needs to scale too. Common rules of thumb:
-  - **SGD-like optimizers** → linear: `lr_new = lr_single × world_size`
-  - **Adam / AMSGrad** (what torchnep uses) → square-root or smaller: `lr_new ≈ lr_single × √world_size`, often even less.
-- A safer recipe if unsure: keep `lr` the same as the single-GPU value, watch the first 5–10 epochs, and only bump it up if loss is descending steadily. Bumping it down if loss diverges or stalls.
-- CPU cores per rank for preprocessing default to `cpu_count() / LOCAL_WORLD_SIZE`. On a 16-core node with 4 GPUs that's 4 workers per rank — already balanced. Override with `TORCHNEP_PREPROC_WORKERS=N` if needed.
-
-### Verifying the multi-GPU launch worked
-
-When you submit, the stdout banner should look like (rank 0 only prints):
-
-```
-Backend  : CUDA (DDP, 4 processes)        ← world_size matches your nproc × nnodes
-Mode     : data-sharded DDP (4 ranks, each holds 1/4 of structures)
-```
-
-`nvidia-smi` on each node should show all GPUs busy. If after 2 minutes there is no progress past the banner, rendezvous is hanging — set `export NCCL_DEBUG=INFO` and resubmit to see where the handshake stalls.
+On some clusters the NCCL transport needs help finding the right NIC
+(e.g. `NCCL_SOCKET_IFNAME=ib0`) or fabric (`NCCL_IB_HCA=...`). torchnep
+itself doesn't override these; set them in your sbatch script if multi-node
+all-reduce hangs.
 
 ---
 
 ## Training Parameters
-
-All parameters can be set in `nep.in` or passed as keyword arguments to `train_nep` / `train_nep_sharded`.  Keyword arguments take precedence over `nep.in`.
 
 ### Model architecture (GPUMD-compatible)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `type` | required | `N name1 name2 ...` — number and names of element types |
-| `cutoff` | `6.0 6.0` | Radial and angular cutoff (Å) |
-| `n_max` | `4 4` | Radial and angular expansion orders |
-| `basis_size` | `12 12` | Chebyshev basis functions per channel |
-| `l_max` | `4 2 0` | Max L for 3-body, 4-body, 5-body terms |
-| `neuron` | `40` | Hidden layer width |
+| `cutoff` | `8.0 4.0` | Radial and angular cutoff (Å) |
+| `n_max` | `6 6` | Radial and angular expansion orders |
+| `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular). Max 16 |
+| `l_max` | `4 1 0 0 0` | `L_3b has_q_222 has_q_1111 has_q_112 has_q_1122` — max L of 3-body terms (1–8) plus four boolean flags enabling each mixed-body invariant. Legacy 3-field form `L l_max_4b l_max_5b` is still accepted |
+| `neuron` | `30` | Hidden layer width |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
 
@@ -252,8 +204,8 @@ All parameters can be set in `nep.in` or passed as keyword arguments to `train_n
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `epoch` | `200` | Total training epochs |
-| `batch` | `1000` | Structures per gradient step |
+| `epoch` | `300` | Total training epochs |
+| `batch` | `32` | Structures per gradient step |
 | `lr` | `0.01` | Initial learning rate |
 | `stop_lr` | `1e-6` | Minimum learning rate (scheduler floor) |
 | `lambda_e` | `1.0` | Energy loss weight |
@@ -262,12 +214,9 @@ All parameters can be set in `nep.in` or passed as keyword arguments to `train_n
 | `lambda_1` | `0.0` | L1 regularisation |
 | `lambda_2` | `0.0` | L2 regularisation (weight decay) |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
-| `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode. |
-| `scheduler_patience` | `50` | `plateau` mode: epochs without improvement before LR reduction |
-| `scheduler_factor` | `0.8` | LR reduction factor — multiplied on each decay in both modes |
-| `step_size` | `100` | `step` mode: epochs between LR decays |
-
-Loss is plain MSE. A loss weight of `0` (e.g. `lambda_v 0`) **skips** that channel's forward and backward entirely — no output accumulation, no autograd edges, no gradient contribution. Use this to speed up Stage 1 runs that only need E+F, or to leave virial compute off until Stage 2 turns it back on with `stage2_lambda_v`. Hyperparameters are **read from `nep.in` only** — no function-argument override.
+| `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
+| `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
+| `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 
 ### Stage 2 (energy fine-tuning, optional)
 
@@ -276,9 +225,9 @@ Loss is plain MSE. A loss weight of `0` (e.g. `lambda_v 0`) **skips** that chann
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 75 % of epochs | Epoch to switch to Stage 2 |
 | `stage2_lr` | `1e-3` | Stage 2 learning rate |
-| `stage2_lambda_e` | `1000.0` | Stage 2 energy weight |
+| `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `100.0` | Stage 2 force weight |
-| `stage2_lambda_v` | `10.0` | Stage 2 virial weight |
+| `stage2_lambda_v` | `1.0` | Stage 2 virial weight |
 
 SWA (Stochastic Weight Averaging) is opt-in via the **function argument** `use_swa=True` (not a `nep.in` key, since it is an optional feature).
 
@@ -286,26 +235,7 @@ SWA (Stochastic Weight Averaging) is opt-in via the **function argument** `use_s
 
 ```
 type 3 Cr Co Ni
-cutoff     6 4
-n_max      8 8
-basis_size 12 12
-l_max      4 2 1
-neuron     80
-
-lambda_e   1.0
-lambda_f   100.0
-lambda_v   1.0
-
-epoch      1000
-batch      64
-lr         0.01
-stop_lr    1e-6
-
-stage2           1
-start_stage2     750
-stage2_lambda_e  1000.0
-stage2_lambda_f  100.0
-stage2_lambda_v  10.0
+stage2 1
 ```
 
 ### Runtime arguments (function kwargs)
@@ -337,22 +267,20 @@ launch time:
 
 | File | Contents |
 |------|----------|
-| `nep_best.txt`     | **Best-loss** model (GPUMD-compatible) — rewritten whenever `avg_loss < best_loss` |
-| `nep_best.pt`      | Same weights as PyTorch state_dict |
-| `nep_stage1.txt`   | **End-of-Stage-1** snapshot (only when `stage2=1`) — written the instant Stage 2 kicks in; lets you restart from there with different Stage-2 weights |
-| `nep_stage1.pt`    | Same Stage-1-end weights as PyTorch state_dict |
+| `nep_best.txt` / `nep_best.pt` | **Best-loss** model (GPUMD-compatible / PyTorch state_dict). Rewritten whenever `avg_loss < best_loss` |
+| `nep_stage1.txt` / `nep_stage1.pt` | **End-of-Stage-1** snapshot (only when `stage2=1`) — written the instant Stage 2 kicks in; lets you restart with different Stage-2 weights |
 | `nep_final.txt`    | Model at the **last** epoch (used for the end-of-training predict) |
-| `nep_average.txt`  | **SWA-averaged** model — only when `use_swa=True` |
-| `nep_average.pt`   | SWA weights as PyTorch state_dict |
+| `nep_average.txt` / `nep_average.pt` | **SWA-averaged** model — only when `use_swa=True` |
 | `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch + loss weights |
-| `output.log`       | Full training log |
-| `loss.out`         | Per-epoch loss / RMSE (for plotting) |
-| `energy_predict.out`, `force_predict.out`, `virial_predict.out` | Interim parity plot (every `prediction_interval` epochs, **nep_best weights**), replaced at end of training by final-epoch prediction |
-| `loss.out` | Per-epoch: loss, RMSE_E (meV/atom), RMSE_F (eV/Å), RMSE_V, gnorm |
-| `output.log` | Full console log |
-| `energy_predict.out` | Per-structure energy predictions vs targets |
-| `force_predict.out` | Per-atom force predictions vs targets |
-| `virial_predict.out` | Per-structure virial predictions vs targets |
+| `output.log`       | Full console log |
+| `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa), gnorm |
+| `energy_predict.out` | Per-frame predicted vs reference E/atom (eV/atom) |
+| `force_predict.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
+| `virial_predict.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
+| `stress_predict.out` | Per-frame predicted vs reference stress (GPa); negated wrt `virial_predict.out` so input and output stress carry the same sign |
+| `descriptor_predict.out` | Scaled descriptor `q * q_scaler` — only when `output_descriptor` is passed to `predict_dataset` |
+
+The `*_predict.out` files are rewritten every `prediction_interval` epochs using **`nep_best` weights** as a live parity plot, then replaced at end of training by a final-epoch prediction. Format matches GPUMD's `*_train.out` so the two can be diffed column by column.
 
 ---
 
@@ -380,7 +308,7 @@ value-only changes. Structural changes (architecture, shapes) are not safe.
 | `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
 | `stage2_lr` | Yes | Re-applied when Stage 2 resumes (overrides optimizer state) |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
-| `scheduler_patience` / `scheduler_factor` / `step_size` | Yes | Applied immediately |
+| `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
 | `lr` (Stage 1) | **No** directly | Overridden by saved optimizer state — pass `reset_lr=<new>` to override |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
@@ -388,40 +316,6 @@ To force a new Stage-1 learning rate after resuming (e.g. LR has decayed to `sto
 
 ```python
 train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
-```
-
-### Restarting from end-of-Stage-1
-
-When `stage2=1`, the trainer writes `nep_stage1.pt` + `nep_stage1.txt` the
-instant Stage 2 kicks in (before any Stage-2 optimizer step). If the Stage-2
-weights turn out wrong, you do not have to rerun Stage 1:
-
-```python
-# edit stage2_lambda_* in nep.in, then:
-train_nep(
-    "nep.in", "train.xyz",
-    output_dir="output_v2",
-    finetune_from="output/nep_stage1.pt",
-)
-```
-
-`finetune_from` re-runs Stage 1 from those weights; to skip Stage 1 entirely
-and jump straight into Stage 2 on the new weights, set `start_stage2=1` in
-`nep.in` (or any value ≤ the first epoch of the new run).
-
-### Inspecting checkpoint files
-
-```python
-import torch
-
-# Best model weights only
-state = torch.load("output/nep_best.pt", map_location="cpu")
-print(list(state.keys()))
-# ['c_param_2', 'c_param_3', 'fitting_nets.0.w0', ..., 'b1', 'q_scaler', ...]
-
-# Full checkpoint
-ckpt = torch.load("output/checkpoint.pt", map_location="cpu")
-print(ckpt["epoch"], ckpt["best_loss"])
 ```
 
 ---
@@ -438,8 +332,7 @@ train_nep(
     "new_data.xyz",
     output_dir="finetune_output",
     finetune_from="pretrained/nep.txt",   # or "pretrained/nep_best.pt"
-    lr=1e-3,
-    num_epochs=200,
+    slim_types=True,
 )
 ```
 
@@ -448,32 +341,13 @@ train_nep(
 - `nep_best.pt` — PyTorch state dict
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
+If the new dataset contains fewer element types than the original model, setting `slim_types=True` removes the unused types **before training begins**.  This reduces the model size and makes training faster,
+
 What happens internally:
 - All trainable weights (`c_param`, fitting nets, `b1`) are loaded from the source model
 - `q_scaler` is **recomputed** from the new dataset (descriptor statistics change with new data)
 - A fresh optimizer is created — no momentum carryover from the original training
 - Any existing `checkpoint.pt` in `output_dir` is ignored when `finetune_from` is set
-
-### Fine-tuning with model slimming
-
-If the new dataset contains fewer element types than the original model, setting `slim_types=True` removes the unused types **before training begins**.  This reduces the model size and makes training faster, because smaller `c_param` matrices and fewer fitting networks mean less computation per batch.
-
-```python
-# Original model: Cr Co Ni (3 types)
-# New data: only Cr and Ni structures
-
-train_nep(
-    "nep.in",            # still lists all 3 types (must match source arch)
-    "new_data.xyz",
-    output_dir="finetune_output",
-    finetune_from="pretrained/nep.txt",
-    slim_types=True,     # detect types from data, slim before training
-    lr=1e-3,
-)
-# output nep.txt will contain only [Cr, Ni]
-```
-
-`slim_types=True` can also be used without `finetune_from` (training from scratch on a subset of the types listed in `nep.in`).
 
 ### Standalone model slimming (no retraining)
 
@@ -508,9 +382,9 @@ result = calc.compute(
     positions=np.array([[0,0,0],[1.5,0,0],[3,0,0]]),
     cell=np.eye(3) * 6.0,
 )
-print(result["energy"])     # total energy (eV)
-print(result["forces"])     # (N, 3) forces (eV/Å)
-print(result["virial"])     # (N, 9) per-atom virial (eV)
+print(result["energy"])         # (N,) per-atom energy (eV); sum for total
+print(result["forces"])         # (N, 3) forces (eV/Å)
+print(result["virial"])         # (N, 9) per-atom virial (eV)
 ```
 
 ### Full-dataset prediction
@@ -524,86 +398,10 @@ predict_dataset(
     "nep.txt",
     "test.xyz",
     output_dir="results",
-    dtype="float64",   # float32 or float64
+    dtype="float64",       # float32 or float64
     batch_size=64,
+    output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
 )
-# writes: energy_predict.out, force_predict.out, virial_predict.out
-```
-
----
-
-## Compute Backends
-
-Two implementations of the same type-pair contraction
-`q[i,n] = Σ_k c[t1,t2,n,k]·basis[p,k]` → scatter. Pick one with `backend=`:
-
-| `backend=` | Implementation | Best for |
-|---|---|---|
-| `"loop"` | nested `for t1, t2` over type pairs, small matmul + scatter per pair | **few types** (≤ ~7) — outer loop runs few iterations |
-| `"bmm"`  | fancy-index `c[t1, t2]` then `torch.bmm` (one batched GEMM) | **many types** (≥ 8) — one kernel launch beats the Python loop |
-| `"auto"` (default) | picks `bmm` if `num_types ≥ 8` else `loop` | everything |
-
-Both backends are pure PyTorch, fully autograd-differentiable, and work on CPU / CUDA / MPS (`torch.bmm` dispatches to cuBLAS / MKL / MPS respectively). They compute the same function — float64 output agrees to machine precision.
-
-Measured one-epoch training wall-time on RTX A2000, float32 (single-GPU, see `probe/`):
-
-| Dataset | num_types | loop | bmm | auto picks |
-|---|---:|---:|---:|---|
-| Si (2474f, BS=64) | 1 | **~2 s** | ~13 s | loop |
-| AlO (2190f, BS=64) | 2 | **2.1 s** | 16.2 s | loop |
-| CrCoNi (3030f, BS=64) | 3 | **2.2 s** | 11.1 s | loop |
-| NEP53 (3000f, BS=100) | 53 | 26 s | **2.2 s** | bmm |
-
-Orthogonal force toggle: `use_autograd_forces=True` switches to autograd-through-rij forces (slower, used only as a gold standard in tests — the analytical path matches it to float precision).
-
----
-
-## Architecture
-
-### Descriptor
-
-- **Radial (2-body):** Chebyshev polynomials with cosine cutoff, contracted with learnable `c_param_2 (nt, nt, n_max+1, basis_size+1)`
-- **Angular (3-body):** Solid harmonic basis accumulated per atom, contracted via C3B coefficients; learnable `c_param_3`
-- **4-body:** Cubic invariants of L=2 angular moments
-- **5-body:** Quartic invariants of L=1 angular moments
-
-Descriptor dimension = `(n_max_radial+1) + (n_max_angular+1)*l_max_3b + ...` — independent of the number of element types.
-
-### Neural network
-
-One per-type single-hidden-layer network: `tanh(q @ W₀ − b₀) @ w₁ − b₁`
-
-GPUMD convention: bias is subtracted, not added; `b₁` is a single shared scalar across all types.
-
-### Training loss
-
-```
-L = λ_e · MSE(E_pred/N, E_ref/N)
-  + λ_f · MSE(F_pred, F_ref)
-  + λ_v · MSE(V_pred/N, V_ref/N)
-```
-
-The banner `loss` column printed every epoch equals this same weighted-MSE
-sum recomputed per-sample across the whole epoch (not a per-batch mean),
-so it is self-consistent with the `RMSE_E / RMSE_F / RMSE_V` columns.
-
----
-
-## Project Structure
-
-```
-torchnep/
-  model.py        — NEPModel (nn.Module), FittingNet, slim_model
-  train.py        — train_nep (single-GPU / CPU / MPS, plain python launcher)
-  train_sharded.py — train_nep_sharded (multi-GPU only, torchrun launcher)
-  nep.py          — NEPCalculator (inference from nep.txt)
-  predict.py      — predict_dataset (batched full-dataset prediction)
-  data.py         — read_xyz, parse_nep_in, build_neighbor_list_np
-  ops.py          — basis functions, descriptors, analytical forces (pure PyTorch)
-  constants.py    — physical constants, element data, C3B/C4B/C5B, Z_COEFFICIENT
-example/
-  run_train.py      — typical single-GPU entry point users edit
-  run_fine_tune.py  — fine-tuning entry point (loads pretrained nep.txt)
-  nep*.in           — example hyperparameter files
-  train*.xyz        — example extxyz datasets
+# writes energy_predict.out, force_predict.out, virial_predict.out,
+# stress_predict.out, and (when output_descriptor != 0) descriptor_predict.out
 ```
