@@ -2,15 +2,7 @@
 /*/__py*/
 /*info
 /example/*ipynb*
-/example/output*/*
-/example/valid*/*
-/example/run_test*
-/example/bench*
-/example/fine*/*
-/example/prof*
-/example/run*
-/example/nep_lmax*
-/example/test*
+/example/*/output
 /check*
 /eval*
 /build/*
