@@ -9,6 +9,8 @@ Supports per-type NN architecture with ZBL (including typewise cutoffs).
 Uses ops module for core computations (pure PyTorch or CUDA).
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -61,17 +63,31 @@ class NEPModel(nn.Module):
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
         self.basis_size_angular = config["basis_size_angular"]
-        # ``l_max`` accepts both the legacy 3-field form (where positions
-        # 1, 2 were "max L for 4b / 5b" but used as booleans) and the new
-        # 5-field form (has_q_222, has_q_1111, has_q_112, has_q_1122).
-        # Everything past index 0 is normalised to a 0/1 flag here.
+        # ``l_max`` accepts the legacy 3-field form (positions 1,2 were
+        # "max L for 4b/5b", used as booleans) up to the GPUMD PR #1517
+        # 7-field form. Everything past index 0 is normalised to a 0/1 flag:
+        #   [L_max, q_222, q_1111, q_112, q_1122, q_123, q_233]
         lm = list(config["l_max"])
         self.l_max_3b = lm[0]
         self.has_q_222  = 1 if (len(lm) > 1 and lm[1] > 0) else 0
         self.has_q_1111 = 1 if (len(lm) > 2 and lm[2] > 0) else 0
         self.has_q_112  = 1 if (len(lm) > 3 and lm[3] > 0) else 0
         self.has_q_1122 = 1 if (len(lm) > 4 and lm[4] > 0) else 0
+        self.has_q_123  = 1 if (len(lm) > 5 and lm[5] > 0) else 0
+        self.has_q_233  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
         self.num_neurons = config["neuron"]
+
+        # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
+        if (self.has_q_123 or self.has_q_233) and self.l_max_3b < 3:
+            raise ValueError("q_123 / q_233 require l_max_3b >= 3")
+        # q_1111 is redundant: it equals const * (3-body L=1 descriptor)^2,
+        # so it adds no information. Kept for backward compatibility, but warn.
+        if self.has_q_1111:
+            warnings.warn(
+                "has_q_1111 (l_max field 3) is set but is redundant — it "
+                "equals a constant times the squared 3-body L=1 descriptor "
+                "and adds no information. You can safely set it to 0.",
+                stacklevel=2)
 
         # ZBL
         self.zbl = config.get("zbl", None)
@@ -104,9 +120,12 @@ class NEPModel(nn.Module):
         self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
         self.dim_angular_1122 = n_ap1 if self.has_q_1122 else 0
+        self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
+        self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
-                    self.dim_angular_112 + self.dim_angular_1122)
+                    self.dim_angular_112 + self.dim_angular_1122 +
+                    self.dim_angular_123 + self.dim_angular_233)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         # Learnable c parameters
@@ -157,6 +176,7 @@ class NEPModel(nn.Module):
             self._c4b2, self._c5b2,
             rij_rad.dtype, rij_rad.device,
             backend=backend,
+            has_q_123=self.has_q_123, has_q_233=self.has_q_233,
         )
 
     def forward(self, rij_rad, rij_ang, pi_rad, pj_rad,
@@ -265,6 +285,7 @@ class NEPModel(nn.Module):
                 dtype, device,
                 return_intermediates=True,
                 backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             )
         else:
             q = ops.compute_descriptors_cached(
@@ -279,6 +300,7 @@ class NEPModel(nn.Module):
                 self._c4b2, self._c5b2,
                 dtype, device,
                 backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             )
             s = gn_ang = None
 
@@ -376,6 +398,7 @@ class NEPModel(nn.Module):
                 dtype, device,
                 compute_virial=need_virial,
                 backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             )
             if zbl_forces is not None:
                 forces = forces + zbl_forces
@@ -505,9 +528,15 @@ class NEPModel(nn.Module):
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
-        lines.append(
-            f"l_max {self.l_max_3b} {self.has_q_222} {self.has_q_1111} "
-            f"{self.has_q_112} {self.has_q_1122}")
+        # GPUMD PR #1517 l_max line: up to 7 fields. Trailing zero flags are
+        # omitted to match GPUMD's writer (it only prints q_123/q_233 columns
+        # when needed), keeping older GPUMD readers happy when they're off.
+        lmax_flags = [self.l_max_3b, self.has_q_222, self.has_q_1111,
+                      self.has_q_112, self.has_q_1122,
+                      self.has_q_123, self.has_q_233]
+        while len(lmax_flags) > 5 and lmax_flags[-1] == 0:
+            lmax_flags.pop()
+        lines.append("l_max " + " ".join(str(x) for x in lmax_flags))
         lines.append(f"ANN {self.num_neurons} 0")
 
         # Per-type NN weights
@@ -579,7 +608,8 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         "basis_size_radial":  model.basis_size_radial,
         "basis_size_angular": model.basis_size_angular,
         "l_max":              [model.l_max_3b, model.has_q_222, model.has_q_1111,
-                               model.has_q_112, model.has_q_1122],
+                               model.has_q_112, model.has_q_1122,
+                               model.has_q_123, model.has_q_233],
         "neuron":             model.num_neurons,
     }
     if model.zbl is not None:
