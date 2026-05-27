@@ -163,10 +163,10 @@ def predict_dataset(
     """Run batched prediction on a full dataset and save GPUMD-format outputs.
 
     Outputs (per-atom for energy and virial; per-atom raw for forces):
-      - energy_predict.out:  e_pred  e_target              (eV/atom, per frame)
-      - force_predict.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
-      - virial_predict.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
-      - descriptor_predict.out (only when ``output_descriptor != 0``):
+      - energy_train.out:  e_pred  e_target              (eV/atom, per frame)
+      - force_train.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
+      - virial_train.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
+      - descriptor.out (only when ``output_descriptor != 0``):
           mode 1 — per-frame averaged scaled descriptor, one row per frame
           mode 2 — per-atom scaled descriptor, one row per atom
         Matches GPUMD's ``output_descriptor`` / ``descriptor.out`` schema.
@@ -178,8 +178,8 @@ def predict_dataset(
     ----------
     output_descriptor : int
         0 — disabled (default).
-        1 — write per-frame averaged ``q * q_scaler`` to descriptor_predict.out.
-        2 — write per-atom ``q * q_scaler`` to descriptor_predict.out.
+        1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
+        2 — write per-atom ``q * q_scaler`` to descriptor.out.
 
     ``backend`` in {"auto", "loop", "bmm"} — see
     ``torchnep.ops.resolve_backend``.
@@ -423,17 +423,17 @@ def predict_dataset(
     os.makedirs(output_dir, exist_ok=True)
 
     e_ref_pa = energy_ref / natoms_arr.astype(np.float64)
-    np.savetxt(os.path.join(output_dir, "energy_predict.out"),
+    np.savetxt(os.path.join(output_dir, "energy_train.out"),
                np.column_stack([e_pred_arr, e_ref_pa]), fmt="%.10g")
 
     if forces_ref is None:
         forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
     if f_pred_arr is None:
         f_pred_arr = np.zeros((N_atoms_total, 3), dtype=np.float64)
-    np.savetxt(os.path.join(output_dir, "force_predict.out"),
+    np.savetxt(os.path.join(output_dir, "force_train.out"),
                np.column_stack([f_pred_arr, forces_ref]), fmt="%.10g")
 
-    np.savetxt(os.path.join(output_dir, "virial_predict.out"),
+    np.savetxt(os.path.join(output_dir, "virial_train.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
 
     # Stress = -virial_total / V * EV_PER_A3_TO_GPa  (GPa). The negative
@@ -451,16 +451,16 @@ def predict_dataset(
     scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
     stress_pred = v_pred_arr * scale
     stress_ref = virial_ref * scale
-    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+    np.savetxt(os.path.join(output_dir, "stress_train.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
     if d_pred_arr is not None:
-        np.savetxt(os.path.join(output_dir, "descriptor_predict.out"),
+        np.savetxt(os.path.join(output_dir, "descriptor.out"),
                    d_pred_arr, fmt="%.10g")
     _log(f"  write:       {time.time() - t0:5.1f}s")
 
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_train.out")
 
 
 # ---------------------------------------------------------------------------
@@ -480,9 +480,9 @@ def predict_from_store(model, data_store, output_dir: str,
 
     Writes GPUMD-format outputs in ``output_dir`` (same columns and format as
     ``predict_dataset``):
-      energy_predict.out  — per-frame (pred, ref) in eV/atom
-      force_predict.out   — per-atom (fx,fy,fz pred, ref) in eV/A
-      virial_predict.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
+      energy_train.out  — per-frame (pred, ref) in eV/atom
+      force_train.out   — per-atom (fx,fy,fz pred, ref) in eV/A
+      virial_train.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
     """
     def _log(msg):
         if verbose:
@@ -560,11 +560,11 @@ def predict_from_store(model, data_store, output_dir: str,
 
     os.makedirs(output_dir, exist_ok=True)
     t_write = time.time()
-    np.savetxt(os.path.join(output_dir, "energy_predict.out"),
+    np.savetxt(os.path.join(output_dir, "energy_train.out"),
                np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "force_predict.out"),
+    np.savetxt(os.path.join(output_dir, "force_train.out"),
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "virial_predict.out"),
+    np.savetxt(os.path.join(output_dir, "virial_train.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
     # Stress (GPa) = -virial_total / V * conversion. Sign picked so round-
@@ -578,11 +578,11 @@ def predict_from_store(model, data_store, output_dir: str,
     scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
     stress_pred = v_pred * scale
     stress_ref = virial_ref * scale
-    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+    np.savetxt(os.path.join(output_dir, "stress_train.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_train.out")
 
 
 # ---------------------------------------------------------------------------
@@ -669,23 +669,23 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
 def _write_predictions(output_dir: str, n_total_frames: int,
                        natoms, volumes,
                        e_pred, e_ref, f_pred, f_ref, v_pred, v_ref):
-    """Write the four *_predict.out files in frame-order. All arrays are
+    """Write the four *_train.out files in frame-order. All arrays are
     already in global input-xyz order (frame 0 first)."""
     from .constants import EV_PER_A3_TO_GPa
     os.makedirs(output_dir, exist_ok=True)
 
-    np.savetxt(os.path.join(output_dir, "energy_predict.out"),
+    np.savetxt(os.path.join(output_dir, "energy_train.out"),
                np.column_stack([e_pred, e_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "force_predict.out"),
+    np.savetxt(os.path.join(output_dir, "force_train.out"),
                np.column_stack([f_pred, f_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "virial_predict.out"),
+    np.savetxt(os.path.join(output_dir, "virial_train.out"),
                np.column_stack([v_pred, v_ref]), fmt="%.10g")
 
     nat_col = natoms.astype(np.float64)[:, None]
     vol_col = volumes[:, None]
     vol_safe = np.where(vol_col > 0, vol_col, 1.0)
     scale = -nat_col / vol_safe * EV_PER_A3_TO_GPa
-    np.savetxt(os.path.join(output_dir, "stress_predict.out"),
+    np.savetxt(os.path.join(output_dir, "stress_train.out"),
                np.column_stack([v_pred * scale, v_ref * scale]), fmt="%.10g")
 
 
@@ -696,7 +696,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                                 verbose: bool = True):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
     data-store shard, arrays are gathered to rank 0, rank 0 writes the four
-    ``*_predict.out`` files in input-xyz order.
+    ``*_train.out`` files in input-xyz order.
 
     No xyz re-read, no neighbor-list rebuild, no temp nep.txt model file.
 
@@ -785,4 +785,4 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                        f_pred_g, f_ref_g,
                        v_pred_g, v_ref_g)
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_predict.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_train.out")

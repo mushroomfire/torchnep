@@ -195,7 +195,7 @@ all-reduce hangs.
 | `cutoff` | `8.0 4.0` | Radial and angular cutoff (Å) |
 | `n_max` | `6 6` | Radial and angular expansion orders |
 | `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular). Max 16 |
-| `l_max` | `4 1 0 0 0` | `L_3b has_q_222 has_q_1111 has_q_112 has_q_1122` — max L of 3-body terms (1–8) plus four boolean flags enabling each mixed-body invariant. Legacy 3-field form `L l_max_4b l_max_5b` is still accepted |
+| `l_max` | `4 1 0 0 0` | `L_3b q_222 q_1111 q_112 q_1122 q_123 q_233` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD PR #1517) enabling each higher-body invariant. `q_123`/`q_233` (4-body bispectrum, fields 6–7) need `L_3b ≥ 3`. `q_1111` is redundant (= const × 3-body L=1 squared) — kept for compatibility but warns if set. Legacy 3-field form `L l_max_4b l_max_5b` still accepted |
 | `neuron` | `30` | Hidden layer width |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
@@ -254,7 +254,7 @@ launch time:
 | `use_compile` | `False` | wrap in `torch.compile` |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
-| `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_predict.out` — live parity plot |
+| `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_train.out` — live parity plot |
 | `restart` | `True` | resume from `checkpoint.pt` if present |
 | `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` before training |
 | `reset_lr` | `None` | override LR after resume/finetune |
@@ -274,13 +274,13 @@ launch time:
 | `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch + loss weights |
 | `output.log`       | Full console log |
 | `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa), gnorm |
-| `energy_predict.out` | Per-frame predicted vs reference E/atom (eV/atom) |
-| `force_predict.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
-| `virial_predict.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
-| `stress_predict.out` | Per-frame predicted vs reference stress (GPa); negated wrt `virial_predict.out` so input and output stress carry the same sign |
-| `descriptor_predict.out` | Scaled descriptor `q * q_scaler` — only when `output_descriptor` is passed to `predict_dataset` |
+| `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
+| `force_train.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
+| `virial_train.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
+| `stress_train.out` | Per-frame predicted vs reference stress (GPa); negated wrt `virial_train.out` so input and output stress carry the same sign |
+| `descriptor.out` | Scaled descriptor `q * q_scaler` — only when `output_descriptor` is passed to `predict_dataset` |
 
-The `*_predict.out` files are rewritten every `prediction_interval` epochs using **`nep_best` weights** as a live parity plot, then replaced at end of training by a final-epoch prediction. Format matches GPUMD's `*_train.out` so the two can be diffed column by column.
+The `*_train.out` files are rewritten every `prediction_interval` epochs using **`nep_best` weights** as a live parity plot, then replaced at end of training by a final-epoch prediction. Format matches GPUMD's `*_train.out` so the two can be diffed column by column.
 
 ---
 
@@ -306,13 +306,19 @@ value-only changes. Structural changes (architecture, shapes) are not safe.
 | `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. Especially useful: restart from `nep_stage1.pt` with different Stage-2 weights by copying it to `nep_best.pt` (or passing it via `finetune_from`) and editing `nep.in`. |
 | `batch` | Yes | — |
 | `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
-| `stage2_lr` | Yes | Re-applied when Stage 2 resumes (overrides optimizer state) |
+| `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. Use `reset_lr` to force a new LR. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
 | `lr` (Stage 1) | **No** directly | Overridden by saved optimizer state — pass `reset_lr=<new>` to override |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
-To force a new Stage-1 learning rate after resuming (e.g. LR has decayed to `stop_lr`):
+**LR on resume.** A restart always keeps the LR stored in `checkpoint.pt`
+(optimizer + scheduler state are restored), so a run interrupted mid-decay
+picks up exactly where it left off — in either stage. The only exceptions:
+the one-time `stage2_lr` applied at the natural Stage 1 → Stage 2 crossing,
+and an explicit `reset_lr=<value>` override (a float, not a flag). Use the
+latter when you've edited `nep.in`'s LR and want it to take effect, e.g. when
+the LR has decayed to `stop_lr`:
 
 ```python
 train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
@@ -402,6 +408,6 @@ predict_dataset(
     batch_size=64,
     output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
 )
-# writes energy_predict.out, force_predict.out, virial_predict.out,
-# stress_predict.out, and (when output_descriptor != 0) descriptor_predict.out
+# writes energy_train.out, force_train.out, virial_train.out,
+# stress_train.out, and (when output_descriptor != 0) descriptor.out
 ```

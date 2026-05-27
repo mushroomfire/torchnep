@@ -537,31 +537,37 @@ def train_nep_sharded(
                 # the second case, leaving the optimizer on stage-1 lr).
                 if not stage2_lr_applied:
                     stage2_lr_applied = True
-                    # Save an end-of-stage-1 snapshot BEFORE applying stage-2
-                    # weights/lr, so the user can restart from this point with
-                    # different stage-2 settings. Rank 0 writes — ranks already
-                    # agree on the model state (DDP all-reduce after each step).
-                    if is_main and start_epoch <= start_stage2:
-                        raw_model.save_nep_txt(
-                            os.path.join(output_dir, "nep_stage1.txt"),
-                            max_NN_rad, max_NN_ang)
-                        torch.save(raw_model.state_dict(),
-                                   os.path.join(output_dir, "nep_stage1.pt"))
-                        _log("\nSaved end-of-stage-1 snapshot: "
-                             "nep_stage1.pt / nep_stage1.txt")
-                    for pg in optimizer.param_groups:
-                        pg['lr'] = stage2_lr
+                    # Distinguish a NATURAL stage-1 -> stage-2 crossing in this
+                    # run from RESUMING a checkpoint that was already in stage 2.
+                    fresh_transition = start_epoch <= start_stage2
                     _log(f"\n{'='*72}")
-                    tag = ("Stage 2 started" if epoch == start_stage2
-                           else "Stage 2 resumed (from checkpoint)")
-                    _log(f"{tag} at epoch {epoch}: "
-                         f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                         f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                    if fresh_transition:
+                        # Crossing into stage 2 now: snapshot end-of-stage-1
+                        # (rank 0 writes), apply the stage-2 lr, reset best_loss.
+                        if is_main:
+                            raw_model.save_nep_txt(
+                                os.path.join(output_dir, "nep_stage1.txt"),
+                                max_NN_rad, max_NN_ang)
+                            torch.save(raw_model.state_dict(),
+                                       os.path.join(output_dir, "nep_stage1.pt"))
+                            _log("Saved end-of-stage-1 snapshot: "
+                                 "nep_stage1.pt / nep_stage1.txt")
+                        for pg in optimizer.param_groups:
+                            pg['lr'] = stage2_lr
+                        best_loss = float("inf")
+                        _log(f"Stage 2 started at epoch {epoch}: "
+                             f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
+                             f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                    else:
+                        # Resumed mid-stage-2: keep the checkpoint's restored
+                        # (possibly decayed) lr / optimizer / scheduler /
+                        # best_loss. Pass reset_lr=<value> to force a new lr.
+                        cur_lr = optimizer.param_groups[0]['lr']
+                        _log(f"Stage 2 resumed at epoch {epoch}: "
+                             f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
+                             f"V_w={cur_pref_v}, lr={cur_lr:.2e} "
+                             f"(kept from checkpoint)")
                     _log(f"{'='*72}")
-                    # Stage 2 uses different loss weights — old best_loss is
-                    # on a different scale, so reset it whichever way we
-                    # entered.
-                    best_loss = float("inf")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
 
