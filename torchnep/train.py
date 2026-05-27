@@ -137,10 +137,10 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('basis_size_radial', 'basis_size_angular'):10}  "
                  f"basis_size   "
                  f"{config['basis_size_radial']} {config['basis_size_angular']}")
-    lm_pad = (config['l_max'] + [0] * 7)[:7]
+    lm_pad = (config['l_max'] + [0] * 6)[:6]
     lines.append(f"  {tag('l_max'):10}  l_max        "
                  f"{' '.join(str(x) for x in lm_pad)}\n"
-                 f"  {'':10}  (L_3b, q_222, q_1111, q_112, q_1122, q_123, q_233)")
+                 f"  {'':10}  (L_3b, q_222, q_1111, q_112, q_123, q_233)")
     lines.append(f"  {tag('neuron'):10}  neuron       {config['neuron']}")
     if config.get("zbl") is not None:
         zbl_extra = ""
@@ -181,6 +181,14 @@ def format_config_summary(config: dict) -> List[str]:
         ss_str = f"{ss}" if ss is not None else f"auto (0.75 * {config['num_epochs']})"
         lines.append(f"  {tag('start_stage2'):10}  start_stage2 {ss_str}")
         lines.append(f"  {tag('stage2_lr'):10}  stage2_lr    {config['stage2_lr']}")
+        # The stage 2 scheduler can override stage 1's patience / factor.
+        # Fall back to the stage 1 values when not explicitly set.
+        s2p = config.get('stage2_scheduler_patience', config['scheduler_patience'])
+        s2f = config.get('stage2_scheduler_factor',   config['scheduler_factor'])
+        lines.append(f"  {tag('stage2_scheduler_patience'):10}  "
+                     f"stage2_scheduler_patience {s2p}")
+        lines.append(f"  {tag('stage2_scheduler_factor'):10}  "
+                     f"stage2_scheduler_factor   {s2f}")
         lines.append(f"  {tag('stage2_pref_e'):10}  stage2_lambda_e {config['stage2_pref_e']}")
         lines.append(f"  {tag('stage2_pref_f'):10}  stage2_lambda_f {config['stage2_pref_f']}")
         lines.append(f"  {tag('stage2_pref_v'):10}  stage2_lambda_v {config['stage2_pref_v']}")
@@ -528,9 +536,9 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
             model.c_param_2, model.c_param_3,
             model.n_max_radial, model.n_max_angular,
             model.l_max_3b,
-            model.has_q_222, model.has_q_1111, model.has_q_112, model.has_q_1122,
+            model.has_q_222, model.has_q_1111, model.has_q_112,
             model.num_lm, model._c3b, model._c4b, model._c5b,
-            model._c4b2, model._c5b2,
+            model._c4b2,
             dtype, dev,
             backend=backend,
             has_q_123=model.has_q_123, has_q_233=model.has_q_233,
@@ -737,6 +745,14 @@ def train_nep(
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
     stage2_pref_v      = config["stage2_pref_v"]
+    # Stage 2 can have its own decay schedule (default: same as stage 1).
+    # Use this when the two stages span different LR ranges — e.g. stage 1
+    # 1e-2 -> 1e-3 (factor 0.794, 10 decays) vs stage 2 1e-3 -> 1e-5
+    # (factor 0.631, 10 decays).
+    stage2_scheduler_patience = config.get("stage2_scheduler_patience",
+                                           scheduler_patience)
+    stage2_scheduler_factor   = config.get("stage2_scheduler_factor",
+                                           scheduler_factor)
 
     # ---- Data ------------------------------------------------------------
     _log("Data")
@@ -867,8 +883,8 @@ def train_nep(
     stage2_scheduler = None
     if stage2:
         stage2_scheduler = _make_lr_scheduler(
-            optimizer, lr_scheduler_mode, scheduler_factor,
-            scheduler_patience, stop_lr)
+            optimizer, lr_scheduler_mode, stage2_scheduler_factor,
+            stage2_scheduler_patience, stop_lr)
         if use_swa:
             swa_model = AveragedModel(raw_model)
 

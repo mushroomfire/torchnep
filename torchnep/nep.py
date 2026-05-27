@@ -16,7 +16,7 @@ import torch
 import numpy as np
 from typing import Dict
 
-from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2, C5B2
+from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
 from .data import build_neighbor_list_np
 from . import ops
 
@@ -94,17 +94,17 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
-        # ``l_max`` line accepts 3 .. 7 trailing flags (legacy -> GPUMD PR
-        # #1517 form). All trailing fields are normalised to 0/1:
-        #   [L_max, q_222, q_1111, q_112, q_1122, q_123, q_233]
+        # ``l_max`` line: L_max + 3 GPUMD-core flags + q_123 / q_233 (the
+        # GPUMD PR #1519 layout — q_1122 is gone).  Field 2 (has_q_222) is
+        # written by ``save_nep_txt`` with the legacy "2 if on else 0"
+        # encoding (matches GPUMD fitness.cu); we normalise it back to 0/1.
         parts = lines[idx].split()
         self.l_max_3b   = int(parts[1])
         self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0
         self.has_q_1111 = 1 if (len(parts) > 3 and int(parts[3]) > 0) else 0
         self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
-        self.has_q_1122 = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
-        self.has_q_123  = 1 if (len(parts) > 6 and int(parts[6]) > 0) else 0
-        self.has_q_233  = 1 if (len(parts) > 7 and int(parts[7]) > 0) else 0
+        self.has_q_123  = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
+        self.has_q_233  = 1 if (len(parts) > 6 and int(parts[6]) > 0) else 0
         idx += 1
 
         # ANN
@@ -113,19 +113,18 @@ class NEPCalculator:
         idx += 1
 
         # Descriptor dimension — order must match GPUMD save layout:
-        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_1122 -> q_123 -> q_233.
+        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_123 -> q_233.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b   = n_ap1 * self.l_max_3b
         self.dim_angular_4b   = n_ap1 if self.has_q_222  else 0
         self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
-        self.dim_angular_1122 = n_ap1 if self.has_q_1122 else 0
         self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
         self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
-                    self.dim_angular_112 + self.dim_angular_1122 +
+                    self.dim_angular_112 +
                     self.dim_angular_123 + self.dim_angular_233)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
@@ -181,7 +180,6 @@ class NEPCalculator:
         self._c4b  = torch.tensor(C4B,  dtype=self.dtype, device=self.device)
         self._c5b  = torch.tensor(C5B,  dtype=self.dtype, device=self.device)
         self._c4b2 = torch.tensor(C4B2, dtype=self.dtype, device=self.device)
-        self._c5b2 = torch.tensor(C5B2, dtype=self.dtype, device=self.device)
 
     def compute(
         self,
@@ -239,9 +237,9 @@ class NEPCalculator:
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
-            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+            self.has_q_222, self.has_q_1111, self.has_q_112,
             self.num_lm, self._c3b, self._c4b, self._c5b,
-            self._c4b2, self._c5b2,
+            self._c4b2,
             self.dtype, self.device,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
         )
@@ -307,9 +305,9 @@ class NEPCalculator:
             self.c2, getattr(self, "c3", None),
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
-            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+            self.has_q_222, self.has_q_1111, self.has_q_112,
             self.num_lm, self._c3b, self._c4b, self._c5b,
-            self._c4b2, self._c5b2,
+            self._c4b2,
             dtype, device,
             return_intermediates=True,
             backend=backend,
@@ -386,9 +384,9 @@ class NEPCalculator:
             s, gn_ang,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
-            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+            self.has_q_222, self.has_q_1111, self.has_q_112,
             self.num_lm, self._c3b, self._c4b, self._c5b,
-            self._c4b2, self._c5b2,
+            self._c4b2,
             dtype, device,
             compute_virial=True,
             backend=backend,

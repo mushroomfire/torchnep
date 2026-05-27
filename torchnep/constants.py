@@ -100,26 +100,16 @@ C4B = [-0.007499480826664, -0.134990654879954, 0.067495327439977,
 
 C5B = [0.026596810706114, 0.053193621412227, 0.026596810706114]
 
-# Mixed-L invariants (GPUMD NEP feature `has_q_112` / `has_q_1122`).
-# q_112  ("4-body type 2"): cubic combinations of L=1 (s[0..2]) and L=2 (s[3..7])
-# q_1122 ("5-body type 2"): quartic combinations of L=1 and L=2 moments.
-# Values must bit-match nep_utilities.cuh::C4B2 / C5B2 to reproduce GPUMD.
+# Mixed-L invariant (GPUMD NEP feature `has_q_112`).
+# q_112 ("4-body type 2"): cubic combinations of L=1 (s[0..2]) and L=2 (s[3..7]).
+# Values must bit-match nep_utilities.cuh::C4B2 to reproduce GPUMD.
+# (GPUMD PR #1519 removed the companion 5-body `q_1122` channel; its C5B2
+# table is no longer used.)
 C4B2 = [0.027493550848847,
         0.164961305093080,
        -0.013746775424423,
         0.041240326273270,
         0.082480652546540]
-
-C5B2 = [0.008204309788260,
-        0.086014789060637,
-        0.021503697265159,
-        0.012176000966294,
-        0.048704003865174,
-        0.005095077688639,
-        0.006218464199244,
-        0.012436928398488,
-        0.037310785195463,
-        0.074621570390925]
 
 # Higher-L 4-body bispectrum invariants (GPUMD PR #1517: has_q_123 / has_q_233).
 # q_123 = B(1,2,3): couples L=1, L=2, L=3 moments.

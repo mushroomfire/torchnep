@@ -260,7 +260,17 @@ def parse_nep_in(filename: str) -> Dict:
                 params["num_types"] = int(parts[1])
                 params["type_names"] = parts[2 : 2 + int(parts[1])]
             elif key == "version":
-                params["version"] = int(parts[1])
+                v = int(parts[1])
+                # torchnep only implements NEP4 (single-radial-channel angular
+                # basis + per-type fitting NN + shared output bias).  Earlier
+                # NEP versions used a different architecture and aren't
+                # supported.  Fail loudly rather than silently produce wrong
+                # weights.
+                if v != 4:
+                    raise ValueError(
+                        f"nep.in version {v} is not supported — torchnep "
+                        f"only implements NEP4 (set 'version 4').")
+                params["version"] = v
             elif key == "zbl":
                 params["zbl"] = float(parts[1])
             elif key == "use_typewise_cutoff_zbl":
@@ -328,6 +338,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stage2_pref_f"] = float(parts[1])
             elif key == "stage2_lambda_v":
                 params["stage2_pref_v"] = float(parts[1])
+            elif key == "stage2_scheduler_patience":
+                params["stage2_scheduler_patience"] = int(parts[1])
+            elif key == "stage2_scheduler_factor":
+                params["stage2_scheduler_factor"] = float(parts[1])
 
     # Snapshot the explicit (user-set) keys before applying defaults so the
     # trainer can report which values came from nep.in vs which fell back
@@ -342,10 +356,11 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("n_max_angular", 6)
     params.setdefault("basis_size_radial", 6)
     params.setdefault("basis_size_angular", 6)
-    # Matches GPUMD default: L_max=4, has_q_222=1 (4-body on), others off.
-    # Legacy 3-field form `l_max <L> <l_max_4b> <l_max_5b>` is still accepted
-    # in nep.in — every trailing field is normalised to 0/1 in NEPModel.
-    params.setdefault("l_max", [4, 1, 0, 0, 0])
+    # Matches the GPUMD default ``l_max 4 1 0`` — L_max=4, q_222=1
+    # (4-body on), q_1111=0; everything beyond is off.  Fields, after the
+    # GPUMD PR #1519 removal of q_1122, are [L_3b, q_222, q_1111, q_112,
+    # q_123, q_233]; every trailing flag is normalised to 0/1 in NEPModel.
+    params.setdefault("l_max", [4, 1, 0])
     params.setdefault("neuron", 30)
 
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)

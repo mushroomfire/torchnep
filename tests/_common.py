@@ -62,14 +62,11 @@ FIXTURES = [
         "ref":   DATA_DIR / "PdCuNiP.gpumd.npz",
         "note":  "nep4_zbl, fixed ZBL, l_max 4 2 0 (only q_222)",
     },
-    {
-        "name":  "mixed",
-        "nep":   DATA_DIR / "nep_mixed.txt",
-        "xyz":   DATA_DIR / "mixed.xyz",
-        "ref":   DATA_DIR / "mixed.gpumd.npz",
-        "note":  "nep4_zbl, typewise ZBL, l_max 4 1 1 1 1 "
-                 "(q_222 + q_1111 + q_112 + q_1122 — NEW mixed-body invariants)",
-    },
+    # The historic "mixed" fixture exercised q_1122, which GPUMD PR #1519
+    # removed. With q_1122 gone from torchnep too, the orphaned nep_mixed.txt /
+    # mixed.gpumd.npz under data/ are no longer parameterised here. They are
+    # kept on disk in case a future rebake against the new GPUMD descriptor
+    # set (q_123/q_233) is desired.
 ]
 
 

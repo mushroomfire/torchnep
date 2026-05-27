@@ -170,7 +170,8 @@ def _random_batch(N=40, seed=0):
 
 def test_analytical_force_vs_autograd():
     """Both channels on: analytical force/virial == autograd-on-rij."""
-    m = _build_model([4, 1, 0, 1, 1, 1, 1])
+    # 6 fields after PR #1519: L_3b, q_222, q_1111, q_112, q_123, q_233
+    m = _build_model([4, 1, 0, 1, 1, 1])
     batch, (pi, pj, rij, dij, at) = _random_batch()
     N = batch["N"]
     with torch.enable_grad():
@@ -194,11 +195,13 @@ def test_analytical_force_vs_autograd():
 
 
 def test_nep_txt_round_trip(tmp_path):
-    m = _build_model([4, 1, 0, 1, 1, 1, 1])
+    m = _build_model([4, 1, 0, 1, 1, 1])
     p = tmp_path / "nep.txt"
     m.save_nep_txt(str(p), max_NN_radial=100, max_NN_angular=60)
     text = p.read_text()
-    assert "l_max 4 1 0 1 1 1 1" in text          # 7-field GPUMD form
+    # 6-field GPUMD form (PR #1519). Field 2 uses the legacy
+    # ``has_q_222 ? 2 : 0`` encoding so older GPUMD builds still load it.
+    assert "l_max 4 2 0 1 1 1" in text
     calc = NEPCalculator(str(p), dtype=DTYPE)
     assert (calc.has_q_123, calc.has_q_233) == (1, 1)
     assert calc.dim == m.dim
@@ -213,11 +216,13 @@ def test_nep_txt_round_trip(tmp_path):
 def test_lmax_guard():
     """q_123 / q_233 need l_max_3b >= 3 (they use L=3 moments)."""
     with pytest.raises(ValueError):
-        _build_model([2, 1, 0, 0, 0, 1, 0])  # l_max_3b=2, q_123 on
+        # 6-field PR #1519 layout: q_123 at field 5
+        _build_model([2, 1, 0, 0, 1, 0])  # l_max_3b=2, q_123 on
 
 
 def test_off_by_default():
-    m = _build_model([4, 1, 0, 1, 1])  # 5-field: q_123/q_233 implicitly 0
+    # 4-field GPUMD-core only — q_123/q_233 default to 0
+    m = _build_model([4, 1, 0, 1])
     assert (m.has_q_123, m.has_q_233) == (0, 0)
     assert m.dim_angular_123 == 0 and m.dim_angular_233 == 0
 
@@ -225,8 +230,8 @@ def test_off_by_default():
 def test_q1111_redundancy_warns():
     """has_q_1111=1 still works (backward compat) but warns it's redundant."""
     with pytest.warns(UserWarning, match="has_q_1111.*redundant"):
-        _build_model([4, 1, 1, 0, 0])  # q_1111 on
+        _build_model([4, 1, 1, 0])  # q_1111 on
     # off -> no warning
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        _build_model([4, 1, 0, 0, 0])
+        _build_model([4, 1, 0, 0])

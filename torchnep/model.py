@@ -17,7 +17,7 @@ import numpy as np
 from typing import List
 
 from .constants import (
-    ELEMENTS, C3B, C4B, C5B, C4B2, C5B2, COVALENT_RADIUS,
+    ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS,
 )
 from . import ops
 
@@ -63,18 +63,18 @@ class NEPModel(nn.Module):
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
         self.basis_size_angular = config["basis_size_angular"]
-        # ``l_max`` accepts the legacy 3-field form (positions 1,2 were
-        # "max L for 4b/5b", used as booleans) up to the GPUMD PR #1517
-        # 7-field form. Everything past index 0 is normalised to a 0/1 flag:
-        #   [L_max, q_222, q_1111, q_112, q_1122, q_123, q_233]
+        # ``l_max`` accepts the legacy 2-field form through GPUMD PR #1519's
+        # 6-field form. Everything past index 0 is normalised to a 0/1 flag:
+        #   [L_max, q_222, q_1111, q_112, q_123, q_233]
+        # (GPUMD PR #1519 removed the historical q_1122 slot, so field 4 is
+        # now q_112 directly — matching GPUMD's parse_l_max after the PR.)
         lm = list(config["l_max"])
         self.l_max_3b = lm[0]
         self.has_q_222  = 1 if (len(lm) > 1 and lm[1] > 0) else 0
         self.has_q_1111 = 1 if (len(lm) > 2 and lm[2] > 0) else 0
         self.has_q_112  = 1 if (len(lm) > 3 and lm[3] > 0) else 0
-        self.has_q_1122 = 1 if (len(lm) > 4 and lm[4] > 0) else 0
-        self.has_q_123  = 1 if (len(lm) > 5 and lm[5] > 0) else 0
-        self.has_q_233  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
+        self.has_q_123  = 1 if (len(lm) > 4 and lm[4] > 0) else 0
+        self.has_q_233  = 1 if (len(lm) > 5 and lm[5] > 0) else 0
         self.num_neurons = config["neuron"]
 
         # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
@@ -111,20 +111,20 @@ class NEPModel(nn.Module):
                 self.zbl_rc_outer = self.zbl
                 self.zbl_typewise_factor = None
 
-        # Dimensions — angular layout matches GPUMD: 3-body, then each enabled
-        # mixed-body block in the fixed order 222 / 1111 / 112 / 1122.
+        # Dimensions — angular layout matches GPUMD: 3-body, then each
+        # enabled mixed-body block in the fixed order 222 / 1111 / 112,
+        # then the optional q_123 / q_233 bispectrum blocks.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b = n_ap1 * self.l_max_3b
         self.dim_angular_4b   = n_ap1 if self.has_q_222  else 0
         self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
-        self.dim_angular_1122 = n_ap1 if self.has_q_1122 else 0
         self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
         self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
-                    self.dim_angular_112 + self.dim_angular_1122 +
+                    self.dim_angular_112 +
                     self.dim_angular_123 + self.dim_angular_233)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
@@ -153,7 +153,6 @@ class NEPModel(nn.Module):
         self.register_buffer("_c4b", torch.tensor(C4B))
         self.register_buffer("_c5b", torch.tensor(C5B))
         self.register_buffer("_c4b2", torch.tensor(C4B2))
-        self.register_buffer("_c5b2", torch.tensor(C5B2))
 
     @torch.no_grad()
     def set_q_scaler(self, q_min: torch.Tensor, q_max: torch.Tensor):
@@ -171,9 +170,9 @@ class NEPModel(nn.Module):
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
-            self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+            self.has_q_222, self.has_q_1111, self.has_q_112,
             self.num_lm, self._c3b, self._c4b, self._c5b,
-            self._c4b2, self._c5b2,
+            self._c4b2,
             rij_rad.dtype, rij_rad.device,
             backend=backend,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
@@ -279,9 +278,9 @@ class NEPModel(nn.Module):
                 batch["atom_types"], N, self.c_param_2, self.c_param_3,
                 self.n_max_radial, self.n_max_angular,
                 self.l_max_3b,
-                self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
                 self.num_lm, self._c3b, self._c4b, self._c5b,
-                self._c4b2, self._c5b2,
+                self._c4b2,
                 dtype, device,
                 return_intermediates=True,
                 backend=backend,
@@ -295,9 +294,9 @@ class NEPModel(nn.Module):
                 batch["atom_types"], N, self.c_param_2, self.c_param_3,
                 self.n_max_radial, self.n_max_angular,
                 self.l_max_3b,
-                self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
                 self.num_lm, self._c3b, self._c4b, self._c5b,
-                self._c4b2, self._c5b2,
+                self._c4b2,
                 dtype, device,
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
@@ -392,9 +391,9 @@ class NEPModel(nn.Module):
                 s, gn_ang,
                 self.n_max_radial, self.n_max_angular,
                 self.l_max_3b,
-                self.has_q_222, self.has_q_1111, self.has_q_112, self.has_q_1122,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
                 self.num_lm, self._c3b, self._c4b, self._c5b,
-                self._c4b2, self._c5b2,
+                self._c4b2,
                 dtype, device,
                 compute_virial=need_virial,
                 backend=backend,
@@ -528,13 +527,22 @@ class NEPModel(nn.Module):
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
-        # GPUMD PR #1517 l_max line: up to 7 fields. Trailing zero flags are
-        # omitted to match GPUMD's writer (it only prints q_123/q_233 columns
-        # when needed), keeping older GPUMD readers happy when they're off.
-        lmax_flags = [self.l_max_3b, self.has_q_222, self.has_q_1111,
-                      self.has_q_112, self.has_q_1122,
+        # l_max line: L_max + GPUMD-core flags + q_123 / q_233.
+        #
+        # Field 2 (has_q_222) is written with the legacy encoding "2 if on
+        # else 0" — this matches GPUMD's fitness.cu (``has_q_222 ? 2 : 0``)
+        # so that older GPUMD builds (which read this field as ``L_max_4body``
+        # and treated >=2 as "enable q_222") still load the model correctly.
+        #
+        # Trailing zero flags are trimmed to >=3 fields so a baseline model
+        # with no extras prints exactly the classic ``l_max L_3b 2 0``
+        # three-token line that older GPUMD builds produced and parsed.
+        lmax_flags = [self.l_max_3b,
+                      2 if self.has_q_222 else 0,
+                      self.has_q_1111,
+                      self.has_q_112,
                       self.has_q_123, self.has_q_233]
-        while len(lmax_flags) > 5 and lmax_flags[-1] == 0:
+        while len(lmax_flags) > 3 and lmax_flags[-1] == 0:
             lmax_flags.pop()
         lines.append("l_max " + " ".join(str(x) for x in lmax_flags))
         lines.append(f"ANN {self.num_neurons} 0")
@@ -608,7 +616,7 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         "basis_size_radial":  model.basis_size_radial,
         "basis_size_angular": model.basis_size_angular,
         "l_max":              [model.l_max_3b, model.has_q_222, model.has_q_1111,
-                               model.has_q_112, model.has_q_1122,
+                               model.has_q_112,
                                model.has_q_123, model.has_q_233],
         "neuron":             model.num_neurons,
     }

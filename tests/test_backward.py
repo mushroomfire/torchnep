@@ -75,7 +75,7 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
         "basis_size_radial":   calc.basis_size_radial,
         "basis_size_angular":  calc.basis_size_angular,
         "l_max":               [calc.l_max_3b, calc.has_q_222, calc.has_q_1111,
-                                calc.has_q_112, calc.has_q_1122],
+                                calc.has_q_112],
         "neuron":              calc.num_neurons,
     }
     if calc.has_zbl:

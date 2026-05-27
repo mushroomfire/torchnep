@@ -252,9 +252,9 @@ def compute_descriptors(
     atom_types, N, c2, c3,
     rc_radial, rc_angular, basis_size_radial, basis_size_angular,
     n_max_radial, n_max_angular, l_max_3b,
-    has_q_222, has_q_1111, has_q_112, has_q_1122,
+    has_q_222, has_q_1111, has_q_112,
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
-    c4b2_coeffs, c5b2_coeffs,
+    c4b2_coeffs,
     dtype, device,
     backend: str = "auto",
     has_q_123: int = 0, has_q_233: int = 0,
@@ -282,11 +282,11 @@ def compute_descriptors(
     basis_size_radial, basis_size_angular : int
     n_max_radial, n_max_angular           : int
     l_max_3b       : int               max L for 3-body angular descriptors.
-    has_q_222, has_q_1111, has_q_112, has_q_1122 : int (0/1)
-        Boolean switches for the four optional mixed-body invariants.
+    has_q_222, has_q_1111, has_q_112 : int (0/1)
+        Boolean switches for the three GPUMD-core mixed-body invariants.
         Each enabled flag adds an (n_max_angular+1)-sized block.
     num_lm         : int               \Sigma_{L=1..l_max_3b}(2L+1).
-    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs, c5b2_coeffs :
+    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs :
         per-body fixed coefficient tensors.
     dtype, device   : torch dtype / device for outputs.
     backend         : "auto" | "loop" | "bmm" (see resolve_backend).
@@ -299,7 +299,6 @@ def compute_descriptors(
       + (n_max_angular+1) * has_q_222       q_222 (4-body original)
       + (n_max_angular+1) * has_q_1111      q_1111 (5-body original)
       + (n_max_angular+1) * has_q_112       q_112 (mixed L=1,L=2 cubic)
-      + (n_max_angular+1) * has_q_1122      q_1122 (mixed L=1,L=2 quartic)
     Zero-filled for atoms with no angular pairs (isolated atoms / dimers).
     """
     backend = resolve_backend(backend, num_types=int(c2.shape[0]))
@@ -320,7 +319,7 @@ def compute_descriptors(
         # angular blocks so output dim still matches q_scaler.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
         for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
-                       + int(has_q_1122) + int(has_q_123) + int(has_q_233)):
+                       + int(has_q_123) + int(has_q_233)):
             parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
@@ -350,12 +349,12 @@ def compute_descriptors(
         q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
         parts.append(q_3b)
 
-        # Mixed-body blocks. Order (222 -> 1111 -> 112 -> 1122) must match
-        # GPUMD's nep_utilities.cuh::find_q and save_nep_txt below.
-        if has_q_222 or has_q_112 or has_q_1122:
+        # Mixed-body blocks. Order (222 -> 1111 -> 112) must match GPUMD's
+        # nep_utilities.cuh::find_q and save_nep_txt below.
+        if has_q_222 or has_q_112:
             s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
             s22r, s22i = s[:, :, 6], s[:, :, 7]
-        if has_q_1111 or has_q_112 or has_q_1122:
+        if has_q_1111 or has_q_112:
             s10, s11r, s11i = s[:, :, 0], s[:, :, 1], s[:, :, 2]
 
         if has_q_222:
@@ -382,28 +381,6 @@ def compute_descriptors(
                     + cb[3]*s22r*(s11r*s11r - s11i*s11i)
                     + cb[4]*s11r*s11i*s22i)
             parts.append(q112)
-
-        if has_q_1122:
-            cb = c5b2_coeffs
-            a2 = s10*s10; b2 = s11r*s11r; c2_ = s11i*s11i
-            d2 = s20*s20; e2 = s21r*s21r; f2 = s21i*s21i
-            g2 = s22r*s22r; h2 = s22i*s22i
-            q1122 = (cb[0]*a2*d2
-                     + cb[1]*(a2*e2 + a2*f2 + b2*e2 + c2_*f2)
-                     + cb[2]*(b2*g2 + b2*h2 + c2_*g2 + c2_*h2)
-                     + cb[3]*(a2*g2 + a2*h2)
-                     + cb[4]*(b2*f2 + c2_*e2)
-                     + cb[5]*(b2*d2 + c2_*d2)
-                     + cb[6]*(c2_*s20*s22r - b2*s20*s22r)
-                     + cb[7]*(s10*s11r*s20*s21r
-                              + s10*s11i*s20*s21i
-                              - s11r*s11i*s20*s22i)
-                     + cb[8]*(s10*s11r*s21r*s22r
-                              + s10*s11r*s21i*s22i
-                              + s10*s11i*s21r*s22i
-                              - s10*s11i*s21i*s22r)
-                     + cb[9]*(s11r*s11i*s21r*s21i))
-            parts.append(q1122)
 
         # q_123 / q_233: extra 4-body bispectrum channels (GPUMD PR #1517),
         # evaluated via the generic polynomial helper from fixed term tables.
@@ -653,9 +630,9 @@ def compute_descriptors_cached(
     pi_rad, pj_rad, pi_ang, pj_ang,
     atom_types, N, c2, c3,
     n_max_radial, n_max_angular, l_max_3b,
-    has_q_222, has_q_1111, has_q_112, has_q_1122,
+    has_q_222, has_q_1111, has_q_112,
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
-    c4b2_coeffs, c5b2_coeffs,
+    c4b2_coeffs,
     dtype, device,
     return_intermediates: bool = False,
     backend: str = "loop",
@@ -679,10 +656,10 @@ def compute_descriptors_cached(
     c2 : (ntypes, ntypes, basis_size_radial + 1, n_max_radial + 1).
     c3 : (ntypes, ntypes, basis_size_angular + 1, n_max_angular + 1).
     n_max_radial, n_max_angular, l_max_3b : int.
-    has_q_222, has_q_1111, has_q_112, has_q_1122 : int (0/1) flags.
+    has_q_222, has_q_1111, has_q_112 : int (0/1) flags.
     num_lm : int  = \Sigma_{L=1..l_max_3b}(2L + 1).
-    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs, c5b2_coeffs :
-        body-order coefficient tensors (the latter two for q_112 / q_1122).
+    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs :
+        body-order coefficient tensors (c4b2 is for q_112).
     dtype, device : torch dtype / device for outputs.
     return_intermediates : bool  also return s and gn_ang (needed by the
                                  analytical-force path).
@@ -715,7 +692,7 @@ def compute_descriptors_cached(
         # returned dim still matches q_scaler / the NN's input layer.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
         for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
-                       + int(has_q_1122) + int(has_q_123) + int(has_q_233)):
+                       + int(has_q_123) + int(has_q_233)):
             parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and fk_ang.shape[0] > 0:
@@ -745,10 +722,10 @@ def compute_descriptors_cached(
         q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
         parts.append(q_3b)
 
-        if has_q_222 or has_q_112 or has_q_1122:
+        if has_q_222 or has_q_112:
             s20, s21r, s21i = s[:, :, 3], s[:, :, 4], s[:, :, 5]
             s22r, s22i = s[:, :, 6], s[:, :, 7]
-        if has_q_1111 or has_q_112 or has_q_1122:
+        if has_q_1111 or has_q_112:
             s10, s11r, s11i = s[:, :, 0], s[:, :, 1], s[:, :, 2]
 
         if has_q_222:
@@ -774,28 +751,6 @@ def compute_descriptors_cached(
                     + cb[3]*s22r*(s11r*s11r - s11i*s11i)
                     + cb[4]*s11r*s11i*s22i)
             parts.append(q112)
-
-        if has_q_1122:
-            cb = c5b2_coeffs
-            a2 = s10*s10; b2 = s11r*s11r; c2_ = s11i*s11i
-            d2 = s20*s20; e2 = s21r*s21r; f2 = s21i*s21i
-            g2 = s22r*s22r; h2 = s22i*s22i
-            q1122 = (cb[0]*a2*d2
-                     + cb[1]*(a2*e2 + a2*f2 + b2*e2 + c2_*f2)
-                     + cb[2]*(b2*g2 + b2*h2 + c2_*g2 + c2_*h2)
-                     + cb[3]*(a2*g2 + a2*h2)
-                     + cb[4]*(b2*f2 + c2_*e2)
-                     + cb[5]*(b2*d2 + c2_*d2)
-                     + cb[6]*(c2_*s20*s22r - b2*s20*s22r)
-                     + cb[7]*(s10*s11r*s20*s21r
-                              + s10*s11i*s20*s21i
-                              - s11r*s11i*s20*s22i)
-                     + cb[8]*(s10*s11r*s21r*s22r
-                              + s10*s11r*s21i*s22i
-                              + s10*s11i*s21r*s22i
-                              - s10*s11i*s21i*s22r)
-                     + cb[9]*(s11r*s11i*s21r*s21i))
-            parts.append(q1122)
 
         if has_q_123:
             parts.append(_eval_extra(s, Q123_TERMS))
@@ -897,9 +852,9 @@ def _extra_grad(s, terms):
 
 
 def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
-                    has_q_222, has_q_1111, has_q_112, has_q_1122,
+                    has_q_222, has_q_1111, has_q_112,
                     c3b_coeffs, c4b_coeffs, c5b_coeffs,
-                    c4b2_coeffs, c5b2_coeffs,
+                    c4b2_coeffs,
                     has_q_123=0, has_q_233=0):
     """Compute dEi/d(sum_fxyz)[N, n_ap1, num_lm] for ALL body orders.
 
@@ -907,7 +862,7 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
     angular force chain rule. Differentiable through s (-> c3) and Fp (-> NN weights).
 
     ``has_q_123`` / ``has_q_233``: the extra 4-body bispectrum channels, each
-    adding one (n_ap1) descriptor block after q_1122.
+    adding one (n_ap1) descriptor block after q_112.
     """
     N = s.shape[0]
     weight = torch.zeros_like(s)  # (N, n_ap1, num_lm)
@@ -928,7 +883,7 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         weight[:, :, st:st + nt] = weight[:, :, st:st + nt] + Fp_l * dq_ds
 
     # Block ordering must match compute_descriptors / save_nep_txt:
-    # q_222 -> q_1111 -> q_112 -> q_1122.
+    # q_222 -> q_1111 -> q_112.
     off = dim_r + l_max_3b * n_ap1
 
     s10, s11r, s11i = s[:, :, 0], s[:, :, 1], s[:, :, 2]
@@ -959,8 +914,8 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         weight[:, :, 1] = weight[:, :, 1] + Fp_5b * 2*s11r*factor_1sq
         weight[:, :, 2] = weight[:, :, 2] + Fp_5b * 2*s11i*factor_1sq
 
-    # q_112 / q_1122 gradients use shorthand (a,b,c)=L=1 moments,
-    # (d,e,f,g,h)=L=2 moments. Polynomial forms live in compute_descriptors_cached.
+    # q_112 gradient uses shorthand (a,b,c)=L=1 moments, (d,e,f,g,h)=L=2
+    # moments. Polynomial form lives in compute_descriptors_cached.
     if has_q_112 and s.shape[2] >= 8:
         Fp_b = Fp[:, off:off + n_ap1]; off += n_ap1
         cb = c4b2_coeffs
@@ -987,75 +942,7 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
         # d/dh
         weight[:, :, 7] = weight[:, :, 7] + Fp_b * (cb[4]*b*c)
 
-    if has_q_1122 and s.shape[2] >= 8:
-        Fp_b = Fp[:, off:off + n_ap1]; off += n_ap1
-        cb = c5b2_coeffs
-        a, b, c = s10, s11r, s11i
-        d, e, f, g, h = s20, s21r, s21i, s22r, s22i
-        a2, b2, c2_ = a*a, b*b, c*c
-        d2, e2, f2 = d*d, e*e, f*f
-        g2, h2 = g*g, h*h
-        # d/da
-        weight[:, :, 0] = weight[:, :, 0] + Fp_b * (
-            2*cb[0]*a*d2
-            + 2*cb[1]*(a*e2 + a*f2)
-            + 2*cb[3]*(a*g2 + a*h2)
-            + cb[7]*(b*d*e + c*d*f)
-            + cb[8]*(b*e*g + b*f*h + c*e*h - c*f*g))
-        # d/db
-        weight[:, :, 1] = weight[:, :, 1] + Fp_b * (
-            2*cb[1]*b*e2
-            + 2*cb[2]*(b*g2 + b*h2)
-            + 2*cb[4]*b*f2
-            + 2*cb[5]*b*d2
-            - 2*cb[6]*b*d*g
-            + cb[7]*(a*d*e - c*d*h)
-            + cb[8]*(a*e*g + a*f*h)
-            + cb[9]*c*e*f)
-        # d/dc
-        weight[:, :, 2] = weight[:, :, 2] + Fp_b * (
-            2*cb[1]*c*f2
-            + 2*cb[2]*(c*g2 + c*h2)
-            + 2*cb[4]*c*e2
-            + 2*cb[5]*c*d2
-            + 2*cb[6]*c*d*g
-            + cb[7]*(a*d*f - b*d*h)
-            + cb[8]*(a*e*h - a*f*g)
-            + cb[9]*b*e*f)
-        # d/dd
-        weight[:, :, 3] = weight[:, :, 3] + Fp_b * (
-            2*cb[0]*a2*d
-            + 2*cb[5]*(b2 + c2_)*d
-            + cb[6]*(c2_ - b2)*g
-            + cb[7]*(a*b*e + a*c*f - b*c*h))
-        # d/de
-        weight[:, :, 4] = weight[:, :, 4] + Fp_b * (
-            2*cb[1]*(a2 + b2)*e
-            + 2*cb[4]*c2_*e
-            + cb[7]*a*b*d
-            + cb[8]*(a*b*g + a*c*h)
-            + cb[9]*b*c*f)
-        # d/df
-        weight[:, :, 5] = weight[:, :, 5] + Fp_b * (
-            2*cb[1]*(a2 + c2_)*f
-            + 2*cb[4]*b2*f
-            + cb[7]*a*c*d
-            + cb[8]*(a*b*h - a*c*g)
-            + cb[9]*b*c*e)
-        # d/dg
-        weight[:, :, 6] = weight[:, :, 6] + Fp_b * (
-            2*cb[2]*(b2 + c2_)*g
-            + 2*cb[3]*a2*g
-            + cb[6]*(c2_ - b2)*d
-            + cb[8]*(a*b*e - a*c*f))
-        # d/dh
-        weight[:, :, 7] = weight[:, :, 7] + Fp_b * (
-            2*cb[2]*(b2 + c2_)*h
-            + 2*cb[3]*a2*h
-            - cb[7]*b*c*d
-            + cb[8]*(a*b*f + a*c*e))
-
-    # --- q_123 / q_233 bispectrum channels (one block each, after q_1122) ---
+    # --- q_123 / q_233 bispectrum channels (one block each, after q_112) ---
     if has_q_123:
         Fp_c = Fp[:, off:off + n_ap1]; off += n_ap1
         weight = weight + Fp_c.unsqueeze(-1) * _extra_grad(s, Q123_TERMS)
@@ -1073,9 +960,9 @@ def compute_analytical_forces(
     pi_ang, pj_ang, rij_ang, d12inv_ang,
     s, gn_ang,
     n_max_radial, n_max_angular, l_max_3b,
-    has_q_222, has_q_1111, has_q_112, has_q_1122,
+    has_q_222, has_q_1111, has_q_112,
     num_lm, c3b_coeffs, c4b_coeffs, c5b_coeffs,
-    c4b2_coeffs, c5b2_coeffs,
+    c4b2_coeffs,
     dtype, device,
     compute_virial: bool = True,
     backend: str = "loop",
@@ -1103,9 +990,9 @@ def compute_analytical_forces(
     s      : (N, n_max_angular + 1, num_lm) sum_fxyz from descriptor forward.
     gn_ang : (P_ang, n_max_angular + 1) pair-level angular radial factor.
     n_max_radial, n_max_angular, l_max_3b : int.
-    has_q_222, has_q_1111, has_q_112, has_q_1122 : int (0/1) flags.
+    has_q_222, has_q_1111, has_q_112 : int (0/1) flags.
     num_lm : int.
-    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs, c5b2_coeffs :
+    c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs :
         body-order coefficient tensors.
     dtype, device : torch dtype / device for outputs.
     compute_virial : bool  if False, ``virial`` output is ``None``.
@@ -1160,9 +1047,9 @@ def compute_analytical_forces(
 
         # weight = dEi/d(sum_fxyz): all body orders, differentiable via s->c3 and Fp->NN
         w_atom = _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
-                                 has_q_222, has_q_1111, has_q_112, has_q_1122,
+                                 has_q_222, has_q_1111, has_q_112,
                                  c3b_coeffs, c4b_coeffs, c5b_coeffs,
-                                 c4b2_coeffs, c5b2_coeffs,
+                                 c4b2_coeffs,
                                  has_q_123=has_q_123,
                                  has_q_233=has_q_233)  # (N, n_ap1, num_lm)
         w_i = w_atom[pi_ang]   # (P, n_ap1, num_lm) — atom_i's weight per pair
