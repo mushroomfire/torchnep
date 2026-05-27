@@ -94,14 +94,17 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
-        # ``l_max`` line accepts 3 / 4 / 5 trailing flags (legacy -> new form).
-        # All trailing fields are normalised to 0/1.
+        # ``l_max`` line accepts 3 .. 7 trailing flags (legacy -> GPUMD PR
+        # #1517 form). All trailing fields are normalised to 0/1:
+        #   [L_max, q_222, q_1111, q_112, q_1122, q_123, q_233]
         parts = lines[idx].split()
         self.l_max_3b   = int(parts[1])
         self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0
         self.has_q_1111 = 1 if (len(parts) > 3 and int(parts[3]) > 0) else 0
         self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
         self.has_q_1122 = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
+        self.has_q_123  = 1 if (len(parts) > 6 and int(parts[6]) > 0) else 0
+        self.has_q_233  = 1 if (len(parts) > 7 and int(parts[7]) > 0) else 0
         idx += 1
 
         # ANN
@@ -110,7 +113,7 @@ class NEPCalculator:
         idx += 1
 
         # Descriptor dimension — order must match GPUMD save layout:
-        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_1122.
+        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_1122 -> q_123 -> q_233.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b   = n_ap1 * self.l_max_3b
@@ -118,9 +121,12 @@ class NEPCalculator:
         self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
         self.dim_angular_1122 = n_ap1 if self.has_q_1122 else 0
+        self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
+        self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
-                    self.dim_angular_112 + self.dim_angular_1122)
+                    self.dim_angular_112 + self.dim_angular_1122 +
+                    self.dim_angular_123 + self.dim_angular_233)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         # Parse data
@@ -237,6 +243,7 @@ class NEPCalculator:
             self.num_lm, self._c3b, self._c4b, self._c5b,
             self._c4b2, self._c5b2,
             self.dtype, self.device,
+            has_q_123=self.has_q_123, has_q_233=self.has_q_233,
         )
 
         descriptor = (q * self.q_scaler).detach() if compute_descriptor else None
@@ -306,6 +313,7 @@ class NEPCalculator:
             dtype, device,
             return_intermediates=True,
             backend=backend,
+            has_q_123=self.has_q_123, has_q_233=self.has_q_233,
         )
 
         q_scaled = q * self.q_scaler
@@ -384,6 +392,7 @@ class NEPCalculator:
             dtype, device,
             compute_virial=True,
             backend=backend,
+            has_q_123=self.has_q_123, has_q_233=self.has_q_233,
         )
         if zbl_forces is not None:
             forces = forces + zbl_forces

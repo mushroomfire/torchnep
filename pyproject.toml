@@ -20,7 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "mdapy"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+# The redundant-q_1111 warning is intentional and fires for fixtures / legacy
+# l_max forms that enable q_1111; silence it so it doesn't clutter the run.
+# test_q1111_redundancy_warns still asserts it fires (via pytest.warns).
+filterwarnings = [
+    "ignore:.*has_q_1111.*redundant.*:UserWarning",
+]
 
 [project.urls]
 Homepage = "https://github.com/mushroomfire/torchnep"

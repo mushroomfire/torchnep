@@ -16,6 +16,7 @@ tests/
   test_backward.py               analytical vs autograd; train vs predict
   test_descriptor_gradient.py    q_112 / q_1122 dq/ds vs autograd
   test_angular_lmax8.py          L = 1..8 angular basis self-consistency
+  test_q123_q233.py              q_123 / q_233 bispectrum vs GPUMD PR #1517
 
   bake_fixtures.py               regenerates data/<name>.gpumd.npz via GPUMD
 
@@ -57,6 +58,7 @@ TEST_DTYPE=float64 pytest tests/
 | `test_backward.py` | (A) analytical force / virial vs autograd-on-rij; (B) `NEPModel.compute_properties_cached` (training path) vs `NEPCalculator.compute_batch` (predict path). Same fixture matrix. |
 | `test_descriptor_gradient.py` | `_angular_weight` (the hand-derived dEi/d(sum_fxyz) for every body order) matches `torch.autograd.grad` on the explicit q-vs-s polynomial. Pins down the new `q_112` / `q_1122` analytical gradients introduced for the mixed-body invariants. |
 | `test_angular_lmax8.py` | Solid-harmonics angular basis: L = 1..4 regression vs the old hand-coded formula; `_compute_dblm_dhat` matches autograd and finite differences for L = 1..8. |
+| `test_q123_q233.py` | The q_123 / q_233 higher-L 4-body bispectrum channels (GPUMD PR #1517 `has_q_123` / `has_q_233`): rotational invariance, **bit-identical match to GPUMD's find_q polynomial**, `ops._extra_grad` vs autograd, end-to-end analytical-force vs autograd, and 7-field-l_max nep.txt round-trip. |
 
 ## Tolerances
 

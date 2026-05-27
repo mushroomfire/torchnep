@@ -115,6 +115,7 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
             model._c4b2, model._c5b2,
             dtype, dev,
             backend=backend,
+            has_q_123=model.has_q_123, has_q_233=model.has_q_233,
         )
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)

@@ -9,7 +9,8 @@ Core NEP operations — pure PyTorch on CPU / CUDA / MPS.
 import torch
 from typing import List, Literal, Optional, Tuple
 
-from .constants import PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B
+from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
+                        Q123_TERMS, Q233_TERMS)
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,7 @@ def compute_descriptors(
     c4b2_coeffs, c5b2_coeffs,
     dtype, device,
     backend: str = "auto",
+    has_q_123: int = 0, has_q_233: int = 0,
 ) -> torch.Tensor:
     r"""Compute NEP4 descriptors from raw pair geometry. Returns (N, dim).
 
@@ -317,9 +319,9 @@ def compute_descriptors(
         # No angular neighbors (e.g. isolated atom / dimer). Emit zero-filled
         # angular blocks so output dim still matches q_scaler.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
-        for flag in (has_q_222, has_q_1111, has_q_112, has_q_1122):
-            if flag:
-                parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
+        for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
+                       + int(has_q_1122) + int(has_q_123) + int(has_q_233)):
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
         dij_ang = torch.norm(rij_ang, dim=-1)
@@ -402,6 +404,13 @@ def compute_descriptors(
                               - s10*s11i*s21i*s22r)
                      + cb[9]*(s11r*s11i*s21r*s21i))
             parts.append(q1122)
+
+        # q_123 / q_233: extra 4-body bispectrum channels (GPUMD PR #1517),
+        # evaluated via the generic polynomial helper from fixed term tables.
+        if has_q_123:
+            parts.append(_eval_extra(s, Q123_TERMS))
+        if has_q_233:
+            parts.append(_eval_extra(s, Q233_TERMS))
 
     q = torch.cat(parts, dim=-1)
     # DDP gradient pin (see compute_descriptors_cached for why).
@@ -650,6 +659,7 @@ def compute_descriptors_cached(
     dtype, device,
     return_intermediates: bool = False,
     backend: str = "loop",
+    has_q_123: int = 0, has_q_233: int = 0,
 ):
     r"""Compute descriptors using precomputed basis functions.
 
@@ -704,9 +714,9 @@ def compute_descriptors_cached(
         # very sparse structures). Emit zero-filled angular blocks so the
         # returned dim still matches q_scaler / the NN's input layer.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
-        for flag in (has_q_222, has_q_1111, has_q_112, has_q_1122):
-            if flag:
-                parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
+        for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
+                       + int(has_q_1122) + int(has_q_123) + int(has_q_233)):
+            parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and fk_ang.shape[0] > 0:
         # Angular: type contraction (no scatter yet — need gn for blm product)
@@ -787,6 +797,11 @@ def compute_descriptors_cached(
                      + cb[9]*(s11r*s11i*s21r*s21i))
             parts.append(q1122)
 
+        if has_q_123:
+            parts.append(_eval_extra(s, Q123_TERMS))
+        if has_q_233:
+            parts.append(_eval_extra(s, Q233_TERMS))
+
     q = torch.cat(parts, dim=-1)
     # DDP gradient pin: when a batch has no pairs (all-monomer bucket under
     # bucket batching), c2 / c3 never enter the compute graph and DDP errors
@@ -802,14 +817,97 @@ def compute_descriptors_cached(
     return q
 
 
+# ---------------------------------------------------------------------------
+# Extra angular-invariant channels (q_123 / q_233 bispectrum, and any future
+# higher body-order term). Each channel is a polynomial in the single-radial-
+# channel angular moments s[:, :, lm], stored as a list of
+# (coefficient, (lm_idx, ...)) monomials (see constants.Q123_TERMS / Q233_TERMS;
+# new terms can be derived with probe/derive_invariants.py). These helpers
+# evaluate a channel and its gradient generically, so adding a term needs only
+# the table — no hand-derived gradient.
+# ---------------------------------------------------------------------------
+
+_EXTRA_PACK_CACHE = {}
+
+
+def _pack_terms(terms, device):
+    """Pack a channel's term list into (coeffs, idx) tensors.
+
+    All monomials in one channel are homogeneous (same degree d), so idx is a
+    dense (T, d) long tensor and no padding is needed. Cached per (terms id,
+    device) since the tables are fixed at model-build time.
+    """
+    key = (id(terms), device)
+    hit = _EXTRA_PACK_CACHE.get(key)
+    if hit is not None:
+        return hit
+    deg = len(terms[0][1])
+    coeffs = torch.tensor([c for c, _ in terms], dtype=torch.float64,
+                          device=device)
+    idx = torch.tensor([list(ix) for _, ix in terms], dtype=torch.long,
+                       device=device)                       # (T, d)
+    _EXTRA_PACK_CACHE[key] = (coeffs, idx, deg)
+    return coeffs, idx, deg
+
+
+def _eval_extra(s, terms):
+    """Evaluate one extra invariant channel. Returns (N, n_ap1).
+
+    s: (N, n_ap1, num_lm). q = Σ_t coeff_t · Π_p s[:, :, idx[t, p]].
+    Vectorised: gather all monomial factors, take the product over the
+    degree axis, weight by coeffs and sum over terms."""
+    coeffs, idx, _ = _pack_terms(terms, s.device)
+    g = s[:, :, idx]                          # (N, n_ap1, T, d)
+    prod = g.prod(dim=-1)                     # (N, n_ap1, T)
+    return (prod * coeffs.to(s.dtype)).sum(-1)
+
+
+def _extra_grad(s, terms):
+    """dq_channel / ds[:, :, lm] for one channel. Returns (N, n_ap1, num_lm).
+
+    Uses leave-one-out products (prefix*suffix, division-free so it is exact
+    even when a factor is zero) then scatter-adds each monomial's per-factor
+    contribution to the lm index it differentiates.
+    """
+    coeffs, idx, d = _pack_terms(terms, s.device)
+    c = coeffs.to(s.dtype)
+    g = s[:, :, idx]                          # (N, n_ap1, T, d)
+    N, n_ap1, T, _ = g.shape
+
+    # Leave-one-out products via functional prefix / suffix scans over the
+    # degree axis (no in-place writes — the analytical-force path runs this
+    # with ``s`` in the autograd graph, so in-place ops would break backward).
+    factors = [g[:, :, :, p] for p in range(d)]      # each (N, n_ap1, T)
+    pref, suff = [None] * d, [None] * d
+    acc = torch.ones_like(factors[0])
+    for p in range(d):
+        pref[p] = acc
+        acc = acc * factors[p]
+    acc = torch.ones_like(factors[0])
+    for p in range(d - 1, -1, -1):
+        suff[p] = acc
+        acc = acc * factors[p]
+    lop = torch.stack([pref[p] * suff[p] for p in range(d)], dim=-1)
+
+    contrib = lop * c.view(1, 1, T, 1)        # (N, n_ap1, T, d)
+    flat_idx = idx.reshape(-1).view(1, 1, -1).expand(N, n_ap1, T * d)
+    grad = torch.zeros_like(s).scatter_add(
+        2, flat_idx, contrib.reshape(N, n_ap1, T * d))
+    return grad
+
+
 def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
                     has_q_222, has_q_1111, has_q_112, has_q_1122,
                     c3b_coeffs, c4b_coeffs, c5b_coeffs,
-                    c4b2_coeffs, c5b2_coeffs):
+                    c4b2_coeffs, c5b2_coeffs,
+                    has_q_123=0, has_q_233=0):
     """Compute dEi/d(sum_fxyz)[N, n_ap1, num_lm] for ALL body orders.
 
     This is the "effective Fp" in sum_fxyz space needed for the analytical
     angular force chain rule. Differentiable through s (-> c3) and Fp (-> NN weights).
+
+    ``has_q_123`` / ``has_q_233``: the extra 4-body bispectrum channels, each
+    adding one (n_ap1) descriptor block after q_1122.
     """
     N = s.shape[0]
     weight = torch.zeros_like(s)  # (N, n_ap1, num_lm)
@@ -957,6 +1055,14 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
             - cb[7]*b*c*d
             + cb[8]*(a*b*f + a*c*e))
 
+    # --- q_123 / q_233 bispectrum channels (one block each, after q_1122) ---
+    if has_q_123:
+        Fp_c = Fp[:, off:off + n_ap1]; off += n_ap1
+        weight = weight + Fp_c.unsqueeze(-1) * _extra_grad(s, Q123_TERMS)
+    if has_q_233:
+        Fp_c = Fp[:, off:off + n_ap1]; off += n_ap1
+        weight = weight + Fp_c.unsqueeze(-1) * _extra_grad(s, Q233_TERMS)
+
     return weight  # (N, n_ap1, num_lm)
 
 
@@ -973,6 +1079,7 @@ def compute_analytical_forces(
     dtype, device,
     compute_virial: bool = True,
     backend: str = "loop",
+    has_q_123: int = 0, has_q_233: int = 0,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -1055,7 +1162,9 @@ def compute_analytical_forces(
         w_atom = _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
                                  has_q_222, has_q_1111, has_q_112, has_q_1122,
                                  c3b_coeffs, c4b_coeffs, c5b_coeffs,
-                                 c4b2_coeffs, c5b2_coeffs)  # (N, n_ap1, num_lm)
+                                 c4b2_coeffs, c5b2_coeffs,
+                                 has_q_123=has_q_123,
+                                 has_q_233=has_q_233)  # (N, n_ap1, num_lm)
         w_i = w_atom[pi_ang]   # (P, n_ap1, num_lm) — atom_i's weight per pair
 
         # Term 1: distance derivative — f12 = (sum_n,lm w_i * gnp * blm) * rij/dij
