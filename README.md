@@ -225,6 +225,8 @@ all-reduce hangs.
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 75 % of epochs | Epoch to switch to Stage 2 |
 | `stage2_lr` | `1e-3` | Stage 2 learning rate |
+| `stage2_scheduler_patience` | `scheduler_patience` | Stage 2 scheduler patience (overrides Stage 1's; same semantics — for `step` it is the epoch interval, for `plateau` it is the epochs-without-improvement window) |
+| `stage2_scheduler_factor` | `scheduler_factor` | Stage 2 LR decay factor (overrides Stage 1's). Lets the two stages span different LR ranges — e.g. stage 1 `1e-2 → 1e-3` (factor `0.794`, 10 decays over 200 epochs) and stage 2 `1e-3 → 1e-5` (factor `0.631`). When unset, Stage 2 reuses the Stage 1 values. |
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `100.0` | Stage 2 force weight |
 | `stage2_lambda_v` | `1.0` | Stage 2 virial weight |
@@ -309,6 +311,7 @@ value-only changes. Structural changes (architecture, shapes) are not safe.
 | `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. Use `reset_lr` to force a new LR. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
+| `stage2_scheduler_patience` / `stage2_scheduler_factor` | Yes | Applied immediately to the Stage 2 scheduler |
 | `lr` (Stage 1) | **No** directly | Overridden by saved optimizer state — pass `reset_lr=<new>` to override |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
