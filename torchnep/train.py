@@ -202,6 +202,48 @@ def format_config_summary(config: dict) -> List[str]:
 # GPU data store — all data pre-loaded to device
 # ---------------------------------------------------------------------------
 
+def _basis_chunk_size(device, dtype, basis_size_angular, num_lm, l_max_3b,
+                      min_chunk=1 << 16, max_chunk=1 << 23):
+    """Pairs-per-chunk for the cached-basis precompute in ``GPUDataStore``.
+
+    The basis is built in chunks so the transient working set is one chunk
+    instead of the whole shard — this lowers the construction-time GPU memory
+    peak (which otherwise sits well above the steady training footprint and
+    needlessly caps how big a shard each rank can hold). Results are unchanged:
+    the Chebyshev/angular bases are per-pair elementwise, so chunking is
+    bit-identical to the one-shot path.
+
+    The chunk is sized so one chunk's transient stays within a small fixed
+    budget (``TARGET`` below, ~512 MB) — the whole point is to keep the peak
+    just above the steady footprint, not to go as fast as possible. On CUDA the
+    budget is additionally clamped to a fraction of the memory still *free*
+    after the persistent basis buffers are allocated (queried via
+    ``mem_get_info``), so a memory-tight card shrinks the chunk further rather
+    than OOM-ing. On CPU only the fixed budget applies. Bigger chunks make
+    ``__init__`` faster; they never affect training speed (training reads the
+    same split-view layout either way).
+    """
+    elem = 8 if dtype == torch.float64 else 4
+    # Generous per-pair transient estimate: Chebyshev scratch (~14 vectors),
+    # angular z/Re/Im powers + the blm list and its torch.stack copy
+    # (~2*num_lm + 4*(l+1)), plus margin. Over-estimating only shrinks the
+    # chunk, which is safe.
+    per_pair = elem * (2 * (basis_size_angular + 1) + 2 * num_lm
+                       + 4 * (l_max_3b + 1) + 40)
+    TARGET = 512 * 1024 * 1024  # ~512 MB transient budget per chunk
+    budget = TARGET
+    if device.type == "cuda":
+        try:
+            free, _ = torch.cuda.mem_get_info(device)
+            # Never let the transient eat more than half of what's free, so a
+            # tight card shrinks the chunk instead of OOM-ing at build time.
+            budget = min(TARGET, int(free * 0.5))
+        except Exception:
+            budget = min(TARGET, 256 * 1024 * 1024)
+    chunk = budget // max(per_pair, 1)
+    return max(min_chunk, min(max_chunk, chunk))
+
+
 class GPUDataStore:
     """Pre-loads all structure data to GPU for zero-copy batch collation.
 
@@ -286,29 +328,55 @@ class GPUDataStore:
                                                      non_blocking=True)
 
         if config is not None:
-            dr_all = torch.norm(rij_r_all, dim=-1)
-            fk_r_all, fkp_r_all = ops.chebyshev_basis_and_deriv(
-                dr_all, config["cutoff_radial"], config["basis_size_radial"])
-            d12inv_r_all = 1.0 / dr_all
+            # Build the cached basis in pair-chunks, writing into preallocated
+            # buffers. The transient working set is then one chunk, not the
+            # whole shard — this caps the construction-time GPU memory peak so
+            # it stays close to the steady training footprint. Chebyshev and
+            # angular bases are per-pair elementwise, so this is bit-identical
+            # to computing them in one shot; only __init__ does more work, the
+            # training step (which reads the split views below) is unchanged.
+            rc_r = config["cutoff_radial"]
+            rc_a = config["cutoff_angular"]
+            bs_r = config["basis_size_radial"]
+            bs_a = config["basis_size_angular"]
+            l3 = config["l_max"][0]
+            num_lm = sum(2 * ll + 1 for ll in range(1, l3 + 1)) if l3 >= 1 else 0
 
-            if rij_a_all.shape[0] > 0:
-                da_all = torch.norm(rij_a_all, dim=-1)
-                fk_a_all, fkp_a_all = ops.chebyshev_basis_and_deriv(
-                    da_all, config["cutoff_angular"], config["basis_size_angular"])
-                d12inv_a_all = 1.0 / da_all
-                blm_all = ops.angular_basis(
-                    rij_a_all[:, 0] * d12inv_a_all,
-                    rij_a_all[:, 1] * d12inv_a_all,
-                    rij_a_all[:, 2] * d12inv_a_all,
-                    config["l_max"][0])
-            else:
-                fk_a_all = torch.zeros(0, config["basis_size_angular"] + 1,
-                                       dtype=dtype, device=device)
-                fkp_a_all = torch.zeros(0, config["basis_size_angular"] + 1,
-                                        dtype=dtype, device=device)
-                d12inv_a_all = torch.zeros(0, dtype=dtype, device=device)
-                num_lm = sum(2 * ll + 1 for ll in range(1, config["l_max"][0] + 1))
-                blm_all = torch.zeros(0, num_lm, dtype=dtype, device=device)
+            P_r = rij_r_all.shape[0]
+            fk_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
+            fkp_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
+            d12inv_r_all = torch.empty(P_r, dtype=dtype, device=device)
+
+            P_a = rij_a_all.shape[0]
+            fk_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
+            fkp_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
+            d12inv_a_all = torch.empty(P_a, dtype=dtype, device=device)
+            blm_all = torch.empty(P_a, num_lm, dtype=dtype, device=device)
+
+            # Chunk sized against memory still free *after* the buffers above.
+            chunk = _basis_chunk_size(device, dtype, bs_a, num_lm, l3)
+
+            for st in range(0, P_r, chunk):
+                en = min(st + chunk, P_r)
+                dr = torch.norm(rij_r_all[st:en], dim=-1)
+                fk, fkp = ops.chebyshev_basis_and_deriv(dr, rc_r, bs_r)
+                fk_r_all[st:en] = fk
+                fkp_r_all[st:en] = fkp
+                d12inv_r_all[st:en] = 1.0 / dr
+
+            for st in range(0, P_a, chunk):
+                en = min(st + chunk, P_a)
+                rij = rij_a_all[st:en]
+                da = torch.norm(rij, dim=-1)
+                fk, fkp = ops.chebyshev_basis_and_deriv(da, rc_a, bs_a)
+                fk_a_all[st:en] = fk
+                fkp_a_all[st:en] = fkp
+                dinv = 1.0 / da
+                d12inv_a_all[st:en] = dinv
+                if num_lm > 0:
+                    blm_all[st:en] = ops.angular_basis(
+                        rij[:, 0] * dinv, rij[:, 1] * dinv,
+                        rij[:, 2] * dinv, l3)
 
         nr_list = n_rad.tolist()
         na_list = n_ang.tolist()
