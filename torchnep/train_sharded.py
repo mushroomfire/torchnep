@@ -22,6 +22,7 @@ Single-rank (N=1) runs but offers nothing over ``train_nep`` in that case.
 
 import os
 import time
+import warnings
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -196,6 +197,13 @@ def train_nep_sharded(
 
     is_main = rank == 0
     dtype = torch.float32 if precision == "float32" else torch.float64
+
+    # Only rank 0 logs. All app output already routes through _log (is_main-
+    # guarded), but Python warnings (e.g. NEPModel's q_1111 redundancy notice)
+    # fire on every rank — silence them on non-main ranks so the console shows
+    # one copy, not world_size copies.
+    if not is_main:
+        warnings.filterwarnings("ignore")
 
     # ---- Logging (rank 0 only) -------------------------------------------
     if is_main:

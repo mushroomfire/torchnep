@@ -23,3 +23,5 @@
 /study
 /4body*
 /descriptor_experiment/
+# Local-only scratch: multi-card repro scripts, temp configs, run outputs.
+/scratch/
