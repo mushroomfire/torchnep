@@ -21,6 +21,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# ASE calculator (torchnep.ase_calculator.NEP) — optional, not needed for
+# training or prediction. Install with: pip install torchnep[ase]
+ase = ["ase>=3.22"]
 
 [tool.pytest.ini_options]
 # The redundant-q_1111 warning is intentional and fires for fixtures / legacy

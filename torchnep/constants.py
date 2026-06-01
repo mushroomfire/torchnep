@@ -111,9 +111,10 @@ C4B2 = [0.027493550848847,
         0.041240326273270,
         0.082480652546540]
 
-# Higher-L 4-body bispectrum invariants (GPUMD PR #1517: has_q_123 / has_q_233).
+# Higher-L 4-body bispectrum invariants (GPUMD: has_q_123 / has_q_233 / has_q_134).
 # q_123 = B(1,2,3): couples L=1, L=2, L=3 moments.
 # q_233 = B(2,3,3): couples L=2, L=3, L=3 moments.
+# q_134 = B(1,3,4): couples L=1, L=3, L=4 moments (see C4B_134 below).
 # Coefficients and monomial structure transcribed verbatim from GPUMD's
 # nep_utilities.cuh::find_q so torchnep descriptors are bit-identical to
 # GPUMD PR #1517 (a trained nep.txt loads and runs there). s-index layout
@@ -126,6 +127,13 @@ C4B_233 = [0.008572620635186, 0.009644198214584, 0.019288396429168,
            0.025717861905558, 0.026789439484956, 0.032147327381947,
            0.038576792858337, 0.128589309527790, 0.192883964291685,
            0.321473273819474]
+
+# q_134 = B(1,3,4): couples L=1, L=3, L=4 moments (GPUMD: has_q_134).
+# Uses L=4 s-moments (lm indices 15..23), so it requires l_max_3b >= 4.
+C4B_134 = [0.003645164295772, 0.004860219061029, 0.006075273826286,
+           0.018225821478859, 0.024301095305146, 0.036451642957719,
+           0.042526916784005, 0.072903285915437, 0.085053833568010,
+           0.255161500704030]
 
 # Each group is (C4B_*[k] index, [(sign, (lm_idx, lm_idx, lm_idx)), ...]),
 # mirroring GPUMD's find_q line by line for easy auditing. Expanded below to
@@ -151,10 +159,25 @@ _Q233_GROUPS = [
     (8, [(+1, (11, 4, 9)), (+1, (12, 5, 9)), (+1, (10, 12, 4)), (-1, (10, 11, 5))]),
     (9, [(+1, (12, 14, 4)), (+1, (11, 14, 5)), (+1, (13, 11, 4)), (-1, (13, 12, 5))]),
 ]
+_Q134_GROUPS = [
+    (0, [(-1, (10, 15, 2)), (-1, (1, 15, 9))]),
+    (1, [(+1, (0, 15, 8))]),
+    (2, [(-1, (1, 13, 18)), (-1, (1, 14, 19)), (-1, (2, 14, 18)), (+1, (2, 13, 19))]),
+    (3, [(-1, (10, 18, 2)), (+1, (1, 10, 19)), (+1, (1, 18, 9)), (+1, (2, 19, 9))]),
+    (4, [(+1, (1, 16, 8)), (+1, (2, 17, 8))]),
+    (5, [(+1, (0, 10, 17)), (+1, (0, 16, 9)), (-1, (1, 11, 16)), (-1, (1, 12, 17)),
+         (-1, (2, 12, 16)), (+1, (2, 11, 17))]),
+    (6, [(+1, (1, 13, 22)), (+1, (1, 14, 23)), (-1, (2, 14, 22)), (+1, (2, 13, 23))]),
+    (7, [(+1, (0, 11, 18)), (+1, (0, 12, 19))]),
+    (8, [(+1, (0, 13, 20)), (+1, (0, 14, 21))]),
+    (9, [(+1, (1, 11, 20)), (+1, (1, 12, 21)), (-1, (2, 12, 20)), (+1, (2, 11, 21))]),
+]
 Q123_TERMS = [(sign * C4B_123[k], idx)
               for k, grp in _Q123_GROUPS for sign, idx in grp]
 Q233_TERMS = [(sign * C4B_233[k], idx)
               for k, grp in _Q233_GROUPS for sign, idx in grp]
+Q134_TERMS = [(sign * C4B_134[k], idx)
+              for k, grp in _Q134_GROUPS for sign, idx in grp]
 
 K_C_SP = 14.399645  # Coulomb constant (eV*Angstrom)
 

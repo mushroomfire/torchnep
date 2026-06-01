@@ -94,8 +94,8 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
-        # ``l_max`` line: L_max + 3 GPUMD-core flags + q_123 / q_233 (the
-        # GPUMD PR #1519 layout — q_1122 is gone).  Field 2 (has_q_222) is
+        # ``l_max`` line: L_max + 3 GPUMD-core flags + q_123 / q_233 / q_134
+        # (the GPUMD PR #1519 layout — q_1122 is gone).  Field 2 (has_q_222) is
         # written by ``save_nep_txt`` with the legacy "2 if on else 0"
         # encoding (matches GPUMD fitness.cu); we normalise it back to 0/1.
         parts = lines[idx].split()
@@ -105,6 +105,7 @@ class NEPCalculator:
         self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
         self.has_q_123  = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
         self.has_q_233  = 1 if (len(parts) > 6 and int(parts[6]) > 0) else 0
+        self.has_q_134  = 1 if (len(parts) > 7 and int(parts[7]) > 0) else 0
         idx += 1
 
         # ANN
@@ -113,7 +114,7 @@ class NEPCalculator:
         idx += 1
 
         # Descriptor dimension — order must match GPUMD save layout:
-        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_123 -> q_233.
+        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_123 -> q_233 -> q_134.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b   = n_ap1 * self.l_max_3b
@@ -122,10 +123,12 @@ class NEPCalculator:
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
         self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
         self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
+        self.dim_angular_134  = n_ap1 if self.has_q_134  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
                     self.dim_angular_112 +
-                    self.dim_angular_123 + self.dim_angular_233)
+                    self.dim_angular_123 + self.dim_angular_233 +
+                    self.dim_angular_134)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         # Parse data
@@ -187,6 +190,7 @@ class NEPCalculator:
         positions: np.ndarray,
         cell: np.ndarray,
         compute_descriptor: bool = False,
+        return_components: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Compute energy, forces, and per-atom virial.
 
@@ -200,10 +204,17 @@ class NEPCalculator:
             Lattice vectors (row-major).
         compute_descriptor : bool
             Also return scaled descriptors.
+        return_components : bool
+            Also split the result into the NEP (neural-network) part and the
+            ZBL repulsive part.  Adds ``energy_nep / forces_nep / virial_nep``
+            and ``energy_zbl / forces_zbl / virial_zbl`` to the output; the
+            plain ``energy / forces / virial`` keys remain the NEP+ZBL total
+            (their exact sum).  For models without ZBL the ZBL part is zero.
 
         Returns
         -------
-        dict with 'energy', 'forces', 'virial', optionally 'descriptor'.
+        dict with 'energy', 'forces', 'virial', optionally 'descriptor' and
+        (if ``return_components``) the per-contribution breakdown above.
         """
         atom_types = torch.tensor(
             [self.type_names.index(s) for s in species],
@@ -242,17 +253,19 @@ class NEPCalculator:
             self._c4b2,
             self.dtype, self.device,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
         )
 
         descriptor = (q * self.q_scaler).detach() if compute_descriptor else None
         q_scaled = q * self.q_scaler
 
-        # NN
-        Ei = ops.apply_ann(q_scaled, atom_types, self.num_types,
-                           self.w0, self.b0, self.w1, self.b1,
-                           self.dtype, self.device)
+        # NN (NEP) per-atom energy
+        Ei_nep = ops.apply_ann(q_scaled, atom_types, self.num_types,
+                               self.w0, self.b0, self.w1, self.b1,
+                               self.dtype, self.device)
 
-        # ZBL
+        # ZBL repulsive correction (depends only on angular pairs)
+        Ei_zbl = None
         if self.has_zbl:
             Ei_zbl = ops.compute_zbl(
                 atom_types, pi_ang, pj_ang, rij_ang, N,
@@ -262,23 +275,46 @@ class NEPCalculator:
                 getattr(self, "zbl_rc_outer_per_type", None),
                 self.dtype, self.device,
             )
-            Ei = Ei + Ei_zbl
 
-        E_total = Ei.sum()
+        Ei_total = Ei_nep if Ei_zbl is None else Ei_nep + Ei_zbl
 
-        # Forces & virial via autograd
-        grads = torch.autograd.grad(
-            E_total, [rij_rad, rij_ang], allow_unused=True)
-        g_rad = grads[0] if grads[0] is not None else torch.zeros_like(rij_rad)
-        g_ang = grads[1] if grads[1] is not None else torch.zeros_like(rij_ang)
+        # Force & virial of an energy term, via autograd on the pair vectors.
+        def _force_virial(energy_sum, retain_graph):
+            grads = torch.autograd.grad(
+                energy_sum, [rij_rad, rij_ang],
+                allow_unused=True, retain_graph=retain_graph)
+            g_rad = grads[0] if grads[0] is not None else torch.zeros_like(rij_rad)
+            g_ang = grads[1] if grads[1] is not None else torch.zeros_like(rij_ang)
+            return ops.accumulate_forces_virial(
+                N, pi_rad, pj_rad, rij_rad.detach(), g_rad.detach(),
+                pi_ang, pj_ang, rij_ang.detach(), g_ang.detach(),
+                self.dtype, self.device,
+            )
 
-        forces, virial = ops.accumulate_forces_virial(
-            N, pi_rad, pj_rad, rij_rad.detach(), g_rad.detach(),
-            pi_ang, pj_ang, rij_ang.detach(), g_ang.detach(),
-            self.dtype, self.device,
-        )
-
-        result = {"energy": Ei.detach(), "forces": forces, "virial": virial}
+        if not return_components:
+            forces, virial = _force_virial(Ei_total.sum(), retain_graph=False)
+            result = {"energy": Ei_total.detach(), "forces": forces,
+                      "virial": virial}
+        else:
+            if Ei_zbl is None:
+                # No ZBL: NEP == total; ZBL part is identically zero.
+                f_nep, v_nep = _force_virial(Ei_nep.sum(), retain_graph=False)
+                f_zbl = torch.zeros_like(f_nep)
+                v_zbl = torch.zeros_like(v_nep)
+                e_zbl = torch.zeros_like(Ei_nep)
+            else:
+                # Two backward passes; the totals are the (exact) component sums.
+                f_nep, v_nep = _force_virial(Ei_nep.sum(), retain_graph=True)
+                f_zbl, v_zbl = _force_virial(Ei_zbl.sum(), retain_graph=False)
+                e_zbl = Ei_zbl
+            result = {
+                "energy": Ei_total.detach(),
+                "forces": f_nep + f_zbl, "virial": v_nep + v_zbl,
+                "energy_nep": Ei_nep.detach(),
+                "forces_nep": f_nep, "virial_nep": v_nep,
+                "energy_zbl": e_zbl.detach(),
+                "forces_zbl": f_zbl, "virial_zbl": v_zbl,
+            }
         if descriptor is not None:
             result["descriptor"] = descriptor
         return result
@@ -312,6 +348,7 @@ class NEPCalculator:
             return_intermediates=True,
             backend=backend,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
         )
 
         q_scaled = q * self.q_scaler
@@ -391,6 +428,7 @@ class NEPCalculator:
             compute_virial=True,
             backend=backend,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
         )
         if zbl_forces is not None:
             forces = forces + zbl_forces

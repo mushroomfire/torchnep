@@ -31,13 +31,20 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torchnep.ops as ops
-from torchnep.constants import (Q123_TERMS, Q233_TERMS, C4B_123, C4B_233)
+from torchnep.constants import (Q123_TERMS, Q233_TERMS, Q134_TERMS,
+                                C4B_123, C4B_233, C4B_134)
 from torchnep.data import build_neighbor_list_np
 from torchnep.model import NEPModel
 from torchnep.nep import NEPCalculator
 
 DTYPE = torch.float64
-CHANNELS = {"q_123": Q123_TERMS, "q_233": Q233_TERMS}
+# name -> (term table, l_max used to build the moments, number of s-moments).
+# q_123 / q_233 need L=3 moments (15 of them); q_134 also uses L=4 (24).
+CHANNELS = {
+    "q_123": (Q123_TERMS, 3, 15),
+    "q_233": (Q233_TERMS, 3, 15),
+    "q_134": (Q134_TERMS, 4, 24),
+}
 
 
 def _rand_rotation(rng):
@@ -86,9 +93,24 @@ def _gpumd_q233(s):
             + C[9]*(s[12]*s[14]*s[4] + s[11]*s[14]*s[5] + s[13]*s[11]*s[4] - s[13]*s[12]*s[5]))
 
 
+def _gpumd_q134(s):
+    C = C4B_134
+    return (C[0]*(-s[10]*s[15]*s[2] - s[1]*s[15]*s[9])
+            + C[1]*(s[0]*s[15]*s[8])
+            + C[2]*(-s[1]*s[13]*s[18] - s[1]*s[14]*s[19] - s[2]*s[14]*s[18] + s[2]*s[13]*s[19])
+            + C[3]*(-s[10]*s[18]*s[2] + s[1]*s[10]*s[19] + s[1]*s[18]*s[9] + s[2]*s[19]*s[9])
+            + C[4]*(s[1]*s[16]*s[8] + s[2]*s[17]*s[8])
+            + C[5]*(s[0]*s[10]*s[17] + s[0]*s[16]*s[9] - s[1]*s[11]*s[16] - s[1]*s[12]*s[17]
+                    - s[2]*s[12]*s[16] + s[2]*s[11]*s[17])
+            + C[6]*(s[1]*s[13]*s[22] + s[1]*s[14]*s[23] - s[2]*s[14]*s[22] + s[2]*s[13]*s[23])
+            + C[7]*(s[0]*s[11]*s[18] + s[0]*s[12]*s[19])
+            + C[8]*(s[0]*s[13]*s[20] + s[0]*s[14]*s[21])
+            + C[9]*(s[1]*s[11]*s[20] + s[1]*s[12]*s[21] - s[2]*s[12]*s[20] + s[2]*s[11]*s[21]))
+
+
 @pytest.mark.parametrize("name", list(CHANNELS))
 def test_rotational_invariance(name):
-    terms = CHANNELS[name]
+    terms, l_max, _ = CHANNELS[name]
     rng = np.random.default_rng(2026)
     worst = 0.0
     for _ in range(150):
@@ -96,29 +118,30 @@ def test_rotational_invariance(name):
         dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
         w = rng.standard_normal(10)
         R = _rand_rotation(rng)
-        q0 = _eval(_moments(dirs, w), terms)
-        q1 = _eval(_moments(dirs @ R.T, w), terms)
+        q0 = _eval(_moments(dirs, w, l_max), terms)
+        q1 = _eval(_moments(dirs @ R.T, w, l_max), terms)
         worst = max(worst, abs(q1 - q0) / (abs(q0) + 1e-12))
     assert worst < 1e-10, f"{name}: rotational variance {worst:.2e}"
 
 
-@pytest.mark.parametrize("name,ref", [("q_123", _gpumd_q123), ("q_233", _gpumd_q233)])
+@pytest.mark.parametrize("name,ref", [("q_123", _gpumd_q123), ("q_233", _gpumd_q233),
+                                      ("q_134", _gpumd_q134)])
 def test_matches_gpumd_polynomial(name, ref):
     """torchnep term tables are bit-identical to GPUMD's find_q polynomial."""
-    terms = CHANNELS[name]
+    terms, _, n_s = CHANNELS[name]
     rng = np.random.default_rng(7)
     worst = 0.0
     for _ in range(2000):
-        s = rng.standard_normal(15)
+        s = rng.standard_normal(n_s)
         worst = max(worst, abs(_eval(s, terms) - ref(s)))
     assert worst < 1e-12, f"{name}: max |torchnep - GPUMD| = {worst:.2e}"
 
 
 @pytest.mark.parametrize("name", list(CHANNELS))
 def test_extra_grad_matches_autograd(name):
-    terms = CHANNELS[name]
+    terms, _, n_s = CHANNELS[name]
     torch.manual_seed(7)
-    s = torch.randn(3, 4, 15, dtype=DTYPE, requires_grad=True)
+    s = torch.randn(3, 4, n_s, dtype=DTYPE, requires_grad=True)
     q = ops._eval_extra(s, terms)
     grad_auto, = torch.autograd.grad(q.sum(), s)
     grad_ana = ops._extra_grad(s.detach(), terms)
@@ -169,9 +192,9 @@ def _random_batch(N=40, seed=0):
 
 
 def test_analytical_force_vs_autograd():
-    """Both channels on: analytical force/virial == autograd-on-rij."""
-    # 6 fields after PR #1519: L_3b, q_222, q_1111, q_112, q_123, q_233
-    m = _build_model([4, 1, 0, 1, 1, 1])
+    """All channels on: analytical force/virial == autograd-on-rij."""
+    # 7 fields: L_3b, q_222, q_1111, q_112, q_123, q_233, q_134
+    m = _build_model([4, 1, 0, 1, 1, 1, 1])
     batch, (pi, pj, rij, dij, at) = _random_batch()
     N = batch["N"]
     with torch.enable_grad():
@@ -195,15 +218,15 @@ def test_analytical_force_vs_autograd():
 
 
 def test_nep_txt_round_trip(tmp_path):
-    m = _build_model([4, 1, 0, 1, 1, 1])
+    m = _build_model([4, 1, 0, 1, 1, 1, 1])
     p = tmp_path / "nep.txt"
     m.save_nep_txt(str(p), max_NN_radial=100, max_NN_angular=60)
     text = p.read_text()
-    # 6-field GPUMD form (PR #1519). Field 2 uses the legacy
-    # ``has_q_222 ? 2 : 0`` encoding so older GPUMD builds still load it.
-    assert "l_max 4 2 0 1 1 1" in text
+    # 7-field GPUMD form. Field 2 uses the legacy ``has_q_222 ? 2 : 0``
+    # encoding so older GPUMD builds still load it.
+    assert "l_max 4 2 0 1 1 1 1" in text
     calc = NEPCalculator(str(p), dtype=DTYPE)
-    assert (calc.has_q_123, calc.has_q_233) == (1, 1)
+    assert (calc.has_q_123, calc.has_q_233, calc.has_q_134) == (1, 1, 1)
     assert calc.dim == m.dim
     rng = np.random.default_rng(1)
     pos = rng.random((12, 3)) * 8.0
@@ -220,11 +243,19 @@ def test_lmax_guard():
         _build_model([2, 1, 0, 0, 1, 0])  # l_max_3b=2, q_123 on
 
 
+def test_lmax_guard_q134():
+    """q_134 needs l_max_3b >= 4 (it uses L=4 moments)."""
+    with pytest.raises(ValueError):
+        # q_134 at field 7; l_max_3b=3 is insufficient
+        _build_model([3, 1, 0, 0, 0, 0, 1])
+
+
 def test_off_by_default():
-    # 4-field GPUMD-core only — q_123/q_233 default to 0
+    # 4-field GPUMD-core only — q_123/q_233/q_134 default to 0
     m = _build_model([4, 1, 0, 1])
-    assert (m.has_q_123, m.has_q_233) == (0, 0)
+    assert (m.has_q_123, m.has_q_233, m.has_q_134) == (0, 0, 0)
     assert m.dim_angular_123 == 0 and m.dim_angular_233 == 0
+    assert m.dim_angular_134 == 0
 
 
 def test_q1111_redundancy_warns():

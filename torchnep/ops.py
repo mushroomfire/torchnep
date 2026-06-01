@@ -10,7 +10,7 @@ import torch
 from typing import List, Literal, Optional, Tuple
 
 from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
-                        Q123_TERMS, Q233_TERMS)
+                        Q123_TERMS, Q233_TERMS, Q134_TERMS)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ def compute_descriptors(
     c4b2_coeffs,
     dtype, device,
     backend: str = "auto",
-    has_q_123: int = 0, has_q_233: int = 0,
+    has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
 ) -> torch.Tensor:
     r"""Compute NEP4 descriptors from raw pair geometry. Returns (N, dim).
 
@@ -319,7 +319,7 @@ def compute_descriptors(
         # angular blocks so output dim still matches q_scaler.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
         for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
-                       + int(has_q_123) + int(has_q_233)):
+                       + int(has_q_123) + int(has_q_233) + int(has_q_134)):
             parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
@@ -388,6 +388,8 @@ def compute_descriptors(
             parts.append(_eval_extra(s, Q123_TERMS))
         if has_q_233:
             parts.append(_eval_extra(s, Q233_TERMS))
+        if has_q_134:
+            parts.append(_eval_extra(s, Q134_TERMS))
 
     q = torch.cat(parts, dim=-1)
     # DDP gradient pin (see compute_descriptors_cached for why).
@@ -636,7 +638,7 @@ def compute_descriptors_cached(
     dtype, device,
     return_intermediates: bool = False,
     backend: str = "loop",
-    has_q_123: int = 0, has_q_233: int = 0,
+    has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
 ):
     r"""Compute descriptors using precomputed basis functions.
 
@@ -692,7 +694,7 @@ def compute_descriptors_cached(
         # returned dim still matches q_scaler / the NN's input layer.
         parts.append(torch.zeros(N, n_ap1 * l_max_3b, dtype=dtype, device=device))
         for _ in range(int(has_q_222) + int(has_q_1111) + int(has_q_112)
-                       + int(has_q_123) + int(has_q_233)):
+                       + int(has_q_123) + int(has_q_233) + int(has_q_134)):
             parts.append(torch.zeros(N, n_ap1, dtype=dtype, device=device))
 
     if l_max_3b > 0 and fk_ang.shape[0] > 0:
@@ -756,6 +758,8 @@ def compute_descriptors_cached(
             parts.append(_eval_extra(s, Q123_TERMS))
         if has_q_233:
             parts.append(_eval_extra(s, Q233_TERMS))
+        if has_q_134:
+            parts.append(_eval_extra(s, Q134_TERMS))
 
     q = torch.cat(parts, dim=-1)
     # DDP gradient pin: when a batch has no pairs (all-monomer bucket under
@@ -855,7 +859,7 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
                     has_q_222, has_q_1111, has_q_112,
                     c3b_coeffs, c4b_coeffs, c5b_coeffs,
                     c4b2_coeffs,
-                    has_q_123=0, has_q_233=0):
+                    has_q_123=0, has_q_233=0, has_q_134=0):
     """Compute dEi/d(sum_fxyz)[N, n_ap1, num_lm] for ALL body orders.
 
     This is the "effective Fp" in sum_fxyz space needed for the analytical
@@ -949,6 +953,9 @@ def _angular_weight(Fp, s, dim_r, n_ap1, l_max_3b,
     if has_q_233:
         Fp_c = Fp[:, off:off + n_ap1]; off += n_ap1
         weight = weight + Fp_c.unsqueeze(-1) * _extra_grad(s, Q233_TERMS)
+    if has_q_134:
+        Fp_c = Fp[:, off:off + n_ap1]; off += n_ap1
+        weight = weight + Fp_c.unsqueeze(-1) * _extra_grad(s, Q134_TERMS)
 
     return weight  # (N, n_ap1, num_lm)
 
@@ -966,7 +973,7 @@ def compute_analytical_forces(
     dtype, device,
     compute_virial: bool = True,
     backend: str = "loop",
-    has_q_123: int = 0, has_q_233: int = 0,
+    has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -1051,7 +1058,8 @@ def compute_analytical_forces(
                                  c3b_coeffs, c4b_coeffs, c5b_coeffs,
                                  c4b2_coeffs,
                                  has_q_123=has_q_123,
-                                 has_q_233=has_q_233)  # (N, n_ap1, num_lm)
+                                 has_q_233=has_q_233,
+                                 has_q_134=has_q_134)  # (N, n_ap1, num_lm)
         w_i = w_atom[pi_ang]   # (P, n_ap1, num_lm) — atom_i's weight per pair
 
         # Term 1: distance derivative — f12 = (sum_n,lm w_i * gnp * blm) * rij/dij

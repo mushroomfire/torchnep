@@ -65,7 +65,7 @@ class NEPModel(nn.Module):
         self.basis_size_angular = config["basis_size_angular"]
         # ``l_max`` accepts the legacy 2-field form through GPUMD PR #1519's
         # 6-field form. Everything past index 0 is normalised to a 0/1 flag:
-        #   [L_max, q_222, q_1111, q_112, q_123, q_233]
+        #   [L_max, q_222, q_1111, q_112, q_123, q_233, q_134]
         # (GPUMD PR #1519 removed the historical q_1122 slot, so field 4 is
         # now q_112 directly — matching GPUMD's parse_l_max after the PR.)
         lm = list(config["l_max"])
@@ -75,11 +75,15 @@ class NEPModel(nn.Module):
         self.has_q_112  = 1 if (len(lm) > 3 and lm[3] > 0) else 0
         self.has_q_123  = 1 if (len(lm) > 4 and lm[4] > 0) else 0
         self.has_q_233  = 1 if (len(lm) > 5 and lm[5] > 0) else 0
+        self.has_q_134  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
         self.num_neurons = config["neuron"]
 
         # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
         if (self.has_q_123 or self.has_q_233) and self.l_max_3b < 3:
             raise ValueError("q_123 / q_233 require l_max_3b >= 3")
+        # q_134 couples L=1, L=3, L=4 moments, so it needs L=4 moments.
+        if self.has_q_134 and self.l_max_3b < 4:
+            raise ValueError("q_134 requires l_max_3b >= 4")
         # q_1111 is redundant: it equals const * (3-body L=1 descriptor)^2,
         # so it adds no information. Kept for backward compatibility, but warn.
         if self.has_q_1111:
@@ -113,7 +117,7 @@ class NEPModel(nn.Module):
 
         # Dimensions — angular layout matches GPUMD: 3-body, then each
         # enabled mixed-body block in the fixed order 222 / 1111 / 112,
-        # then the optional q_123 / q_233 bispectrum blocks.
+        # then the optional q_123 / q_233 / q_134 bispectrum blocks.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b = n_ap1 * self.l_max_3b
@@ -122,10 +126,12 @@ class NEPModel(nn.Module):
         self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
         self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
         self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
+        self.dim_angular_134  = n_ap1 if self.has_q_134  else 0
         self.dim = (self.dim_radial + self.dim_angular_3b +
                     self.dim_angular_4b + self.dim_angular_5b +
                     self.dim_angular_112 +
-                    self.dim_angular_123 + self.dim_angular_233)
+                    self.dim_angular_123 + self.dim_angular_233 +
+                    self.dim_angular_134)
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         # Learnable c parameters
@@ -176,6 +182,7 @@ class NEPModel(nn.Module):
             rij_rad.dtype, rij_rad.device,
             backend=backend,
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
         )
 
     def forward(self, rij_rad, rij_ang, pi_rad, pj_rad,
@@ -285,6 +292,7 @@ class NEPModel(nn.Module):
                 return_intermediates=True,
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
             )
         else:
             q = ops.compute_descriptors_cached(
@@ -300,6 +308,7 @@ class NEPModel(nn.Module):
                 dtype, device,
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
             )
             s = gn_ang = None
 
@@ -398,6 +407,7 @@ class NEPModel(nn.Module):
                 compute_virial=need_virial,
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
             )
             if zbl_forces is not None:
                 forces = forces + zbl_forces
@@ -527,7 +537,7 @@ class NEPModel(nn.Module):
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
-        # l_max line: L_max + GPUMD-core flags + q_123 / q_233.
+        # l_max line: L_max + GPUMD-core flags + q_123 / q_233 / q_134.
         #
         # Field 2 (has_q_222) is written with the legacy encoding "2 if on
         # else 0" — this matches GPUMD's fitness.cu (``has_q_222 ? 2 : 0``)
@@ -541,7 +551,7 @@ class NEPModel(nn.Module):
                       2 if self.has_q_222 else 0,
                       self.has_q_1111,
                       self.has_q_112,
-                      self.has_q_123, self.has_q_233]
+                      self.has_q_123, self.has_q_233, self.has_q_134]
         while len(lmax_flags) > 3 and lmax_flags[-1] == 0:
             lmax_flags.pop()
         lines.append("l_max " + " ".join(str(x) for x in lmax_flags))
@@ -617,7 +627,7 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         "basis_size_angular": model.basis_size_angular,
         "l_max":              [model.l_max_3b, model.has_q_222, model.has_q_1111,
                                model.has_q_112,
-                               model.has_q_123, model.has_q_233],
+                               model.has_q_123, model.has_q_233, model.has_q_134],
         "neuron":             model.num_neurons,
     }
     if model.zbl is not None:

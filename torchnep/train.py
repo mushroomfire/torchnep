@@ -137,10 +137,10 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('basis_size_radial', 'basis_size_angular'):10}  "
                  f"basis_size   "
                  f"{config['basis_size_radial']} {config['basis_size_angular']}")
-    lm_pad = (config['l_max'] + [0] * 6)[:6]
+    lm_pad = (config['l_max'] + [0] * 7)[:7]
     lines.append(f"  {tag('l_max'):10}  l_max        "
                  f"{' '.join(str(x) for x in lm_pad)}\n"
-                 f"  {'':10}  (L_3b, q_222, q_1111, q_112, q_123, q_233)")
+                 f"  {'':10}  (L_3b, q_222, q_1111, q_112, q_123, q_233, q_134)")
     lines.append(f"  {tag('neuron'):10}  neuron       {config['neuron']}")
     if config.get("zbl") is not None:
         zbl_extra = ""
@@ -610,6 +610,7 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
             dtype, dev,
             backend=backend,
             has_q_123=model.has_q_123, has_q_233=model.has_q_233,
+            has_q_134=model.has_q_134,
         )
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)

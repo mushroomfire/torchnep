@@ -359,7 +359,7 @@ def parse_nep_in(filename: str) -> Dict:
     # Matches the GPUMD default ``l_max 4 1 0`` — L_max=4, q_222=1
     # (4-body on), q_1111=0; everything beyond is off.  Fields, after the
     # GPUMD PR #1519 removal of q_1122, are [L_3b, q_222, q_1111, q_112,
-    # q_123, q_233]; every trailing flag is normalised to 0/1 in NEPModel.
+    # q_123, q_233, q_134]; every trailing flag is normalised to 0/1 in NEPModel.
     params.setdefault("l_max", [4, 1, 0])
     params.setdefault("neuron", 30)
 

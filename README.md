@@ -195,7 +195,7 @@ all-reduce hangs.
 | `cutoff` | `8.0 4.0` | Radial and angular cutoff (Å) |
 | `n_max` | `6 6` | Radial and angular expansion orders |
 | `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular). Max 16 |
-| `l_max` | `4 1 0 0 0` | `L_3b q_222 q_1111 q_112 q_1122 q_123 q_233` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD PR #1517) enabling each higher-body invariant. `q_123`/`q_233` (4-body bispectrum, fields 6–7) need `L_3b ≥ 3`. `q_1111` is redundant (= const × 3-body L=1 squared) — kept for compatibility but warns if set. Legacy 3-field form `L l_max_4b l_max_5b` still accepted |
+| `l_max` | `4 1 0 0 0` | `L_3b q_222 q_1111 q_112 q_123 q_233 q_134` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD) enabling each higher-body invariant. `q_123`/`q_233` (4-body bispectrum, fields 5–6) need `L_3b ≥ 3`; `q_134` (field 7) needs `L_3b ≥ 4`. `q_1111` is redundant (= const × 3-body L=1 squared) — kept for compatibility but warns if set. Legacy 3-field form `L l_max_4b l_max_5b` still accepted |
 | `neuron` | `30` | Hidden layer width |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
@@ -382,7 +382,7 @@ slimmed.save_nep_txt("nep_slim.txt", max_NN_radial=127, max_NN_angular=42)
 ### Single-structure prediction
 
 ```python
-from torchnep import NEPCalculator
+from torchnep.nep import NEPCalculator
 import numpy as np
 
 calc = NEPCalculator("nep.txt")
@@ -394,7 +394,38 @@ result = calc.compute(
 print(result["energy"])         # (N,) per-atom energy (eV); sum for total
 print(result["forces"])         # (N, 3) forces (eV/Å)
 print(result["virial"])         # (N, 9) per-atom virial (eV)
+
+# Split the NEP (neural-network) part from the ZBL repulsive part:
+result = calc.compute(..., return_components=True)
+print(result["energy_nep"], result["energy_zbl"])   # sum == result["energy"]
 ```
+
+`NEPCalculator` is an internal building block, so it is imported from
+`torchnep.nep` rather than the package root (the package exports only the three
+high-level entry points `train_nep`, `train_nep_sharded`, `predict_dataset`).
+
+### ASE calculator
+
+If [ASE](https://wiki.fysik.dtu.dk/ase/) is installed (`pip install torchnep[ase]`),
+any ASE workflow (relaxation, MD, EOS, …) can drive a trained model:
+
+```python
+from ase.io import read
+from torchnep.ase_calculator import NEP
+
+atoms = read("POSCAR")
+atoms.calc = NEP("nep.txt")
+print(atoms.get_potential_energy())   # eV
+print(atoms.get_forces())             # (N, 3) eV/Å
+print(atoms.get_stress())             # Voigt 6-vector eV/Å³ (periodic cells)
+
+# NEP / ZBL / total breakdown of energy, forces, and stress:
+parts = atoms.calc.get_components()
+print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
+```
+
+ASE is an **optional** dependency — it is not required for training or
+prediction, and `torchnep.ase_calculator` raises a clear error if it is missing.
 
 ### Full-dataset prediction
 
