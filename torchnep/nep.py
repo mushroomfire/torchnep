@@ -280,6 +280,11 @@ class NEPCalculator:
 
         # Force & virial of an energy term, via autograd on the pair vectors.
         def _force_virial(energy_sum, retain_graph):
+            # A term with no grad history (e.g. ZBL when every pair is beyond
+            # its cutoff) contributes zero force/virial — autograd would raise.
+            if not energy_sum.requires_grad:
+                return (torch.zeros((N, 3), dtype=self.dtype, device=self.device),
+                        torch.zeros((N, 9), dtype=self.dtype, device=self.device))
             grads = torch.autograd.grad(
                 energy_sum, [rij_rad, rij_ang],
                 allow_unused=True, retain_graph=retain_graph)
