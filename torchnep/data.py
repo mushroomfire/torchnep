@@ -378,10 +378,13 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
-    # Defaults for optional stage-2 parameters (only used if stage2=1)
+    # Defaults for optional stage-2 parameters (only used if stage2=1).
+    # Stage 2 flips the energy/force emphasis: stage 1 is force-dominated
+    # (1/100/1) to fit geometry/forces first, stage 2 is energy-dominated
+    # (100/1/1) to refine energies at the lower stage-2 learning rate.
     params.setdefault("stage2_lr", 1e-3)
-    params.setdefault("stage2_pref_e", 1.0)
-    params.setdefault("stage2_pref_f", 100.0)
+    params.setdefault("stage2_pref_e", 100.0)
+    params.setdefault("stage2_pref_f", 1.0)
     params.setdefault("stage2_pref_v", 1.0)
     # start_stage2 defaults to 0.75 * num_epochs if not set — handled in trainer
 
