@@ -25,3 +25,7 @@
 /descriptor_experiment/
 # Local-only scratch: multi-card repro scripts, temp configs, run outputs.
 /scratch/
+# Local-only benchmarks (compile / autograd vs analytical speed tests).
+/bench_test/
+# Local-only docs / notes (diagrams, LaTeX, markdown explanations).
+/docs/

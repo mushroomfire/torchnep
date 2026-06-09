@@ -52,9 +52,23 @@ class _NEPDDPShim(nn.Module):
     this shim's ``forward`` puts it on the DDP path.
     """
 
-    def __init__(self, model: NEPModel):
+    def __init__(self, model: NEPModel, use_compile: bool = False):
         super().__init__()
         self.model = model
+        # torch.compile is applied to the bound analytical compute method, not
+        # to ``model`` — the heavy compute lives in compute_properties_cached,
+        # NOT in NEPModel.forward(), so compiling the module would be a no-op.
+        # The compiled call stays INSIDE this shim's forward, so it remains on
+        # DDP's forward path and the reducer still arms backward all-reduce; the
+        # compiled region does not span the DDP boundary. The autograd path is
+        # left eager (its create_graph=True double backward is incompatible with
+        # torch.compile's donated-buffer optimisation). See train.py for the
+        # single-device counterpart.
+        if use_compile and hasattr(torch, "compile"):
+            self._compute_cached = torch.compile(
+                model.compute_properties_cached, dynamic=True)
+        else:
+            self._compute_cached = model.compute_properties_cached
 
     def forward(self, batch, use_autograd_forces: bool,
                 need_forces: bool, need_virial: bool, backend: str):
@@ -67,7 +81,7 @@ class _NEPDDPShim(nn.Module):
                 batch["struct_idx"], batch["num_structures"],
                 need_forces=need_forces, need_virial=need_virial,
                 backend=backend)
-        return self.model.compute_properties_cached(
+        return self._compute_cached(
             batch, need_forces=need_forces, need_virial=need_virial,
             backend=backend)
 
@@ -78,6 +92,7 @@ from .train import (
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
+    _compile_check,
 )
 
 
@@ -419,14 +434,24 @@ def train_nep_sharded(
         torch.cuda.synchronize()
     _log(f"  q_scaler in {time.time() - t_qs:.1f}s (all-reduce across shards)")
 
-    if use_compile and hasattr(torch, "compile"):
-        model = torch.compile(model)
-        _log("  torch.compile: enabled")
-
     # Wrap in a shim whose forward calls compute_properties{_cached} — this
     # keeps the force/virial compute on DDP's forward path so the reducer can
-    # arm backward all-reduce. See _NEPDDPShim docstring.
-    shim = _NEPDDPShim(model)
+    # arm backward all-reduce. See _NEPDDPShim docstring. torch.compile is
+    # applied INSIDE the shim (to the bound analytical method), not to the
+    # module — compiling the module only wraps NEPModel.forward(), which the
+    # training loop never calls, so it would be a no-op (the bug this fixes).
+    compile_on = False
+    if use_compile:
+        ok, msg = _compile_check(dev)
+        if not ok:
+            _log(f"  torch.compile: disabled — {msg}")
+        elif use_autograd_forces:
+            _log("  torch.compile: skipped — incompatible with autograd "
+                 "double-backward forces (analytical path supports it)")
+        else:
+            compile_on = True
+            _log("  torch.compile: enabled (analytical compute method)")
+    shim = _NEPDDPShim(model, use_compile=compile_on)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
     # every step — no need for find_unused_parameters, and no implicit grad
@@ -434,10 +459,10 @@ def train_nep_sharded(
     model = DDP(shim,
                 device_ids=[gpu_id] if cuda_available else None,
                 find_unused_parameters=False)
-    # raw_model: unwrap DDP -> shim -> (optional torch.compile) -> NEPModel
+    # raw_model: unwrap DDP -> shim -> NEPModel (compile now lives on a bound
+    # method inside the shim, so model.model is the plain NEPModel).
     _shim = model.module
-    inner = _shim.model
-    raw_model = inner._orig_mod if hasattr(inner, "_orig_mod") else inner
+    raw_model = _shim.model
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=lambda_2, amsgrad=True)

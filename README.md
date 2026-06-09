@@ -253,7 +253,7 @@ launch time:
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
 | `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.*` |
-| `use_compile` | `False` | wrap in `torch.compile` |
+| `use_compile` | `False` | `torch.compile` the analytical compute method (~25-30% faster/epoch after a one-time compile; needs Triton; ignored on the autograd path) |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_train.out` — live parity plot |
@@ -262,6 +262,45 @@ launch time:
 | `reset_lr` | `None` | override LR after resume/finetune |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
+
+#### `use_compile` — conditions and failure behaviour
+
+`use_compile=True` wraps the **analytical** compute method (not the module) in
+`torch.compile`, giving roughly **25–30 % faster epochs** after a one-time
+first-epoch compilation cost (tens of seconds). It works for both single-GPU
+(`train_nep`) and DDP (`train_nep_sharded`); under DDP the compiled region
+stays inside the gradient-synced forward path, so all-reduce is unaffected
+(verified: compiled grads match the world-averaged eager grads to ~1e-7).
+
+Requirements:
+
+- **Triton** must be importable on the machine that runs training — the CUDA
+  backend (TorchInductor) lowers to Triton kernels. It ships with the standard
+  CUDA PyTorch wheels, but on a cluster make sure `python -c "import triton"`
+  succeeds **on the compute node**, not just the login node. (On CPU, Inductor
+  uses its C++ backend and needs no Triton.)
+- A working C/C++ compiler in `PATH` (Inductor compiles generated code).
+
+If the preconditions are not met, training does **not** crash — it logs a
+warning and falls back to eager. You will see one of these lines near the top
+of `output.log` / the console:
+
+```
+  torch.compile: enabled (analytical compute method)        # working
+  torch.compile: disabled — Triton not found (...)          # missing Triton -> eager fallback
+  torch.compile: disabled — torch.compile is unavailable... # PyTorch too old -> eager fallback
+  torch.compile: skipped — incompatible with autograd ...   # use_autograd_forces=True -> eager
+```
+
+Notes:
+
+- `use_compile` is **ignored on the autograd force path**
+  (`use_autograd_forces=True`): that path uses `create_graph=True` (double
+  backward), which is incompatible with `torch.compile`'s donated-buffer
+  optimisation. The analytical (default) path is the one that benefits.
+- The Triton precheck guards the common cluster case; a compile failure for
+  some *other* reason (e.g. a broken Inductor toolchain) would still raise at
+  the first batch — in that case set `use_compile=False`.
 
 ---
 

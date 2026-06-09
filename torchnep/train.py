@@ -700,6 +700,26 @@ def _load_checkpoint(path, model, optimizer, scheduler, device):
     return ckpt["epoch"], ckpt["best_loss"], ckpt.get("loss_weights")
 
 
+def _compile_check(dev):
+    """Decide whether torch.compile can be used; never raises.
+
+    Returns (ok: bool, msg: str). The CUDA backend (TorchInductor) lowers to
+    Triton kernels, so Triton must be importable — this is the usual failure
+    mode on a cluster compute node. On CPU, Inductor uses the C++ backend and
+    needs no Triton. ``msg`` is a short reason when ``ok`` is False, so callers
+    can log a warning and fall back to eager instead of crashing mid-training.
+    """
+    if not hasattr(torch, "compile"):
+        return False, "torch.compile is unavailable in this PyTorch build"
+    if dev.type == "cuda":
+        import importlib.util
+        if importlib.util.find_spec("triton") is None:
+            return False, ("Triton not found (the CUDA TorchInductor backend "
+                           "needs it) — install triton, or set "
+                           "use_compile=False to silence this")
+    return True, ""
+
+
 # ---------------------------------------------------------------------------
 # Unified training entry point (single GPU or torchrun DDP)
 # ---------------------------------------------------------------------------
@@ -740,7 +760,10 @@ def train_nep(
         standard); False (default) -> analytical chain rule.
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` / ``nep_average.pt`` at the end.
-    use_compile : wrap model in torch.compile (~10 % extra speedup).
+    use_compile : torch.compile the analytical compute method (~25-30 % faster
+        per epoch after a one-time first-epoch compilation cost; needs Triton,
+        which ships with the CUDA PyTorch build). Ignored on the autograd force
+        path (incompatible with its double-backward).
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
@@ -929,11 +952,35 @@ def train_nep(
         torch.cuda.synchronize()
     _log(f"  q_scaler in {time.time() - t0:.1f}s")
 
-    if use_compile and hasattr(torch, "compile"):
-        model = torch.compile(model)
-        _log("  torch.compile: enabled")
-
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
+    # torch.compile: compile the bound compute METHOD, not the module.
+    # The training loop calls compute_properties[_cached] directly — these are
+    # NOT the module's forward(), so torch.compile(model) only wraps forward()
+    # and is a pure no-op for training (the heavy compute never runs through the
+    # compiled entry point). Compiling the bound method shares parameters with
+    # raw_model, so the optimizer / grad-clipping below still act on the same
+    # tensors. dynamic=True avoids a recompile per distinct batch shape (atom /
+    # pair counts vary every minibatch); graph breaks around ZBL and the
+    # data-dependent type loops are tolerated (fullgraph=False default).
+    #
+    # Only the analytical force path is compiled. The autograd path uses
+    # create_graph=True (double backward), which is incompatible with
+    # torch.compile's donated-buffer optimisation and raises at backward; it is
+    # the slow reference path anyway, so we leave it eager.
+    compute_props = raw_model.compute_properties
+    compute_props_cached = raw_model.compute_properties_cached
+    if use_compile:
+        ok, msg = _compile_check(dev)
+        if not ok:
+            _log(f"  torch.compile: disabled — {msg}")
+        elif use_autograd_forces:
+            _log("  torch.compile: skipped — incompatible with autograd "
+                 "double-backward forces (analytical path supports it)")
+        else:
+            compute_props_cached = torch.compile(
+                raw_model.compute_properties_cached, dynamic=True)
+            _log("  torch.compile: enabled (analytical compute method)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=lambda_2, amsgrad=True)
@@ -1089,7 +1136,7 @@ def train_nep(
                 batch = data_store.collate(idx)
 
                 if use_autograd_forces:
-                    result = raw_model.compute_properties(
+                    result = compute_props(
                         batch["rij_rad"], batch["rij_ang"],
                         batch["pair_i_rad"], batch["pair_j_rad"],
                         batch["pair_i_ang"], batch["pair_j_ang"],
@@ -1098,7 +1145,7 @@ def train_nep(
                         need_forces=has_forces, need_virial=has_virial,
                         backend=backend)
                 else:
-                    result = raw_model.compute_properties_cached(
+                    result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
                         backend=backend)
 
