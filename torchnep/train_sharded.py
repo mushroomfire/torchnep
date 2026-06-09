@@ -117,6 +117,7 @@ from .train import (
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
+    _clean_warning_format,
 )
 
 
@@ -207,6 +208,8 @@ def train_nep_sharded(
     are the DDP launch, CUDA/gloo backend auto-select, and distributed
     q_scaler/metric aggregation.
     """
+    _clean_warning_format()
+
     # ---- Distributed init ------------------------------------------------
     # Wrap local_rank around the number of visible GPUs — lets several
     # processes share one GPU (useful for locally simulating multi-rank DDP).

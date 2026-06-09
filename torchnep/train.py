@@ -717,6 +717,18 @@ def _quiet_compile_logs():
         logging.getLogger(name).setLevel(logging.ERROR)
 
 
+def _clean_warning_format():
+    """Show warnings as a one-line ``Category: message`` — drop the
+    ``file:line:`` prefix and the source-line echo. The default formatter prints
+    the triggering line of code under the message (e.g. ``model =
+    NEPModel(...)`` below the redundant-q_1111 notice), which is just noise.
+    """
+    import warnings
+    warnings.formatwarning = (
+        lambda message, category, filename, lineno, line=None:
+        f"{category.__name__}: {message}\n")
+
+
 def _maybe_enable_tf32(dev, dtype, log):
     """TF32 tensor-core matmul — OFF by default.
 
@@ -817,6 +829,8 @@ def train_nep(
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
     """
+    _clean_warning_format()
+
     # ---- Device ----------------------------------------------------------
     if device is None:
         device = _default_device()
