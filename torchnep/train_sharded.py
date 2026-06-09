@@ -116,7 +116,7 @@ from .train import (
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
-    _compile_check, _quiet_compile_logs,
+    _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
 )
 
 
@@ -279,6 +279,7 @@ def train_nep_sharded(
     for line in _backend_info(dev, world_size):
         _log(line)
     _log(f"Precision: {precision}")
+    _maybe_enable_tf32(dev, dtype, _log)   # sets the flag on every rank
     _log(f"Mode     : data-sharded DDP ({world_size} ranks, "
          f"each holds 1/{world_size} of structures)")
     _log("")

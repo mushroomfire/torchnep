@@ -712,8 +712,28 @@ def _quiet_compile_logs():
     logging.getLogger("torch._dynamo").setLevel(logging.WARNING).
     """
     import logging
-    for name in ("torch._dynamo", "torch._inductor"):
+    for name in ("torch._dynamo", "torch._inductor",
+                 "torch.fx.experimental.symbolic_shapes"):
         logging.getLogger(name).setLevel(logging.ERROR)
+
+
+def _maybe_enable_tf32(dev, dtype, log):
+    """Enable TF32 tensor-core matmul for float32 CUDA training.
+
+    On Ampere+ GPUs (A100/H100/RTX 30xx+) float32 matmuls can use TF32 tensor
+    cores — a large speedup (inputs rounded to a 10-bit mantissa, accumulation
+    stays in fp32). PyTorch defaults to full fp32 ("highest"); Inductor prints a
+    UserWarning recommending "high". We enable it for float32 CUDA runs (and log
+    it, so it is not silent). No-op on hardware without TF32 (e.g. V100), and
+    never touched for float64 (use ``precision="float64"`` for full precision).
+    Set ``TORCHNEP_TF32=0`` in the environment to keep bit-for-bit fp32 matmul.
+    """
+    if dev.type == "cuda" and dtype == torch.float32:
+        if os.environ.get("TORCHNEP_TF32", "1") == "0":
+            log("  TF32 matmul: disabled (TORCHNEP_TF32=0) — full fp32 matmul")
+            return
+        torch.set_float32_matmul_precision("high")
+        log("  TF32 matmul: enabled for speed (set TORCHNEP_TF32=0 to disable)")
 
 
 def _compile_check(dev):
@@ -825,6 +845,7 @@ def train_nep(
     for line in _backend_info(dev):
         _log(line)
     _log(f"Precision: {precision}")
+    _maybe_enable_tf32(dev, dtype, _log)
     _log("")
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
