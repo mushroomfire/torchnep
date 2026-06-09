@@ -700,6 +700,22 @@ def _load_checkpoint(path, model, optimizer, scheduler, device):
     return ckpt["epoch"], ckpt["best_loss"], ckpt.get("loss_weights")
 
 
+def _quiet_compile_logs():
+    """Silence torch.compile's graph-break WARNING spam.
+
+    The analytical compute has intentional data-dependent control flow (per-type
+    loops with boolean masks -> aten.nonzero, ZBL .item()) that Dynamo cannot
+    trace, so it logs a graph break for each — harmless (it just falls back to
+    eager for those ops), but very noisy, especially under DDP (every rank,
+    every recompile). Raise the dynamo/inductor loggers to ERROR so genuine
+    compile failures still surface. To see the graph breaks again, set
+    logging.getLogger("torch._dynamo").setLevel(logging.WARNING).
+    """
+    import logging
+    for name in ("torch._dynamo", "torch._inductor"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 def _compile_check(dev):
     """Decide whether torch.compile can be used; never raises.
 
@@ -760,10 +776,12 @@ def train_nep(
         standard); False (default) -> analytical chain rule.
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` / ``nep_average.pt`` at the end.
-    use_compile : torch.compile the analytical compute method (~25-30 % faster
-        per epoch after a one-time first-epoch compilation cost; needs Triton,
-        which ships with the CUDA PyTorch build). Ignored on the autograd force
-        path (incompatible with its double-backward).
+    use_compile : torch.compile the analytical compute method (~1.3x faster per
+        epoch after a one-time first-epoch compilation cost; needs Triton, which
+        ships with the CUDA PyTorch build). Ignored on the autograd force path
+        (incompatible with its double-backward). For an extra ~1.3x when memory
+        allows, also pass backend="bmm" (faster under compile but higher peak
+        memory — see docs/torch_compile.md).
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
@@ -939,7 +957,11 @@ def train_nep(
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # Resolve "auto" backend now that we know num_types (and the CUDA kernel
-    # load attempt above has updated availability).
+    # load attempt above has updated availability). NOTE: the auto choice is
+    # purely num_types-based (loop for few types, bmm for >=8). Under
+    # torch.compile, bmm is usually faster (it fuses better) but uses more peak
+    # memory — that is left as an explicit opt-in: pass backend="bmm" if memory
+    # allows. See docs/torch_compile.md.
     from .ops import resolve_backend as _resolve_backend
     backend = _resolve_backend(backend, num_types=model.num_types)
     force_str = "autograd" if use_autograd_forces else "analytical"
@@ -963,11 +985,9 @@ def train_nep(
     # tensors. dynamic=True avoids a recompile per distinct batch shape (atom /
     # pair counts vary every minibatch); graph breaks around ZBL and the
     # data-dependent type loops are tolerated (fullgraph=False default).
-    #
-    # Only the analytical force path is compiled. The autograd path uses
-    # create_graph=True (double backward), which is incompatible with
-    # torch.compile's donated-buffer optimisation and raises at backward; it is
-    # the slow reference path anyway, so we leave it eager.
+    # Only the analytical path is compiled; the autograd path uses
+    # create_graph=True (double backward), incompatible with compile's
+    # donated-buffer optimisation, so it stays eager.
     compute_props = raw_model.compute_properties
     compute_props_cached = raw_model.compute_properties_cached
     if use_compile:
@@ -978,6 +998,7 @@ def train_nep(
             _log("  torch.compile: skipped — incompatible with autograd "
                  "double-backward forces (analytical path supports it)")
         else:
+            _quiet_compile_logs()
             compute_props_cached = torch.compile(
                 raw_model.compute_properties_cached, dynamic=True)
             _log("  torch.compile: enabled (analytical compute method)")

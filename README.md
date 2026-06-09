@@ -253,7 +253,7 @@ launch time:
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
 | `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.*` |
-| `use_compile` | `False` | `torch.compile` the analytical compute method (~25-30% faster/epoch after a one-time compile; needs Triton; ignored on the autograd path) |
+| `use_compile` | `False` | `torch.compile` the analytical compute method (~1.3× faster/epoch after a one-time compile; needs Triton; ignored on the autograd path; pair with `backend="bmm"` for ~1.3× more if memory allows) |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_train.out` — live parity plot |
@@ -266,11 +266,27 @@ launch time:
 #### `use_compile` — conditions and failure behaviour
 
 `use_compile=True` wraps the **analytical** compute method (not the module) in
-`torch.compile`, giving roughly **25–30 % faster epochs** after a one-time
+`torch.compile`, giving roughly **1.3× faster epochs** after a one-time
 first-epoch compilation cost (tens of seconds). It works for both single-GPU
 (`train_nep`) and DDP (`train_nep_sharded`); under DDP the compiled region
 stays inside the gradient-synced forward path, so all-reduce is unaffected
-(verified: compiled grads match the world-averaged eager grads to ~1e-7).
+(verified: compiled grads match the world-averaged eager grads to ~1e-5).
+
+**Optional `backend="bmm"` for an extra ~1.3× (memory permitting).** The default
+`backend="auto"` is num_types-based (`loop` for few types, `bmm` for ≥8). The
+vectorised `bmm` contraction fuses far better under Inductor than the per-type
+`loop`, so under compile it is ~1.3× faster — but it materialises a larger
+intermediate and uses **more peak memory, growing with batch size** (measured on
+CrCoNi: **+14 % at `batch 16`, +37 % at `batch 64`, +51 % at `batch 128`**). So
+it is left as an explicit opt-in: pass `backend="bmm"` when memory is ample, or
+`backend="loop"` to stay lean. The two backends are numerically identical. See
+[docs/torch_compile.md](docs/torch_compile.md).
+
+Expect a burst of `torch._dynamo` graph-break warnings the first time the
+compiled function runs — they are harmless (the per-type loops and ZBL have
+data-dependent control flow Dynamo can't trace, so it falls back to eager for
+those ops). torchnep raises the dynamo/inductor log level to `ERROR` once compile
+is enabled to keep them quiet; genuine compile failures still show.
 
 Requirements:
 

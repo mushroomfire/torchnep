@@ -38,6 +38,11 @@ def resolve_backend(backend: str = "auto",
     otherwise   -> "loop"  (few-types; inline Python loop is fastest)
 
     Any non-"auto" string is returned unchanged (for explicit overrides).
+
+    NOTE: this choice is num_types-based only. Under ``torch.compile`` the
+    vectorised "bmm" path usually runs faster (it fuses better) but uses more
+    peak memory — so it is left as an explicit opt-in (pass ``backend="bmm"``),
+    not auto-selected by compile. See docs/torch_compile.md.
     """
     if backend != "auto":
         return backend
@@ -534,14 +539,17 @@ def compute_zbl(
     rc_i = rc_inner  # per-pair tensor in typewise, scalar otherwise
     rc_o = rc_outer
 
-    fc = torch.zeros_like(d)
-    m1 = d < rc_i
-    fc[m1] = 1.0
-    m2 = (~m1) & (d < rc_o)
-    if m2.any():
-        ri = rc_i[m2] if use_tw else rc_i
-        ro = rc_o[m2] if use_tw else rc_o
-        fc[m2] = 0.5 * torch.cos(PI / (ro - ri) * (d[m2] - ri)) + 0.5
+    # Smooth ZBL cutoff: 1 for d<rc_i, 0.5*cos(pi*t)+0.5 taper for
+    # rc_i<=d<=rc_o, 0 beyond. Written branch-free / out-of-place: clamping the
+    # normalised distance t=(d-rc_i)/(rc_o-rc_i) to [0,1] reproduces all three
+    # regions exactly (t=0 -> fc=1, t=1 -> fc=0). The previous masked in-place
+    # form (fc[m1]=1; fc[m2]=...) triggered an IndexPutBackward anomaly warning
+    # under torch.compile and forced graph breaks via the data-dependent
+    # ``if m2.any()`` / boolean indexing — this version avoids both and is
+    # numerically identical (rc_o > rc_i always holds). dtype handles the
+    # scalar and per-pair-tensor (typewise) cases identically.
+    t = torch.clamp((d - rc_i) / (rc_o - rc_i), 0.0, 1.0)
+    fc = 0.5 * torch.cos(PI * t) + 0.5
 
     e_pair = zizj * phi / d * fc
     # Neighbor list is directed: every physical pair (i,j) appears twice

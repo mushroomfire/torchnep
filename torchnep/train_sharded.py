@@ -21,6 +21,7 @@ Single-rank (N=1) runs but offers nothing over ``train_nep`` in that case.
 """
 
 import os
+import atexit
 import time
 import warnings
 import torch
@@ -37,6 +38,29 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
 from .model import slim_model
+
+
+_PG_ATEXIT_DONE = False
+
+
+def _register_pg_atexit():
+    """Register a one-time atexit hook to destroy the process group on exit.
+
+    We deliberately do NOT destroy the group at the end of train_nep_sharded so
+    the same process can run several trainings back to back; cleanup happens
+    once, at interpreter shutdown, which also avoids the "process group has NOT
+    been destroyed" warning a bare leak would print.
+    """
+    global _PG_ATEXIT_DONE
+    if _PG_ATEXIT_DONE:
+        return
+    _PG_ATEXIT_DONE = True
+
+    def _cleanup():
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+    atexit.register(_cleanup)
 
 
 class _NEPDDPShim(nn.Module):
@@ -92,7 +116,7 @@ from .train import (
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _make_lr_scheduler, _scheduler_step,
-    _compile_check,
+    _compile_check, _quiet_compile_logs,
 )
 
 
@@ -207,6 +231,13 @@ def train_nep_sharded(
         # heterogeneous rank->GPU mappings). gloo ignores device_id.
         dist.init_process_group(backend=ddp_backend,
                                 device_id=dev if cuda_available else None)
+        # Tear the group down once, at process exit — NOT at the end of this
+        # function. That lets a single script call train_nep_sharded() more than
+        # once (e.g. compile vs no-compile back to back): re-initialising a
+        # torchrun process group after destroying it desynchronises the ranks
+        # and fails NCCL eager-connect ("remote process exited / Connection
+        # refused"). See the end-of-function barrier.
+        _register_pg_atexit()
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -421,10 +452,30 @@ def train_nep_sharded(
     global_has_virial = bool(flags_t[1].item())
 
     # Resolve "auto" backend now that we know num_types + kernel availability.
+    # Auto choice is num_types-based only (loop for few types, bmm for >=8);
+    # bmm under compile is faster but uses more memory, so it is an explicit
+    # opt-in (pass backend="bmm"). See docs/torch_compile.md.
     from .ops import resolve_backend as _resolve_backend
     backend = _resolve_backend(backend, num_types=model.num_types)
     force_str = "autograd" if use_autograd_forces else "analytical"
     _log(f"  backend: {backend}, forces: {force_str}")
+
+    # Decide whether torch.compile will actually run. Only the analytical path
+    # is compiled; the autograd path's create_graph=True double backward is
+    # incompatible with compile, so it stays eager.
+    compile_on = False
+    compile_msg = None
+    if use_compile:
+        ok, msg = _compile_check(dev)
+        if not ok:
+            compile_msg = f"  torch.compile: disabled — {msg}"
+        elif use_autograd_forces:
+            compile_msg = ("  torch.compile: skipped — incompatible with "
+                           "autograd double-backward forces (analytical path "
+                           "supports it)")
+        else:
+            compile_on = True
+            compile_msg = "  torch.compile: enabled (analytical compute method)"
 
     # q_scaler: local shard -> all_reduce
     t_qs = time.time()
@@ -440,17 +491,10 @@ def train_nep_sharded(
     # applied INSIDE the shim (to the bound analytical method), not to the
     # module — compiling the module only wraps NEPModel.forward(), which the
     # training loop never calls, so it would be a no-op (the bug this fixes).
-    compile_on = False
-    if use_compile:
-        ok, msg = _compile_check(dev)
-        if not ok:
-            _log(f"  torch.compile: disabled — {msg}")
-        elif use_autograd_forces:
-            _log("  torch.compile: skipped — incompatible with autograd "
-                 "double-backward forces (analytical path supports it)")
-        else:
-            compile_on = True
-            _log("  torch.compile: enabled (analytical compute method)")
+    if compile_msg is not None:
+        _log(compile_msg)
+    if compile_on:
+        _quiet_compile_logs()
     shim = _NEPDDPShim(model, use_compile=compile_on)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
@@ -856,4 +900,11 @@ def train_nep_sharded(
         _log(f"Output: {output_dir}/")
         _out_log_file.close()
 
-    dist.destroy_process_group()
+    # Resync all ranks before returning. The end-of-training prediction writes
+    # are rank-0 only, so non-main ranks finish well ahead; without this barrier
+    # a *second* train_nep_sharded() call in the same script would start its
+    # collectives while rank 0 is still writing, desynchronising the group.
+    # The group itself is kept alive (destroyed once at process exit, see
+    # _register_pg_atexit) so the re-init that previously crashed never happens.
+    if dist.is_initialized():
+        dist.barrier()
