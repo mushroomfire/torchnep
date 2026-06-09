@@ -718,22 +718,21 @@ def _quiet_compile_logs():
 
 
 def _maybe_enable_tf32(dev, dtype, log):
-    """Enable TF32 tensor-core matmul for float32 CUDA training.
+    """TF32 tensor-core matmul — OFF by default.
 
-    On Ampere+ GPUs (A100/H100/RTX 30xx+) float32 matmuls can use TF32 tensor
-    cores — a large speedup (inputs rounded to a 10-bit mantissa, accumulation
-    stays in fp32). PyTorch defaults to full fp32 ("highest"); Inductor prints a
-    UserWarning recommending "high". We enable it for float32 CUDA runs (and log
-    it, so it is not silent). No-op on hardware without TF32 (e.g. V100), and
-    never touched for float64 (use ``precision="float64"`` for full precision).
-    Set ``TORCHNEP_TF32=0`` in the environment to keep bit-for-bit fp32 matmul.
+    NEP's matmuls are small (the NN layer and the descriptor contraction) and
+    the workload is dominated by gather/scatter/elementwise ops, so TF32 gives
+    no measurable speedup here while slightly reducing float32 matmul precision.
+    Opt in with ``TORCHNEP_TF32=1`` (may help on A100/H100). Either way we
+    silence Inductor's "consider set_float32_matmul_precision('high')" nag. Only
+    applies to float32 CUDA; float64 is never touched.
     """
     if dev.type == "cuda" and dtype == torch.float32:
-        if os.environ.get("TORCHNEP_TF32", "1") == "0":
-            log("  TF32 matmul: disabled (TORCHNEP_TF32=0) — full fp32 matmul")
-            return
-        torch.set_float32_matmul_precision("high")
-        log("  TF32 matmul: enabled for speed (set TORCHNEP_TF32=0 to disable)")
+        import warnings
+        warnings.filterwarnings("ignore", message=".*TensorFloat32.*")
+        if os.environ.get("TORCHNEP_TF32", "0") == "1":
+            torch.set_float32_matmul_precision("high")
+            log("  TF32 matmul: enabled (TORCHNEP_TF32=1)")
 
 
 def _compile_check(dev):
@@ -977,16 +976,39 @@ def train_nep(
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
-    # Resolve "auto" backend now that we know num_types (and the CUDA kernel
-    # load attempt above has updated availability). NOTE: the auto choice is
-    # purely num_types-based (loop for few types, bmm for >=8). Under
-    # torch.compile, bmm is usually faster (it fuses better) but uses more peak
-    # memory — that is left as an explicit opt-in: pass backend="bmm" if memory
-    # allows. See docs/torch_compile.md.
+    # Decide whether torch.compile will actually run BEFORE resolving the
+    # backend — the backend choice depends on it. Only the analytical path is
+    # compiled; the autograd path's create_graph=True double backward is
+    # incompatible with compile, so it stays eager.
+    compile_on = False
+    compile_msg = None
+    if use_compile:
+        ok, msg = _compile_check(dev)
+        if not ok:
+            compile_msg = f"  torch.compile: disabled — {msg}"
+        elif use_autograd_forces:
+            compile_msg = ("  torch.compile: skipped — incompatible with "
+                           "autograd double-backward forces")
+        else:
+            compile_on = True
+            compile_msg = "  torch.compile: enabled (analytical compute method)"
+
+    # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
+    # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
+    # ``train_backend`` is what the per-batch compute uses — bmm whenever
+    # compiling (it fuses best under Inductor). An explicit backend= wins for
+    # both; the two backends are numerically identical.
     from .ops import resolve_backend as _resolve_backend
-    backend = _resolve_backend(backend, num_types=model.num_types)
+    orig_backend = backend
+    backend = _resolve_backend(orig_backend, num_types=model.num_types)
+    train_backend = _resolve_backend(
+        orig_backend, num_types=model.num_types, use_compile=compile_on)
     force_str = "autograd" if use_autograd_forces else "analytical"
-    _log(f"  backend: {backend}, forces: {force_str}")
+    if train_backend != backend:
+        _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
+             f"forces: {force_str}")
+    else:
+        _log(f"  backend: {backend}, forces: {force_str}")
 
     t0 = time.time()
     q_min, q_max = compute_q_scaler(model, data_store, backend=backend)
@@ -997,32 +1019,18 @@ def train_nep(
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
-    # torch.compile: compile the bound compute METHOD, not the module.
-    # The training loop calls compute_properties[_cached] directly — these are
-    # NOT the module's forward(), so torch.compile(model) only wraps forward()
-    # and is a pure no-op for training (the heavy compute never runs through the
-    # compiled entry point). Compiling the bound method shares parameters with
-    # raw_model, so the optimizer / grad-clipping below still act on the same
-    # tensors. dynamic=True avoids a recompile per distinct batch shape (atom /
-    # pair counts vary every minibatch); graph breaks around ZBL and the
-    # data-dependent type loops are tolerated (fullgraph=False default).
-    # Only the analytical path is compiled; the autograd path uses
-    # create_graph=True (double backward), incompatible with compile's
-    # donated-buffer optimisation, so it stays eager.
+    # torch.compile: compile the bound compute METHOD, not the module — the
+    # training loop calls compute_properties_cached directly (not forward()), so
+    # compiling the module would be a no-op. Compiling the bound method shares
+    # parameters with raw_model. dynamic=True avoids a recompile per batch shape.
     compute_props = raw_model.compute_properties
     compute_props_cached = raw_model.compute_properties_cached
-    if use_compile:
-        ok, msg = _compile_check(dev)
-        if not ok:
-            _log(f"  torch.compile: disabled — {msg}")
-        elif use_autograd_forces:
-            _log("  torch.compile: skipped — incompatible with autograd "
-                 "double-backward forces (analytical path supports it)")
-        else:
-            _quiet_compile_logs()
-            compute_props_cached = torch.compile(
-                raw_model.compute_properties_cached, dynamic=True)
-            _log("  torch.compile: enabled (analytical compute method)")
+    if compile_on:
+        _quiet_compile_logs()
+        compute_props_cached = torch.compile(
+            raw_model.compute_properties_cached, dynamic=True)
+    if compile_msg is not None:
+        _log(compile_msg)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=lambda_2, amsgrad=True)
@@ -1189,7 +1197,7 @@ def train_nep(
                 else:
                     result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                        backend=train_backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]

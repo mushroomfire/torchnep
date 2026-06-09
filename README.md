@@ -253,7 +253,7 @@ launch time:
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
 | `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.*` |
-| `use_compile` | `False` | `torch.compile` the analytical compute method (~1.3× faster/epoch after a one-time compile; needs Triton; ignored on the autograd path; pair with `backend="bmm"` for ~1.3× more if memory allows) |
+| `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_train.out` — live parity plot |
@@ -263,101 +263,24 @@ launch time:
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
 
-#### `use_compile` — conditions and failure behaviour
+#### `use_compile`
 
-`use_compile=True` wraps the **analytical** compute method (not the module) in
-`torch.compile`, giving roughly **1.3× faster epochs** after a one-time
-first-epoch compilation cost (tens of seconds). It works for both single-GPU
-(`train_nep`) and DDP (`train_nep_sharded`); under DDP the compiled region
-stays inside the gradient-synced forward path, so all-reduce is unaffected
-(verified: compiled grads match the world-averaged eager grads to ~1e-5).
+`use_compile=True` `torch.compile`s the analytical compute method for faster
+epochs (after a one-time first-epoch compilation cost). Works on both single-GPU
+(`train_nep`) and DDP (`train_nep_sharded`). When compiling, `backend="auto"`
+uses the `bmm` contraction (fastest under compile); pass `backend="loop"` to
+override. Ignored on the autograd force path (`use_autograd_forces=True`).
 
-**Optional `backend="bmm"` for an extra ~1.3× (memory permitting).** The default
-`backend="auto"` is num_types-based (`loop` for few types, `bmm` for ≥8). The
-vectorised `bmm` contraction fuses far better under Inductor than the per-type
-`loop`, so under compile it is ~1.3× faster — but it materialises a larger
-intermediate and uses **more peak memory, growing with batch size** (measured on
-CrCoNi: **+14 % at `batch 16`, +37 % at `batch 64`, +51 % at `batch 128`**). So
-it is left as an explicit opt-in: pass `backend="bmm"` when memory is ample, or
-`backend="loop"` to stay lean. The two backends are numerically identical. See
-[docs/torch_compile.md](docs/torch_compile.md).
-
-Expect a burst of `torch._dynamo` graph-break warnings the first time the
-compiled function runs — they are harmless (the per-type loops and ZBL have
-data-dependent control flow Dynamo can't trace, so it falls back to eager for
-those ops). torchnep raises the dynamo / inductor / symbolic-shapes log level to
-`ERROR` once compile is enabled to keep them (and the `_maybe_guard_rel`
-dynamic-shape notes) quiet; genuine compile failures still show.
-
-**TF32 matmul (float32 only).** On Ampere+ GPUs (A100 / H100 / RTX 30xx+) PyTorch
-prints `Consider setting torch.set_float32_matmul_precision('high')`. torchnep
-does this for you on float32 CUDA runs — it logs `TF32 matmul: enabled` and uses
-the tensor cores for a sizeable matmul speedup (multiply inputs rounded to a
-10-bit mantissa, accumulation stays in fp32). It is a no-op on GPUs without TF32
-(e.g. V100) and never touches float64. For bit-for-bit fp32 matmul, set
-`TORCHNEP_TF32=0` in the environment, or just train with `precision="float64"`.
-
-Requirements:
-
-- **Triton** must be importable on any GPU device — Inductor (the default
-  `torch.compile` backend) lowers GPU kernels through Triton. It ships with the
-  standard CUDA / ROCm PyTorch wheels, but on a cluster make sure
-  `python -c "import triton"` succeeds **on the compute node**, not just the
-  login node. (On CPU, Inductor uses its C++ backend and needs no Triton.)
-- A working C/C++ compiler in `PATH` (Inductor compiles generated code).
-
-**Not NVIDIA-only.** `torch.compile` targets whatever backend Inductor supports,
-the GPU path just goes through Triton:
-
-| device | torch type | code-gen | needs |
-|---|---|---|---|
-| NVIDIA | `cuda` | Triton | Triton (in CUDA wheels) |
-| **AMD (ROCm)** | `cuda`¹ | Triton (ROCm) | Triton-ROCm (in ROCm wheels) |
-| Intel GPU | `xpu` | Triton (XPU) | Triton-XPU |
-| CPU | `cpu` | C++/OpenMP | a C/C++ compiler |
-| Apple | `mps` | experimental | limited Inductor MPS support |
-
-¹ ROCm builds of PyTorch report AMD GPUs as device type `cuda`, so **AMD cards
-work** and the Triton precheck already covers them.
-
-If the preconditions are not met, training does **not** crash — it logs a
-warning and falls back to eager. You will see one of these lines near the top
-of `output.log` / the console:
+Needs **Triton** (the Inductor GPU backend); it ships with CUDA/ROCm PyTorch
+wheels, so on a cluster check `python -c "import triton"` on the **compute
+node**. If unavailable, training does not crash — it logs a warning and falls
+back to eager:
 
 ```
-  torch.compile: enabled (analytical compute method)        # working
-  torch.compile: disabled — Triton not found (...)          # missing Triton -> eager fallback
-  torch.compile: disabled — torch.compile is unavailable... # PyTorch too old -> eager fallback
-  torch.compile: skipped — incompatible with autograd ...   # use_autograd_forces=True -> eager
+  torch.compile: enabled (analytical compute method)   # working
+  torch.compile: disabled — Triton not found (...)     # -> eager fallback
+  torch.compile: skipped — incompatible with autograd  # use_autograd_forces=True
 ```
-
-Notes:
-
-- **Why `use_compile` is ignored on the autograd force path**
-  (`use_autograd_forces=True`). `torch.compile` (AOTAutograd) compiles a forward
-  plus **one** matching first-order backward, and a memory optimisation
-  ("donated buffers") lets that backward free its inputs because it assumes it
-  runs once and is never itself differentiated. The analytical path fits: the
-  forward emits energy *and* forces (forces are explicit forward ops) and
-  training is a single `loss.backward()`. The autograd path is **inherently
-  second-order** — it computes forces with `autograd.grad(E, rij,
-  create_graph=True)` (backward #1, kept differentiable), then `loss.backward()`
-  differentiates *through* the force (backward #2 = double backward). The
-  compiled backward forbids that and raises `non-empty donated buffers requires
-  create_graph=False`. So compile only applies to the analytical (default) path.
-- **Analytical vs. autograd speed is num_types-dependent (a crossover).** With
-  *no* compile, the analytical path's explicit force chain rule re-runs the
-  per-type contraction a second time; for **many element types** that becomes
-  more expensive than the autograd path's double backward, so eager autograd can
-  actually be *faster* (measured at 16 types: eager autograd ~1012 vs analytical
-  ~1163 ms/epoch). For **few types** analytical wins (3 types: ~546 vs ~879).
-  But this only matters without compile — **compiled analytical+bmm beats every
-  eager option by ~3×** (16 types: ~358 ms), and autograd cannot be compiled, so
-  the production answer is simply: leave `use_autograd_forces=False` and turn on
-  `use_compile`. See [docs/torch_compile.md](docs/torch_compile.md).
-- The Triton precheck guards the common cluster case; a compile failure for
-  some *other* reason (e.g. a broken Inductor toolchain) would still raise at
-  the first batch — in that case set `use_compile=False`.
 
 ---
 

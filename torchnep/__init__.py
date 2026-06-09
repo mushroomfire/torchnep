@@ -2,7 +2,7 @@
 # Copyright (c) 2026, Yongchao Wu.
 # Part of the torchnep project — https://github.com/mushroomfire/torchnep.
 
-__version__ = "1.0.1"
+__version__ = "1.0.0"
 
 # Public API: only the three high-level entry points users actually call.
 # Internal building blocks (NEPModel, NEPCalculator, data readers, ...) remain

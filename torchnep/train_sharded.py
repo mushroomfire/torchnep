@@ -452,17 +452,9 @@ def train_nep_sharded(
     global_has_forces = bool(flags_t[0].item())
     global_has_virial = bool(flags_t[1].item())
 
-    # Resolve "auto" backend now that we know num_types + kernel availability.
-    # Auto choice is num_types-based only (loop for few types, bmm for >=8);
-    # bmm under compile is faster but uses more memory, so it is an explicit
-    # opt-in (pass backend="bmm"). See docs/torch_compile.md.
-    from .ops import resolve_backend as _resolve_backend
-    backend = _resolve_backend(backend, num_types=model.num_types)
-    force_str = "autograd" if use_autograd_forces else "analytical"
-    _log(f"  backend: {backend}, forces: {force_str}")
-
-    # Decide whether torch.compile will actually run. Only the analytical path
-    # is compiled; the autograd path's create_graph=True double backward is
+    # Decide whether torch.compile will actually run BEFORE resolving the
+    # backend — the backend choice depends on it. Only the analytical path is
+    # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
     compile_on = False
     compile_msg = None
@@ -472,11 +464,25 @@ def train_nep_sharded(
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
             compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces (analytical path "
-                           "supports it)")
+                           "autograd double-backward forces")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
+
+    # ``backend`` is the eager backend for the one-shot q_scaler pass
+    # (num_types-based); ``train_backend`` is what the per-batch compute uses —
+    # bmm whenever compiling. Explicit backend= wins for both.
+    from .ops import resolve_backend as _resolve_backend
+    orig_backend = backend
+    backend = _resolve_backend(orig_backend, num_types=model.num_types)
+    train_backend = _resolve_backend(
+        orig_backend, num_types=model.num_types, use_compile=compile_on)
+    force_str = "autograd" if use_autograd_forces else "analytical"
+    if train_backend != backend:
+        _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
+             f"forces: {force_str}")
+    else:
+        _log(f"  backend: {backend}, forces: {force_str}")
 
     # q_scaler: local shard -> all_reduce
     t_qs = time.time()
@@ -664,7 +670,7 @@ def train_nep_sharded(
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
                 result = model(batch, use_autograd_forces,
-                               has_forces, has_virial, backend)
+                               has_forces, has_virial, train_backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]

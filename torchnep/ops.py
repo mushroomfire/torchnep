@@ -31,21 +31,22 @@ Backend = Literal["auto", "loop", "bmm"]
 
 
 def resolve_backend(backend: str = "auto",
-                     num_types: Optional[int] = None) -> str:
+                    num_types: Optional[int] = None,
+                    use_compile: bool = False) -> str:
     """Resolve "auto" into a concrete backend.
 
-    ntypes >= 8  -> "bmm"   (fancy-index + batched GEMM wins)
-    otherwise   -> "loop"  (few-types; inline Python loop is fastest)
+    under torch.compile -> "bmm"   (vectorised path fuses far better; the per-
+                                    type Python loop forces graph breaks, so bmm
+                                    is consistently fastest once compiled)
+    ntypes >= 8         -> "bmm"   (fancy-index + batched GEMM wins)
+    otherwise           -> "loop"  (few-types eager; inline Python loop fastest)
 
-    Any non-"auto" string is returned unchanged (for explicit overrides).
-
-    NOTE: this choice is num_types-based only. Under ``torch.compile`` the
-    vectorised "bmm" path usually runs faster (it fuses better) but uses more
-    peak memory — so it is left as an explicit opt-in (pass ``backend="bmm"``),
-    not auto-selected by compile. See docs/torch_compile.md.
+    Any non-"auto" string is returned unchanged (explicit override wins).
     """
     if backend != "auto":
         return backend
+    if use_compile:
+        return "bmm"
     if num_types is not None and num_types >= 8:
         return "bmm"
     return "loop"
