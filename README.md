@@ -256,10 +256,11 @@ launch time:
 | `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
-| `prediction_interval` | `20` | every N epochs run predict on the current `nep_best` and overwrite `{energy,force,virial}_train.out` — live parity plot |
+| `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` — live parity plot |
 | `restart` | `True` | resume from `checkpoint.pt` if present |
-| `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` before training |
-| `reset_lr` | `None` | override LR after resume/finetune |
+| `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` and start a NEW training from them |
+| `resume_from` | `None` | path to a checkpoint to CONTINUE from (e.g. `checkpoint_stage1.pt` to redo Stage 2); takes precedence over the automatic `checkpoint.pt` pickup |
+| `recompute_q_scaler` | `False` | only with `finetune_from`: recompute the descriptor scaler on the new data instead of keeping the source model's (not recommended — see Fine-Tuning) |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
 
@@ -288,11 +289,11 @@ back to eager:
 
 | File | Contents |
 |------|----------|
-| `nep_best.txt` / `nep_best.pt` | **Best-loss** model (GPUMD-compatible / PyTorch state_dict). Rewritten whenever `avg_loss < best_loss` |
-| `nep_stage1.txt` / `nep_stage1.pt` | **End-of-Stage-1** snapshot (only when `stage2=1`) — written the instant Stage 2 kicks in; lets you restart with different Stage-2 weights |
+| `nep_best.txt` / `nep_best.pt` | **Best** model. Early in the run, saved whenever the epoch's `avg_loss` makes a new minimum; in the **last third** of the run a new minimum only nominates the weights — they are saved only if a frozen-weight evaluation over the full dataset beats the best true loss so far. The final epoch is always evaluated, so `nep_best` is never worse than `nep_final`. |
 | `nep_final.txt`    | Model at the **last** epoch (used for the end-of-training predict) |
 | `nep_average.txt` / `nep_average.pt` | **SWA-averaged** model — only when `use_swa=True` |
-| `checkpoint.pt`    | Full training state: weights + optimizer + scheduler + epoch + loss weights |
+| `checkpoint.pt`    | Full training state: weights + optimizer + active scheduler + stage tag + SWA state + epoch + best losses + loss weights |
+| `checkpoint_stage1.pt` | Full end-of-Stage-1 checkpoint (only when `stage2=1`) — written the instant Stage 2 kicks in. Redo Stage 2 with edited `stage2_*` settings via `resume_from=".../checkpoint_stage1.pt"` |
 | `output.log`       | Full console log |
 | `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa), gnorm |
 | `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
@@ -301,19 +302,39 @@ back to eager:
 | `stress_train.out` | Per-frame predicted vs reference stress (GPa); negated wrt `virial_train.out` so input and output stress carry the same sign |
 | `descriptor.out` | Scaled descriptor `q * q_scaler` — only when `output_descriptor` is passed to `predict_dataset` |
 
-The `*_train.out` files are rewritten every `prediction_interval` epochs using **`nep_best` weights** as a live parity plot, then replaced at end of training by a final-epoch prediction. Format matches GPUMD's `*_train.out` so the two can be diffed column by column.
+The `*_train.out` files are rewritten every `prediction_interval` epochs using the **current-epoch weights** as a live parity plot (so the predict loss matches the line just logged), then replaced at end of training by a final-epoch prediction. Format matches GPUMD's `*_train.out` so the two can be diffed column by column.
 
 ---
 
 ## Restart and Resume
 
-Set `restart=True` (the default).  torchnep looks for `checkpoint.pt` in `output_dir` and resumes from exactly where training stopped — epoch, learning rate, optimizer momentum, and scheduler state are all restored.
+**Resume = exact continuation.** A resumed run picks up precisely where the
+checkpoint left off: epoch, learning rate, optimizer momentum, the scheduler
+that was active in that stage, the SWA average, and the best-loss gates are
+all restored, so the first resumed epoch's RMSE continues the old curve.
+`nep.in`'s `lr` is **never** applied on resume (a log line reminds you).
+`loss.out` is trimmed back to the checkpoint epoch before appending, so its
+rows always match the actual training history with no duplicates.
+
+Two ways to resume:
 
 ```python
-train_nep("nep.in", "train.xyz", output_dir="output")  # restart=True by default
+# 1) automatic: looks for checkpoint.pt in output_dir (restart=True default)
+train_nep("nep.in", "train.xyz", output_dir="output")
+
+# 2) explicit: continue from a specific checkpoint — e.g. you watched
+#    stage 2 run at stage2_lr=1e-3 and want to redo it differently:
+#    edit stage2_* in nep.in, then resume from the end-of-stage-1 state
+#    (same output_dir works; resume_from beats the automatic pickup of
+#    the newer checkpoint.pt, and loss.out is rewound accordingly)
+train_nep("nep.in", "train.xyz", output_dir="output",
+          resume_from="output/checkpoint_stage1.pt")
 ```
 
 Works correctly regardless of which stage was active when training stopped.
+Everything in this section applies to `train_nep_sharded` identically, and
+checkpoints are interchangeable between the two trainers (a DDP
+`checkpoint_stage1.pt` can seed a single-GPU stage-2 redo and vice versa).
 
 ### What you can safely change on restart
 
@@ -324,27 +345,21 @@ value-only changes. Structural changes (architecture, shapes) are not safe.
 |-----------|----------------|-------|
 | `epoch` | Yes | Extend training by increasing this |
 | `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. Changing any of them triggers an auto-reset of `best_loss` so the new scale can establish a new best (instead of staying gated by the old-scale number stored in `checkpoint.pt`). |
-| `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. Especially useful: restart from `nep_stage1.pt` with different Stage-2 weights by copying it to `nep_best.pt` (or passing it via `finetune_from`) and editing `nep.in`. |
+| `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. Especially useful: redo Stage 2 with different weights via `resume_from=".../checkpoint_stage1.pt"` after editing `nep.in`. |
 | `batch` | Yes | — |
 | `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
-| `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. Use `reset_lr` to force a new LR. |
+| `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. To re-enter Stage 2 with a new LR, `resume_from=".../checkpoint_stage1.pt"`. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
 | `stage2_scheduler_patience` / `stage2_scheduler_factor` | Yes | Applied immediately to the Stage 2 scheduler |
-| `lr` (Stage 1) | **No** directly | Overridden by saved optimizer state — pass `reset_lr=<new>` to override |
+| `lr` (Stage 1) | **No** | Resume keeps the checkpoint's LR (resume = exact continuation). For a genuinely new LR, start a new training (optionally `finetune_from` the saved weights) |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
-**LR on resume.** A restart always keeps the LR stored in `checkpoint.pt`
+**LR on resume.** A resumed run always keeps the LR stored in the checkpoint
 (optimizer + scheduler state are restored), so a run interrupted mid-decay
-picks up exactly where it left off — in either stage. The only exceptions:
-the one-time `stage2_lr` applied at the natural Stage 1 → Stage 2 crossing,
-and an explicit `reset_lr=<value>` override (a float, not a flag). Use the
-latter when you've edited `nep.in`'s LR and want it to take effect, e.g. when
-the LR has decayed to `stop_lr`:
-
-```python
-train_nep("nep.in", "train.xyz", output_dir="output", reset_lr=1e-3)
-```
+picks up exactly where it left off — in either stage. The only exception is
+the one-time `stage2_lr` applied at a fresh Stage 1 → Stage 2 crossing
+(including a `resume_from=checkpoint_stage1.pt` re-entry).
 
 ---
 
@@ -373,9 +388,9 @@ If the new dataset contains fewer element types than the original model, setting
 
 What happens internally:
 - All trainable weights (`c_param`, fitting nets, `b1`) are loaded from the source model
-- `q_scaler` is **recomputed** from the new dataset (descriptor statistics change with new data)
+- `q_scaler` is **kept** from the source model — it is part of the potential the weights were trained as; recomputing it on the new data would rescale the NN inputs and wreck the loaded model's initial predictions. `recompute_q_scaler=True` opts into the recompute anyway (measured comparison: `bench_test/restart_rework/t8_finetune_real`)
 - A fresh optimizer is created — no momentum carryover from the original training
-- Any existing `checkpoint.pt` in `output_dir` is ignored when `finetune_from` is set
+- Any existing `checkpoint.pt` in `output_dir` is ignored when `finetune_from` is set; to *continue* a run instead, use `resume_from`
 
 ### Standalone model slimming (no retraining)
 

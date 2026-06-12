@@ -423,8 +423,8 @@ class NEPModel(nn.Module):
         """Load trainable weights from a GPUMD nep.txt file into this model.
 
         The model architecture (num_types, neuron, n_max, basis_size, l_max)
-        must match the nep.txt file exactly.  The q_scaler is loaded too but
-        will be replaced when ``compute_q_scaler`` runs on the new dataset.
+        must match the nep.txt file exactly.  The q_scaler is loaded too and
+        kept — it is part of the potential the weights were trained as.
 
         Typical usage (fine-tuning):
 
@@ -489,7 +489,7 @@ class NEPModel(nn.Module):
                 torch.from_numpy(np.ascontiguousarray(np.transpose(c3, (2, 3, 0, 1)))))
             idx += n_c3
 
-        # q_scaler (buffer — will be overwritten by compute_q_scaler on new data)
+        # q_scaler (buffer — kept; the weights were trained against it)
         q_scaler = vals[idx:idx + dim]
         self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
 

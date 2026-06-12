@@ -21,6 +21,7 @@ card's memory.
     see example/run_multi_node.sbatch
 """
 
+import contextlib
 import os
 import platform
 import time
@@ -660,7 +661,14 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 # ---------------------------------------------------------------------------
 
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
-                     loss_weights=None):
+                     loss_weights=None, in_stage2=False, swa_model=None,
+                     best_true_loss=None):
+    """Write a full training checkpoint.
+
+    ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
+    lr_scheduler otherwise); ``in_stage2`` records which it was so the load
+    side can restore the state into the right object.
+    """
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
     state = {
@@ -668,36 +676,195 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "best_loss": best_loss,
         "model_state": m.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "in_stage2": in_stage2,
     }
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
     if loss_weights is not None:
         state["loss_weights"] = loss_weights
+    if swa_model is not None:
+        state["swa_state"] = swa_model.state_dict()
+    if best_true_loss is not None:
+        state["best_true_loss"] = best_true_loss
     torch.save(state, path)
 
 
-def _load_checkpoint(path, model, optimizer, scheduler, device):
-    """Load checkpoint.
+def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
+                     swa_model, device):
+    """Load a checkpoint so the run continues exactly where it stopped.
 
-    Returns (start_epoch, best_loss, saved_loss_weights). The third element is
-    the dict of loss weights active when the checkpoint was saved (or None for
-    pre-feature checkpoints). Callers compare against current nep.in weights to
-    decide whether to reset best_loss.
+    The optimizer state carries the lr of the checkpoint moment — nep.in's
+    lr is never re-applied on resume. The scheduler state is restored into
+    the scheduler that was active when the checkpoint was written
+    (``in_stage2`` tag; pre-tag checkpoints fall back to the stage-1
+    scheduler, matching the old behaviour). SWA state is restored when both
+    sides have it.
+
+    Returns a dict with epoch / best_loss / best_true_loss / loss_weights /
+    in_stage2.
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
-    m.load_state_dict(ckpt["model_state"])
+    model_state = ckpt["model_state"]
+    # Checkpoints written by older DDP runs saved the shim's state_dict,
+    # whose keys carry a uniform "model." prefix — strip it so they load
+    # into a plain NEPModel (new checkpoints always store plain keys).
+    if model_state and all(k.startswith("model.") for k in model_state):
+        model_state = {k[len("model."):]: v for k, v in model_state.items()}
+    m.load_state_dict(model_state)
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    if scheduler is not None and "scheduler_state" in ckpt:
+    in_stage2 = ckpt.get("in_stage2", False)
+    target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
+              else lr_scheduler)
+    if target is not None and "scheduler_state" in ckpt:
         # Scheduler class may have changed between runs (user switched
         # lr_scheduler mode). Tolerate that by skipping the state load —
         # scheduler just starts fresh this run.
         try:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
+            target.load_state_dict(ckpt["scheduler_state"])
         except (KeyError, ValueError, TypeError):
             pass
-    return ckpt["epoch"], ckpt["best_loss"], ckpt.get("loss_weights")
+    if swa_model is not None and ckpt.get("swa_state") is not None:
+        try:
+            swa_model.load_state_dict(ckpt["swa_state"])
+        except (KeyError, ValueError, RuntimeError):
+            pass
+    return {
+        "epoch": ckpt["epoch"],
+        "best_loss": ckpt["best_loss"],
+        "best_true_loss": ckpt.get("best_true_loss", float("inf")),
+        "loss_weights": ckpt.get("loss_weights"),
+        "in_stage2": in_stage2,
+    }
+
+
+def _trim_loss_log(path, last_epoch):
+    """Drop loss.out rows past ``last_epoch``.
+
+    A run killed between a checkpoint and the next one has logged epochs the
+    resumed run will retrain; without trimming, those epochs would appear
+    twice in the file.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        lines = f.readlines()
+    kept = []
+    for ln in lines:
+        try:
+            ep = int(ln.split()[0])
+        except (ValueError, IndexError):
+            kept.append(ln)  # header
+            continue
+        if ep <= last_epoch:
+            kept.append(ln)
+    if len(kept) != len(lines):
+        with open(path, "w") as f:
+            f.writelines(kept)
+
+
+def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
+                               compute_props, compute_props_cached,
+                               use_autograd_forces, backend,
+                               has_forces, has_virial, dtype, dev):
+    """Frozen-weight squared-error sums over the LOCAL data_store.
+
+    Mirrors the training-epoch accumulation exactly (same masks, same
+    per-sample units), but forward-only on one fixed set of weights.
+    Returns (sum_le, sum_lf, sum_lv, n_e, n_f, n_v) so callers can finish
+    the per-sample averaging themselves — the DDP path all-reduces these
+    six numbers across ranks first, which makes the aggregated loss
+    EXACTLY the full-dataset value (a sum of per-shard sums), identical
+    to the single-GPU result.
+    """
+    sum_le = sum_lf = sum_lv = 0.0
+    n_e = n_f = n_v = 0
+
+    was_training = raw_model.training
+    raw_model.eval()  # autograd path: .training drives create_graph
+    # The analytical path needs no graph at all; the autograd path still
+    # needs grad-enabled rij for the force evaluation, so no_grad only
+    # wraps the cached (analytical) compute.
+    ctx = contextlib.nullcontext() if use_autograd_forces else torch.no_grad()
+    try:
+        with ctx:
+            for start in range(0, data_store.n, batch_size):
+                idx = list(range(start, min(start + batch_size,
+                                            data_store.n)))
+                batch = data_store.collate(idx)
+                if use_autograd_forces:
+                    result = compute_props(
+                        batch["rij_rad"], batch["rij_ang"],
+                        batch["pair_i_rad"], batch["pair_j_rad"],
+                        batch["pair_i_ang"], batch["pair_j_ang"],
+                        batch["atom_types"], batch["N"],
+                        batch["struct_idx"], batch["num_structures"],
+                        need_forces=has_forces, need_virial=has_virial,
+                        backend=backend)
+                else:
+                    result = compute_props_cached(
+                        batch, need_forces=has_forces,
+                        need_virial=has_virial, backend=backend)
+
+                e_mask = batch["energy_mask"]
+                if e_mask.any():
+                    e_pa_pred = result["Etot"] / batch["natoms"]
+                    e_pa_ref = batch["energy"] / batch["natoms"]
+                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
+                    sum_le += (diff_e ** 2).sum().item()
+                    n_e += int(e_mask.sum().item())
+
+                if has_forces:
+                    f_mask = batch["force_mask"]
+                    if f_mask.any():
+                        f_diff = result["forces"][f_mask] - batch["forces"][f_mask]
+                        sum_lf += (f_diff ** 2).mean(dim=1).sum().item()
+                        n_f += int(f_mask.sum().item())
+
+                if (has_virial and "virial" in result
+                        and batch["virial"].shape[1] == 9):
+                    v_mask = batch["virial_mask"]
+                    if v_mask.any():
+                        v_atom = result["virial"]
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
+                        v_sys.scatter_add_(0, si, v_atom)
+                        na = batch["natoms"][v_mask].unsqueeze(-1)
+                        v_diff = (v_sys[v_mask] - batch["virial"][v_mask]) / na
+                        sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
+                        n_v += int(v_mask.sum().item())
+    finally:
+        if was_training:
+            raw_model.train()
+
+    return sum_le, sum_lf, sum_lv, n_e, n_f, n_v
+
+
+def _evaluate_true_loss(data_store, batch_size, raw_model,
+                        compute_props, compute_props_cached,
+                        use_autograd_forces, backend,
+                        pref_e, pref_f, pref_v, dtype, dev):
+    """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
+
+    Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
+    decide whether a candidate epoch really is the best model (see the
+    best-save block in the epoch loop).
+
+    Returns (true_loss, rmse_e, rmse_f, rmse_v).
+    """
+    has_forces = data_store.has_forces and pref_f > 0
+    has_virial = data_store.has_virial and pref_v > 0
+    sum_le, sum_lf, sum_lv, n_e, n_f, n_v = _accumulate_true_loss_sums(
+        data_store, batch_size, raw_model,
+        compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    mse_e = sum_le / max(n_e, 1)
+    mse_f = sum_lf / max(n_f, 1)
+    mse_v = sum_lv / max(n_v, 1)
+    true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
 
 
 def _quiet_compile_logs():
@@ -786,7 +953,8 @@ def train_nep(
     checkpoint_interval: int = 100,
     prediction_interval: int = 20,
     finetune_from: str = None,
-    reset_lr: float = None,
+    resume_from: str = None,
+    recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
 ):
@@ -822,8 +990,20 @@ def train_nep(
         current nep_best weights and overwrite {energy,force,virial}_train.out
         in output_dir — lets you watch the parity-plot converge live.
         Set to 0 or a negative value to disable.
-    finetune_from : path to an existing .pt or nep.txt to load weights from.
-    reset_lr : override LR after resume/finetune.
+    finetune_from : path to an existing .pt or nep.txt to load weights from
+        (weights only — a NEW training starts from them: epoch 1, nep.in lr,
+        fresh optimizer). The q_scaler stored with the weights is kept.
+    resume_from : path to a checkpoint (.pt) to CONTINUE from — restores
+        model, optimizer (incl. lr), scheduler, epoch and best losses, so
+        the run picks up exactly where that checkpoint left off. Use
+        ``checkpoint_stage1.pt`` to redo stage 2 with edited stage2_*
+        settings. Mutually exclusive with finetune_from; takes precedence
+        over the automatic checkpoint.pt pickup.
+    recompute_q_scaler : only with finetune_from. Default False — the
+        q_scaler stored with the loaded weights is kept (it is part of the
+        potential they were trained as). True recomputes it from the new
+        dataset, which rescales the NN inputs: the loaded model starts off
+        wrong and must re-adapt (see bench_test/restart_rework/t8).
     slim_types : drop element types not present in data_file before training.
     energy_key : name of the comment-line tag read as the reference energy
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
@@ -955,7 +1135,9 @@ def train_nep(
 
     if finetune_from is not None:
         # Load pre-trained weights; skip random b1 init from mean_epa.
-        # q_scaler will be recomputed below on the new dataset.
+        # The stored q_scaler is part of the loaded model and is KEPT (see
+        # the q_scaler block below) — recomputing it on the new dataset
+        # would rescale the NN inputs the weights were trained against.
         ft_path = finetune_from
 
         def _load_weights(target, path):
@@ -1024,12 +1206,23 @@ def train_nep(
     else:
         _log(f"  backend: {backend}, forces: {force_str}")
 
-    t0 = time.time()
-    q_min, q_max = compute_q_scaler(model, data_store, backend=backend)
-    model.set_q_scaler(q_min, q_max)
-    if dev.type == "cuda":
-        torch.cuda.synchronize()
-    _log(f"  q_scaler in {time.time() - t0:.1f}s")
+    if finetune_from is not None and not recompute_q_scaler:
+        # The q_scaler is part of the potential definition: the loaded NN
+        # weights were trained against it. Keep it; recomputing from the
+        # new data (with the loaded, trained c-params) would rescale every
+        # descriptor component and wreck the loaded model.
+        _log("  q_scaler: kept from finetune source (not recomputed)")
+    else:
+        if finetune_from is not None:
+            _log("  q_scaler: RECOMPUTED from the new dataset "
+                 "(recompute_q_scaler=True) — the loaded weights will "
+                 "see rescaled descriptors and must re-adapt")
+        t0 = time.time()
+        q_min, q_max = compute_q_scaler(model, data_store, backend=backend)
+        model.set_q_scaler(q_min, q_max)
+        if dev.type == "cuda":
+            torch.cuda.synchronize()
+        _log(f"  q_scaler in {time.time() - t0:.1f}s")
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
@@ -1080,34 +1273,59 @@ def train_nep(
     ckpt_path = os.path.join(output_dir, "checkpoint.pt")
     start_epoch = 1
     best_loss = float("inf")
+    best_true_loss = float("inf")
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
-    if restart and os.path.exists(ckpt_path) and finetune_from is None:
-        start_epoch, best_loss, saved_loss_weights = _load_checkpoint(
-            ckpt_path, model, optimizer, lr_scheduler, dev)
-        start_epoch += 1
-        _log(f"Resumed from checkpoint: epoch {start_epoch - 1}, "
+    if resume_from is not None and finetune_from is not None:
+        raise ValueError("resume_from and finetune_from are mutually "
+                         "exclusive: resume_from continues a run, "
+                         "finetune_from starts a new one from weights")
+    resume_ckpt = None
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"resume_from: {resume_from} not found")
+        resume_ckpt = resume_from
+    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
+        resume_ckpt = ckpt_path
+    if resume_ckpt is not None:
+        info = _load_checkpoint(resume_ckpt, model, optimizer,
+                                lr_scheduler, stage2_scheduler,
+                                swa_model, dev)
+        start_epoch = info["epoch"] + 1
+        best_loss = info["best_loss"]
+        best_true_loss = info["best_true_loss"]
+        _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}")
+        # Resume = exact continuation: lr (and the whole optimizer state)
+        # comes from the checkpoint moment. nep.in's lr only applies to
+        # fresh runs / finetunes — and stage2_lr at a fresh stage-2 entry.
+        _log(f"  lr taken from checkpoint: "
+             f"{optimizer.param_groups[0]['lr']:.2e} "
+             f"(nep.in lr is not applied on resume)")
+        saved_loss_weights = info["loss_weights"]
         if saved_loss_weights is not None and saved_loss_weights != cur_loss_weights:
             _log("Loss weights changed since checkpoint was saved — "
-                 "resetting best_loss so the new scale can establish a new best.")
+                 "resetting best losses so the new scale can establish "
+                 "a new best.")
             _log(f"  saved:   {saved_loss_weights}")
             _log(f"  current: {cur_loss_weights}")
             best_loss = float("inf")
-
-    # Override LR after checkpoint load (useful when resuming with a new lr)
-    if reset_lr is not None:
-        for pg in optimizer.param_groups:
-            pg["lr"] = reset_lr
-        _log(f"LR reset to {reset_lr:.2e}")
+            best_true_loss = float("inf")
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
     # the CURRENT stage's weights — so a stage-1 weight of 0 can still enable
     # computation in stage 2 (and vice versa). Do NOT latch them here.
 
-    loss_log_mode = "a" if (restart and start_epoch > 1) else "w"
-    loss_log = open(os.path.join(output_dir, "loss.out"), loss_log_mode)
-    if loss_log_mode == "w":
+    loss_log_path = os.path.join(output_dir, "loss.out")
+    if start_epoch > 1:
+        # Keep loss.out in 1:1 correspondence with the actual history: rows
+        # past the checkpoint epoch belong to epochs the resumed run is
+        # about to retrain.
+        _trim_loss_log(loss_log_path, start_epoch - 1)
+    write_header = (start_epoch == 1 or not os.path.exists(loss_log_path)
+                    or os.path.getsize(loss_log_path) == 0)
+    loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
+    if write_header:
         loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                        "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
 
@@ -1117,9 +1335,20 @@ def train_nep(
     # resuming from a checkpoint.
     stage2_tag = (f", Stage 2 from epoch {start_stage2} "
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
+    # In the last third of the run a candidate best is verified by a
+    # frozen-weight evaluation over the full dataset before nep_best is
+    # written (see the best-save block in the loop).
+    true_eval_start = (2 * num_epochs) // 3 + 1
     _log("")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
     _log("=" * 72)
+
+    def _save_best():
+        raw_model.save_nep_txt(
+            os.path.join(output_dir, "nep_best.txt"),
+            max_NN_rad, max_NN_ang)
+        torch.save(raw_model.state_dict(),
+                   os.path.join(output_dir, "nep_best.pt"))
 
     train_t0 = time.time()
 
@@ -1156,29 +1385,37 @@ def train_nep(
                     fresh_transition = start_epoch <= start_stage2
                     _log(f"\n{'='*72}")
                     if fresh_transition:
-                        # Crossing into stage 2 now: snapshot end-of-stage-1,
-                        # then apply the stage-2 lr and reset best_loss (the
-                        # stage-2 loss weights put it on a different scale).
-                        raw_model.save_nep_txt(
-                            os.path.join(output_dir, "nep_stage1.txt"),
-                            max_NN_rad, max_NN_ang)
-                        torch.save(raw_model.state_dict(),
-                                   os.path.join(output_dir, "nep_stage1.pt"))
-                        _log("Saved end-of-stage-1 snapshot: "
-                             "nep_stage1.pt / nep_stage1.txt")
+                        # Crossing into stage 2 now: save a FULL end-of-
+                        # stage-1 checkpoint (model + optimizer + scheduler
+                        # state through epoch-1), so stage 2 can be redone
+                        # from this exact point via resume_from after
+                        # editing the stage2_* settings in nep.in. Then
+                        # apply the stage-2 lr and reset the best losses
+                        # (the stage-2 loss weights put them on a
+                        # different scale).
+                        _save_checkpoint(
+                            os.path.join(output_dir, "checkpoint_stage1.pt"),
+                            model, optimizer, lr_scheduler, epoch - 1,
+                            best_loss, loss_weights=cur_loss_weights,
+                            in_stage2=False, swa_model=None,
+                            best_true_loss=best_true_loss)
+                        _log("Saved end-of-stage-1 checkpoint: "
+                             "checkpoint_stage1.pt (redo stage 2 from it "
+                             "via resume_from)")
                         for pg in optimizer.param_groups:
                             pg['lr'] = stage2_lr
                         best_loss = float("inf")
+                        best_true_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                              f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
                     else:
                         # Resumed mid-stage-2: keep the checkpoint's restored
                         # (possibly decayed) lr / optimizer / scheduler /
-                        # best_loss — do NOT re-apply nep.in's stage2_lr. To
-                        # force a new lr here, pass reset_lr=<value> (applied
-                        # before the loop). best_loss is reset only if the loss
-                        # weights changed (handled at checkpoint load).
+                        # best losses — do NOT re-apply nep.in's stage2_lr
+                        # (resume = exact continuation). best losses are
+                        # reset only if the loss weights changed (handled
+                        # at checkpoint load).
                         cur_lr = optimizer.param_groups[0]['lr']
                         _log(f"Stage 2 resumed at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
@@ -1330,18 +1567,40 @@ def train_nep(
                 _out_log_file.write(line + "\n")
                 _out_log_file.flush()
 
-            if avg_loss < best_loss:
+            # Best-model bookkeeping. avg_loss averages over weights that
+            # keep moving within the epoch, so it is a noisy proxy for the
+            # end-of-epoch weights actually saved. Early in the run that is
+            # fine (the model improves much faster than the noise). In the
+            # last third — where best really gets decided — a new avg_loss
+            # minimum only NOMINATES the weights: they become nep_best only
+            # if a frozen-weight pass over the full dataset (same masks and
+            # averaging as the screen numbers) beats the best true loss so
+            # far. The final epoch is always evaluated, so nep_best can
+            # never end up worse than nep_final.
+            new_min = avg_loss < best_loss
+            if new_min:
                 best_loss = avg_loss
-                raw_model.save_nep_txt(
-                    os.path.join(output_dir, "nep_best.txt"),
-                    max_NN_rad, max_NN_ang)
-                torch.save(raw_model.state_dict(),
-                           os.path.join(output_dir, "nep_best.pt"))
+            if epoch < true_eval_start:
+                if new_min:
+                    _save_best()
+            elif new_min or epoch == num_epochs:
+                t_loss, _te, _tf, _tv = _evaluate_true_loss(
+                    data_store, batch_size, raw_model,
+                    compute_props, compute_props_cached,
+                    use_autograd_forces, train_backend,
+                    cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                if t_loss < best_true_loss:
+                    best_true_loss = t_loss
+                    _save_best()
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs:
-                _save_checkpoint(ckpt_path, model, optimizer,
-                                 lr_scheduler, epoch, best_loss,
-                                 loss_weights=cur_loss_weights)
+                _save_checkpoint(
+                    ckpt_path, model, optimizer,
+                    stage2_scheduler if in_stage2 else lr_scheduler,
+                    epoch, best_loss, loss_weights=cur_loss_weights,
+                    in_stage2=in_stage2,
+                    swa_model=swa_model if in_stage2 else None,
+                    best_true_loss=best_true_loss)
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights
