@@ -12,13 +12,59 @@ The descriptor/force computation is implemented in ops.py (pure PyTorch
 by default, with optional CUDA kernel acceleration).
 """
 
+import math
 import torch
 import numpy as np
 from typing import Dict
 
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
-from .neighbor import build_neighbor_list
+from .neighbor import build_neighbor_list, CellList
 from . import ops
+
+
+def _available_memory_bytes(device: torch.device) -> int:
+    """Best-effort free memory for the compute device.
+
+    CUDA -> free VRAM; CPU / MPS (unified memory) -> free system RAM. Tries
+    psutil, then OS-specific probes, then a conservative 4 GB fallback so the
+    auto block sizer never assumes more than it can verify.
+    """
+    if device.type == "cuda":
+        try:
+            return int(torch.cuda.mem_get_info(device)[0])
+        except Exception:
+            return 4 * 1024 ** 3
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    import sys
+    if sys.platform == "linux":
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            import subprocess
+            out = subprocess.check_output(["vm_stat"]).decode()
+            page, free, inactive = 4096, 0, 0
+            for line in out.splitlines():
+                if "page size of" in line:
+                    page = int(line.split("page size of")[1].split("bytes")[0])
+                elif line.startswith("Pages free"):
+                    free = int(line.split(":")[1].strip().rstrip("."))
+                elif line.startswith("Pages inactive"):
+                    inactive = int(line.split(":")[1].strip().rstrip("."))
+            if free or inactive:
+                return (free + inactive) * page
+        except Exception:
+            pass
+    return 4 * 1024 ** 3
 
 
 class NEPCalculator:
@@ -446,3 +492,229 @@ class NEPCalculator:
         """Compute scaled descriptors. Returns (N, dim) numpy."""
         return self.compute(species, positions, cell,
                             compute_descriptor=True)["descriptor"].cpu().numpy()
+
+    # -- Memory-bounded tiled inference (large MD cells) ----------------------
+    def _auto_block_size(self, N, cell, mem_fraction=0.35, safety=2.0):
+        """Pick a block size so one tile's peak stays within a fraction of the
+        device's free memory. Derived from the cell density + model dims + dtype;
+        calibrated against the measured 512k-carbon peak (6.2 GB @ B=6000, f32).
+        """
+        esize = torch.finfo(self.dtype).bits // 8
+        vol = abs(float(np.linalg.det(np.asarray(cell, dtype=float))))
+        density = N / vol if vol > 1e-9 else 0.05
+        nbr_rad = density * (4.0 / 3.0) * math.pi * self.rc_radial ** 3
+        nbr_ang = density * (4.0 / 3.0) * math.pi * self.rc_angular ** 3
+        nap1, nlm = self.n_max_angular + 1, self.num_lm
+        # Per-block-atom transient bytes (dominant terms): radial basis, radial
+        # geometry, the gn_blm/gnp_blm angular tensors (the big ones), blm +
+        # direction derivatives, and the gn_ang factors.
+        per_atom = (nbr_rad * (self.basis_size_radial + 1) * 2
+                    + nbr_rad * 3 * 4
+                    + nbr_ang * nap1 * nlm * 2
+                    + nbr_ang * nlm * 5
+                    + nbr_ang * nap1 * 3) * esize * safety
+        # N-sized scratch (q, Fp, s, force/virial accumulators) — independent of B.
+        n_scratch = N * (2 * self.dim + nap1 * nlm + 12) * esize * safety
+        budget = _available_memory_bytes(self.device) * mem_fraction
+        B = int((budget - n_scratch) / max(per_atom, 1.0))
+        return max(256, min(B, N))
+
+    def compute_tiled(
+        self,
+        species: list,
+        positions: np.ndarray,
+        cell: np.ndarray,
+        block_size="auto",
+        query_sub_chunk: int = 4000,
+        backend: str = "auto",
+        compile: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Energy / forces / virial for large cells with bounded peak memory.
+
+        This is the MD-oriented counterpart of :meth:`compute`. Instead of
+        building the whole neighbor list and back-propagating through it (which
+        scales the peak memory with the total pair count — infeasible for a
+        500k-atom, high-density cell), it:
+
+        * builds the spatial bin table once (:class:`~torchnep.neighbor.CellList`);
+        * streams over blocks of ``block_size`` centre atoms, querying only that
+          block's neighbors at a time;
+        * computes per-atom energy with the **analytical** force/virial path
+          (``ops.compute_analytical_forces``) — no autograd graph is retained, so
+          peak memory is set by a single block, not the whole system. (This is
+          the same analytical kernel training/prediction use, hence also
+          ``torch.compile``-friendly.)
+
+        Each directed pair is owned by exactly one block (the block holding its
+        centre atom ``i``); contributions scatter into global per-atom
+        accumulators, so the result is identical to :meth:`compute` to round-off.
+
+        For cells too small for the linked-cell decomposition this transparently
+        defers to :meth:`compute` (the autograd path is cheap there).
+
+        Parameters
+        ----------
+        species, positions, cell : as in :meth:`compute`.
+        block_size : int or "auto"
+            Number of centre atoms processed per tile. Larger = faster but more
+            peak memory (block-independent N-sized scratch + this block's pairs).
+            "auto" (default) sizes it from the cell density, model dims, dtype
+            and the device's free memory (~35% budget); pass an int to override.
+        query_sub_chunk : int
+            Inner chunk for the neighbor query (bounds the candidate tensor).
+        backend : "auto" | "loop" | "bmm"  type-pair contraction (see ops).
+        compile : bool
+            torch.compile the descriptor + analytical-force kernels (dynamic
+            shapes, so the pair-count changes between MD steps do NOT trigger
+            recompilation — one warm-up compile, then a single dynamic graph).
+            Forces the ``bmm`` backend (compile-friendly; the per-type Python
+            loop graph-breaks). Worth it for many steps / large cells.
+
+        Returns
+        -------
+        dict with 'energy' (N,), 'forces' (N, 3), 'virial' (N, 9) — same keys and
+        conventions as :meth:`compute` (sans the component split / descriptor).
+        """
+        dtype, device = self.dtype, self.device
+        N = len(species)
+        atom_types = torch.tensor(
+            [self.type_names.index(s) for s in species],
+            dtype=torch.long, device=device)
+
+        max_rc = max(self.rc_radial, self.rc_angular)
+        cl = CellList(positions, cell, max_rc, device=device)
+        if not cl.ok:
+            # Small box — the autograd path is cheap and exact here.
+            res = self.compute(species, positions, cell)
+            return {"energy": res["energy"], "forces": res["forces"],
+                    "virial": res["virial"]}
+
+        if block_size == "auto":
+            block_size = self._auto_block_size(N, cell)
+        block_size = int(block_size)
+
+        if compile and self.device.type == "mps":
+            # torch.compile's inductor backend has no MPS support — fall back
+            # to eager rather than crashing mid-MD.
+            import warnings
+            warnings.warn("torch.compile is unsupported on MPS; running eager.",
+                          RuntimeWarning)
+            compile = False
+        if compile:
+            # bmm backend is compile-friendly (no per-type Python loop). Compile
+            # once and cache on the instance so MD steps reuse the dynamic graph.
+            backend = "bmm"
+            if not hasattr(self, "_desc_compiled"):
+                self._desc_compiled = torch.compile(
+                    ops.compute_descriptors_cached, dynamic=True)
+                self._force_compiled = torch.compile(
+                    ops.compute_analytical_forces, dynamic=True)
+            desc_fn, force_fn = self._desc_compiled, self._force_compiled
+        else:
+            backend = ops.resolve_backend(backend, num_types=self.num_types)
+            desc_fn, force_fn = (ops.compute_descriptors_cached,
+                                 ops.compute_analytical_forces)
+        c2 = self.c2
+        c3 = getattr(self, "c3", None)
+
+        E_atom = torch.zeros(N, dtype=dtype, device=device)
+        forces = torch.zeros(N, 3, dtype=dtype, device=device)
+        virial = torch.zeros(N, 9, dtype=dtype, device=device)
+
+        for a in range(0, N, block_size):
+            blk = torch.arange(a, min(a + block_size, N), device=device)
+            pi, pj, rij = cl.query(blk, sub_chunk=query_sub_chunk)
+            rij = rij.to(dtype)
+            dij = torch.norm(rij, dim=-1)
+
+            rad = dij < self.rc_radial
+            ang = dij < self.rc_angular
+            pir, pjr, rij_r, dr = pi[rad], pj[rad], rij[rad], dij[rad]
+            pia, pja, rij_a, da = pi[ang], pj[ang], rij[ang], dij[ang]
+
+            # Cached basis for this block's pairs (analytical-force inputs).
+            fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
+                dr, self.rc_radial, self.basis_size_radial)
+            d12inv_r = 1.0 / dr.clamp(min=1e-10)
+            if rij_a.shape[0] > 0:
+                fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
+                    da, self.rc_angular, self.basis_size_angular)
+                d12inv_a = 1.0 / da.clamp(min=1e-10)
+                blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
+                                        rij_a[:, 1] * d12inv_a,
+                                        rij_a[:, 2] * d12inv_a, self.l_max_3b)
+            else:
+                fk_a = torch.zeros(0, self.basis_size_angular + 1, dtype=dtype, device=device)
+                fkp_a = torch.zeros(0, self.basis_size_angular + 1, dtype=dtype, device=device)
+                d12inv_a = torch.zeros(0, dtype=dtype, device=device)
+                blm = torch.zeros(0, self.num_lm, dtype=dtype, device=device)
+
+            # Descriptors (scatter into N-sized buffers; only block-centre rows
+            # are complete, which is all we read).
+            q, s, gn_ang = desc_fn(
+                fk_r, fk_a, blm, pir, pjr, pia, pja,
+                atom_types, N, c2, c3,
+                self.n_max_radial, self.n_max_angular, self.l_max_3b,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
+                self.num_lm, self._c3b, self._c4b, self._c5b, self._c4b2,
+                dtype, device, return_intermediates=True, backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+                has_q_134=self.has_q_134)
+
+            # NN forward — block centres only.
+            q_blk = q[blk] * self.q_scaler
+            types_blk = atom_types[blk]
+            Ei_blk = torch.zeros(blk.shape[0], dtype=dtype, device=device)
+            Fp_blk = torch.zeros(blk.shape[0], self.dim, dtype=dtype, device=device)
+            for t in range(self.num_types):
+                m = types_blk == t
+                if not m.any():
+                    continue
+                qt = q_blk[m]
+                h = torch.tanh(qt @ self.w0[t].T - self.b0[t])
+                Ei_blk[m] = h @ self.w1[t]
+                Fp_blk[m] = (self.w1[t] * (1.0 - h * h)) @ self.w0[t]
+            E_atom[blk] = Ei_blk - self.b1
+
+            Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
+            Fp[blk] = Fp_blk * self.q_scaler
+
+            # ZBL (local autograd on this block's angular pairs — bounded).
+            if self.has_zbl:
+                with torch.enable_grad():
+                    rij_zbl = rij_a.detach().requires_grad_(True)
+                    Ei_zbl = ops.compute_zbl(
+                        atom_types, pia, pja, rij_zbl, N,
+                        self.atomic_numbers, self.zbl_rc_inner, self.zbl_rc_outer,
+                        self.zbl_typewise_factor,
+                        getattr(self, "zbl_rc_inner_per_type", None),
+                        getattr(self, "zbl_rc_outer_per_type", None),
+                        dtype, device)
+                    g_zbl = (torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
+                                                 allow_unused=True)[0]
+                             if Ei_zbl.requires_grad else None)
+                E_atom[blk] = E_atom[blk] + Ei_zbl[blk].detach()
+                if g_zbl is not None:
+                    empty_i = torch.zeros(0, dtype=torch.long, device=device)
+                    empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
+                    zf, zv = ops.accumulate_forces_virial(
+                        N, empty_i, empty_i, empty_r, empty_r,
+                        pia, pja, rij_a.detach(), g_zbl.detach(), dtype, device)
+                    forces += zf
+                    virial += zv
+
+            # Analytical NEP forces + virial for this block's pairs.
+            f_blk, v_blk = force_fn(
+                Fp, atom_types, N, c2, c3, fkp_r, fkp_a, blm,
+                pir, pjr, rij_r, d12inv_r, pia, pja, rij_a, d12inv_a,
+                s, gn_ang,
+                self.n_max_radial, self.n_max_angular, self.l_max_3b,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
+                self.num_lm, self._c3b, self._c4b, self._c5b, self._c4b2,
+                dtype, device, compute_virial=True, backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+                has_q_134=self.has_q_134)
+            forces += f_blk
+            virial += v_blk
+
+        return {"energy": E_atom, "forces": forces, "virial": virial}

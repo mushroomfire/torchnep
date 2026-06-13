@@ -27,7 +27,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from torchnep.data import build_neighbor_list_np          # noqa: E402
-from torchnep.neighbor import build_neighbor_list, _cell_list  # noqa: E402
+from torchnep.neighbor import build_neighbor_list, CellList  # noqa: E402
 from torchnep.nep import NEPCalculator                    # noqa: E402
 from torchnep.data import read_xyz                        # noqa: E402
 
@@ -59,10 +59,9 @@ def test_cell_list_matches_numpy_orthorhombic(seed):
     pos = rng.random((400, 3)) @ cell
     # also exercise atoms pushed outside the primary cell
     pos[:20] += cell[0] * 2.0
-    pis = _assert_same_pairs(pos, cell, 6.0)
+    _assert_same_pairs(pos, cell, 6.0)
     # confirm the fast path actually ran (30/6 = 5 bins per dir >= 3)
-    assert _cell_list(torch.as_tensor(pos), torch.as_tensor(cell), 6.0,
-                      torch.device("cpu"), torch.float64, 2_000_000) is not None
+    assert CellList(pos, cell, 6.0, device="cpu").ok
 
 
 @pytest.mark.parametrize("seed", [0, 1])
@@ -79,8 +78,7 @@ def test_small_box_falls_back_to_numpy():
     # build_neighbor_list still returns the correct numpy result.
     cell = np.eye(3) * 8.0
     pos = np.random.default_rng(0).random((20, 3)) @ cell
-    assert _cell_list(torch.as_tensor(pos), torch.as_tensor(cell), 6.0,
-                      torch.device("cpu"), torch.float64, 2_000_000) is None
+    assert not CellList(pos, cell, 6.0, device="cpu").ok
     _assert_same_pairs(pos, cell, 6.0)
 
 
@@ -118,3 +116,100 @@ def test_supercell_reproduces_unit_cell():
     assert abs(epa - epa0) < 1e-10
     # forces on the first replica equal the unit-cell forces
     assert np.abs(r["forces"].numpy()[:len(pos0)] - r0["forces"].numpy()).max() < 1e-9
+
+
+def test_tiled_matches_autograd():
+    """The memory-bounded tiled analytical path must reproduce the autograd
+    compute() to round-off, including across block boundaries (small block_size
+    forces many tiles) and for a ZBL model (CrCoNi has typewise ZBL)."""
+    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    cell0 = np.asarray(fr["cell"]); pos0 = np.asarray(fr["positions"])
+    sp0 = list(fr["species"])
+    reps = 3
+    cell = cell0 * reps
+    pos, sp = [], []
+    for i in range(reps):
+        for j in range(reps):
+            for k in range(reps):
+                pos.append(pos0 + np.array([i, j, k]) @ cell0)
+                sp += sp0
+    pos = np.concatenate(pos)
+
+    calc = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float64)
+    ref = calc.compute(sp, pos, cell)
+    til = calc.compute_tiled(sp, pos, cell, block_size=500)  # ~6 tiles
+
+    assert abs(float(ref["energy"].sum()) - float(til["energy"].sum())) < 1e-9
+    assert np.abs(ref["energy"].numpy() - til["energy"].numpy()).max() < 1e-9
+    assert np.abs(ref["forces"].numpy() - til["forces"].numpy()).max() < 1e-9
+    assert np.abs(ref["virial"].numpy().sum(0)
+                  - til["virial"].numpy().sum(0)).max() < 1e-8
+
+
+def test_tiled_compile_matches_eager():
+    """compile=True (torch.compile, bmm backend, dynamic shapes) must reproduce
+    the eager tiled result bit-for-bit on physical data."""
+    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    cell0 = np.asarray(fr["cell"]); pos0 = np.asarray(fr["positions"])
+    sp0 = list(fr["species"])
+    reps = 3
+    cell = cell0 * reps
+    pos, sp = [], []
+    for i in range(reps):
+        for j in range(reps):
+            for k in range(reps):
+                pos.append(pos0 + np.array([i, j, k]) @ cell0)
+                sp += sp0
+    pos = np.concatenate(pos)
+
+    calc = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float64)
+    eager = calc.compute_tiled(sp, pos, cell, block_size=700, compile=False)
+    comp = calc.compute_tiled(sp, pos, cell, block_size=700, compile=True)
+    assert abs(float(eager["energy"].sum()) - float(comp["energy"].sum())) < 1e-9
+    assert np.abs(eager["forces"].numpy() - comp["forces"].numpy()).max() < 1e-9
+    assert np.abs(eager["virial"].numpy().sum(0)
+                  - comp["virial"].numpy().sum(0)).max() < 1e-7
+
+
+def test_auto_block_size():
+    """block_size='auto' stays in [256, N], shrinks for float64 vs float32, and
+    produces the same result as an explicit block size."""
+    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    cell0 = np.asarray(fr["cell"]); pos0 = np.asarray(fr["positions"])
+    sp0 = list(fr["species"])
+    reps = 3
+    cell = cell0 * reps
+    pos, sp = [], []
+    for i in range(reps):
+        for j in range(reps):
+            for k in range(reps):
+                pos.append(pos0 + np.array([i, j, k]) @ cell0)
+                sp += sp0
+    pos = np.concatenate(pos)
+    N = len(sp)
+
+    c32 = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float32)
+    c64 = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float64)
+    b32 = c32._auto_block_size(N, cell)
+    b64 = c64._auto_block_size(N, cell)
+    assert 256 <= b32 <= N and 256 <= b64 <= N
+    assert b64 <= b32  # float64 needs more memory per atom -> smaller block
+
+    # 'auto' must give the same physics as a fixed block size.
+    auto = c64.compute_tiled(sp, pos, cell, block_size="auto")
+    fixed = c64.compute_tiled(sp, pos, cell, block_size=500)
+    assert abs(float(auto["energy"].sum()) - float(fixed["energy"].sum())) < 1e-9
+    assert np.abs(auto["forces"].numpy() - fixed["forces"].numpy()).max() < 1e-9
+
+
+def test_tiled_small_box_falls_back():
+    """compute_tiled on a box too small for the cell-list defers to compute()
+    and still returns the correct energy/forces."""
+    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    calc = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float64)
+    ref = calc.compute(list(fr["species"]), np.asarray(fr["positions"]),
+                       np.asarray(fr["cell"]))
+    til = calc.compute_tiled(list(fr["species"]), np.asarray(fr["positions"]),
+                             np.asarray(fr["cell"]))
+    assert abs(float(ref["energy"].sum()) - float(til["energy"].sum())) < 1e-9
+    assert np.abs(ref["forces"].numpy() - til["forces"].numpy()).max() < 1e-9

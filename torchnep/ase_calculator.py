@@ -72,10 +72,21 @@ class NEP(Calculator):
     implemented_properties = ["energy", "energies", "free_energy",
                               "forces", "stress"]
 
-    def __init__(self, model_file, dtype="float64", device="cpu", **kwargs):
+    def __init__(self, model_file, dtype="float64", device="cpu",
+                 tiled="auto", block_size="auto", compile=False, **kwargs):
         super().__init__(**kwargs)
         self.nep = _NEPCore(model_file, dtype=_resolve_dtype(dtype),
                             device=device)
+        # tiled: memory-bounded analytical inference for large cells.
+        #   True   -> always tile;  False -> never (autograd path);
+        #   "auto" -> tile once the system exceeds ``tiled_threshold`` atoms.
+        self.tiled = tiled
+        # block_size: "auto" sizes each tile from free memory; or an int override.
+        self.block_size = block_size
+        self.tiled_threshold = 50000
+        # compile: torch.compile the tiled kernels (CPU/CUDA only; one-time
+        # warm-up, then a dynamic graph that survives MD pair-count changes).
+        self.compile = bool(compile)
 
     # -- helpers --------------------------------------------------------------
     def _cell_for_neighbors(self, atoms):
@@ -100,11 +111,16 @@ class NEP(Calculator):
         atoms = self.atoms  # set by super().calculate
 
         cell, periodic = self._cell_for_neighbors(atoms)
-        res = self.nep.compute(
-            species=atoms.get_chemical_symbols(),
-            positions=atoms.get_positions(),
-            cell=cell,
-        )
+        species = atoms.get_chemical_symbols()
+        use_tiled = (self.tiled is True or
+                     (self.tiled == "auto" and len(species) >= self.tiled_threshold))
+        if use_tiled:
+            res = self.nep.compute_tiled(
+                species=species, positions=atoms.get_positions(),
+                cell=cell, block_size=self.block_size, compile=self.compile)
+        else:
+            res = self.nep.compute(
+                species=species, positions=atoms.get_positions(), cell=cell)
         energies = res["energy"].detach().cpu().numpy()
         forces = res["forces"].detach().cpu().numpy()
 
