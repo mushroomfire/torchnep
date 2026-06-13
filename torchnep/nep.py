@@ -17,7 +17,7 @@ import numpy as np
 from typing import Dict
 
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
-from .data import build_neighbor_list_np
+from .neighbor import build_neighbor_list
 from . import ops
 
 
@@ -223,13 +223,12 @@ class NEPCalculator:
         cell_np = np.asarray(cell)
         N = pos_np.shape[0]
 
-        # Neighbor list (numpy; single implementation shared with training/prediction)
+        # Neighbor list: PyTorch linked-cell search (O(N), stays on device) for
+        # MD-sized cells, with an automatic fallback to the numpy brute-force
+        # builder for tiny training-style boxes. See torchnep.neighbor.
         max_rc = max(self.rc_radial, self.rc_angular)
-        pi_np, pj_np, rij_np = build_neighbor_list_np(pos_np, cell_np, max_rc)
-        pair_i = torch.from_numpy(pi_np).to(self.device)
-        pair_j = torch.from_numpy(pj_np).to(self.device)
-        rij = torch.from_numpy(np.ascontiguousarray(rij_np)).to(
-            device=self.device, dtype=self.dtype)
+        pair_i, pair_j, rij = build_neighbor_list(
+            pos_np, cell_np, max_rc, device=self.device, dtype=self.dtype)
         dij = torch.norm(rij, dim=-1)
 
         rad_mask = dij < self.rc_radial
