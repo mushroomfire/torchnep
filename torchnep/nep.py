@@ -494,10 +494,20 @@ class NEPCalculator:
                             compute_descriptor=True)["descriptor"].cpu().numpy()
 
     # -- Memory-bounded tiled inference (large MD cells) ----------------------
-    def _auto_block_size(self, N, cell, mem_fraction=0.35, safety=2.0):
-        """Pick a block size so one tile's peak stays within a fraction of the
-        device's free memory. Derived from the cell density + model dims + dtype;
-        calibrated against the measured 512k-carbon peak (6.2 GB @ B=6000, f32).
+    def _auto_block_size(self, N, cell, mem_fraction=0.6, copy_fudge=1.8):
+        """Pick the largest block whose peak memory fits a fraction of the
+        device's free memory — bigger blocks mean fewer tiles and less overhead.
+
+        Memory model (validated against measured peak RSS, CrCoNi/CrCoNi-ZBL and
+        512k carbon, float32): peak ~= fixed N-scratch + per_atom * block_size.
+        The block term is dominated NOT by the neighbor list (~150 MB) but by the
+        three (P_ang, n_ap1, num_lm) angular intermediates in the descriptor /
+        force kernels (gn_blm, gnp_blm, w_i); next is the radial basis
+        (fk/fkp) and dblm_dhat. ``copy_fudge`` (1.8) is calibrated so the
+        estimate matches the *heaviest* measured model (512k carbon with the
+        extra q_222/q_1111 mixed-body intermediates, ~780 KB/atom); for lighter
+        models it is conservative. With mem_fraction 0.6 that leaves ~40%
+        headroom for density non-uniformity and runtime memory fluctuation.
         """
         esize = torch.finfo(self.dtype).bits // 8
         vol = abs(float(np.linalg.det(np.asarray(cell, dtype=float))))
@@ -505,16 +515,14 @@ class NEPCalculator:
         nbr_rad = density * (4.0 / 3.0) * math.pi * self.rc_radial ** 3
         nbr_ang = density * (4.0 / 3.0) * math.pi * self.rc_angular ** 3
         nap1, nlm = self.n_max_angular + 1, self.num_lm
-        # Per-block-atom transient bytes (dominant terms): radial basis, radial
-        # geometry, the gn_blm/gnp_blm angular tensors (the big ones), blm +
-        # direction derivatives, and the gn_ang factors.
-        per_atom = (nbr_rad * (self.basis_size_radial + 1) * 2
-                    + nbr_rad * 3 * 4
-                    + nbr_ang * nap1 * nlm * 2
-                    + nbr_ang * nlm * 5
-                    + nbr_ang * nap1 * 3) * esize * safety
-        # N-sized scratch (q, Fp, s, force/virial accumulators) — independent of B.
-        n_scratch = N * (2 * self.dim + nap1 * nlm + 12) * esize * safety
+        # Per-block-atom bytes:
+        #   3x (n_ap1*num_lm) angular intermediates  <- dominant
+        #   dblm_dhat (num_lm*3) + blm (num_lm) + 2x gn factors (n_ap1)
+        #   radial basis fk_r+fkp_r (2*(basis_r+1)) + neighbor rij/idx (~7 per pair)
+        per_atom = (nbr_ang * (3 * nap1 * nlm + nlm * 3 + nlm + 2 * nap1)
+                    + nbr_rad * (2 * (self.basis_size_radial + 1) + 7)) * esize * copy_fudge
+        # N-sized scratch (q, Fp, s, w_atom, force/virial accumulators) — fixed.
+        n_scratch = N * (2 * self.dim + 2 * nap1 * nlm + 12) * esize * copy_fudge
         budget = _available_memory_bytes(self.device) * mem_fraction
         B = int((budget - n_scratch) / max(per_atom, 1.0))
         return max(256, min(B, N))
