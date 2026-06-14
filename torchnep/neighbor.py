@@ -57,8 +57,18 @@ class CellList:
     """
 
     def __init__(self, positions, cell, cutoff, device="cpu"):
-        self.device = torch.device(device)
-        self.sdtype = _search_dtype(self.device)
+        self.out_device = torch.device(device)
+        # The geometry (binning, wrapping, displacements) is done on a
+        # float64-capable device, then results are moved to ``out_device``.
+        # Positions reach ~1e2 A, where float32 has only ~1e-5 A resolution;
+        # at stiff short bonds (e.g. high-pressure ZBL) that feeds a visible
+        # force error. MPS has no float64, so for MPS the search runs on CPU
+        # (float64) and only the indices + rij are shipped to the GPU — the
+        # heavy NN / force math still runs on MPS. CPU / CUDA search in place.
+        self.search_device = (torch.device("cpu")
+                              if self.out_device.type == "mps" else self.out_device)
+        self.device = self.search_device  # internal tensors live here
+        self.sdtype = _search_dtype(self.search_device)
         self.cutoff = float(cutoff)
         pos = torch.as_tensor(np.asarray(positions), dtype=self.sdtype, device=self.device)
         cell_t = torch.as_tensor(np.asarray(cell), dtype=self.sdtype, device=self.device)
@@ -120,6 +130,10 @@ class CellList:
         S = self.offs.shape[0]                                          # 27
         c2 = self.cutoff * self.cutoff
         center_ids = torch.as_tensor(center_ids, dtype=torch.long, device=self.device)
+        out = self.out_device
+        # rij is computed in float64 on the search device; MPS can't hold
+        # float64, so cast it down before shipping there (CPU/CUDA keep float64).
+        out_rdtype = torch.float32 if out.type == "mps" else self.sdtype
         pis, pjs, rijs = [], [], []
         for st in range(0, center_ids.shape[0], sub_chunk):
             cidx = center_ids[st:st + sub_chunk]
@@ -140,9 +154,12 @@ class CellList:
             ci = cidx.unsqueeze(1).unsqueeze(2).expand_as(cand)
             pis.append(ci[keep]); pjs.append(q[keep]); rijs.append(rij[keep])
         if not pis:
-            z = torch.zeros(0, dtype=torch.long, device=self.device)
-            return z, z.clone(), torch.zeros(0, 3, dtype=self.sdtype, device=self.device)
-        return torch.cat(pis), torch.cat(pjs), torch.cat(rijs)
+            z = torch.zeros(0, dtype=torch.long, device=out)
+            return z, z.clone(), torch.zeros(0, 3, dtype=out_rdtype, device=out)
+        # Geometry computed on search_device (float64 for CPU/CUDA); ship the
+        # integer pairs and displacements to the compute device.
+        return (torch.cat(pis).to(out), torch.cat(pjs).to(out),
+                torch.cat(rijs).to(out_rdtype).to(out))
 
 
 def build_neighbor_list(positions, cell, cutoff, device="cpu",

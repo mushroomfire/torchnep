@@ -171,6 +171,39 @@ def test_tiled_compile_matches_eager():
                   - comp["virial"].numpy().sum(0)).max() < 1e-7
 
 
+def test_mps_search_runs_in_float64():
+    """Regression: an MPS-targeted CellList must run its geometry on CPU in
+    float64 (MPS has no float64). Positions reach ~1e2 A where float32 has only
+    ~1e-5 A resolution, which at stiff short bonds caused a visible force error.
+    """
+    cl = CellList(np.random.default_rng(0).random((50, 3)) * 30.0,
+                  np.eye(3) * 30.0, 6.0, device="mps")
+    assert cl.search_device.type == "cpu"
+    assert cl.sdtype == torch.float64
+
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        return
+    # On real MPS: forces on a large-coordinate cell must match CPU float32
+    # (both now fed a float64-accurate neighbor list).
+    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    cell0 = np.asarray(fr["cell"]); pos0 = np.asarray(fr["positions"])
+    sp0 = list(fr["species"])
+    reps = 3
+    cell = cell0 * reps
+    pos, sp = [], []
+    for i in range(reps):
+        for j in range(reps):
+            for k in range(reps):
+                pos.append(pos0 + np.array([i, j, k]) @ cell0)
+                sp += sp0
+    pos = np.concatenate(pos) + 200.0  # large coordinates stress float32 geometry
+    c_cpu = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float32, device="cpu")
+    c_mps = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float32, device="mps")
+    f_cpu = c_cpu.compute_tiled(sp, pos, cell, block_size=700)["forces"].cpu().numpy()
+    f_mps = c_mps.compute_tiled(sp, pos, cell, block_size=700)["forces"].cpu().numpy()
+    assert np.abs(f_cpu - f_mps).max() < 1e-3
+
+
 def test_auto_block_size():
     """block_size='auto' stays in [256, N], shrinks for float64 vs float32, and
     produces the same result as an explicit block size."""
