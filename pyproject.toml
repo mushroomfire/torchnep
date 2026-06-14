@@ -31,6 +31,9 @@ ase = ["ase>=3.22"]
 # test_q1111_redundancy_warns still asserts it fires (via pytest.warns).
 filterwarnings = [
     "ignore:.*has_q_1111.*redundant.*:UserWarning",
+    # torch-internal: torch.compile's inductor import trips torch's own
+    # torch.jit.script_method deprecation. Not actionable by us.
+    "ignore:.*torch.jit.script_method.*is deprecated.*:DeprecationWarning",
 ]
 
 [project.urls]

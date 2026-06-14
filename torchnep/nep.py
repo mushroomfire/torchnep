@@ -494,20 +494,21 @@ class NEPCalculator:
                             compute_descriptor=True)["descriptor"].cpu().numpy()
 
     # -- Memory-bounded tiled inference (large MD cells) ----------------------
-    def _auto_block_size(self, N, cell, mem_fraction=0.6, copy_fudge=1.8):
-        """Pick the largest block whose peak memory fits a fraction of the
-        device's free memory — bigger blocks mean fewer tiles and less overhead.
+    def _auto_block_size(self, N, cell, reserve_gb=1.5, copy_fudge=1.3):
+        """Pick the largest block whose extra allocation fits the device's free
+        memory minus ``reserve_gb`` — bigger blocks mean fewer tiles, less
+        overhead, faster. The reserve (default 2 GB) is the only headroom kept;
+        everything else is used.
 
-        Memory model (validated against measured peak RSS, CrCoNi/CrCoNi-ZBL and
-        512k carbon, float32): peak ~= fixed N-scratch + per_atom * block_size.
-        The block term is dominated NOT by the neighbor list (~150 MB) but by the
-        three (P_ang, n_ap1, num_lm) angular intermediates in the descriptor /
-        force kernels (gn_blm, gnp_blm, w_i); next is the radial basis
-        (fk/fkp) and dblm_dhat. ``copy_fudge`` (1.8) is calibrated so the
-        estimate matches the *heaviest* measured model (512k carbon with the
-        extra q_222/q_1111 mixed-body intermediates, ~780 KB/atom); for lighter
-        models it is conservative. With mem_fraction 0.6 that leaves ~40%
-        headroom for density non-uniformity and runtime memory fluctuation.
+        Memory model (fit to measured peak RSS — CrCoNi-ZBL and 512k carbon,
+        float32): the *extra* allocation during compute is
+        ``n_scratch + per_atom * block_size``. The block term is dominated NOT by
+        the neighbor list (~150 MB; transfer is ~3 ms) but by the three
+        (P_ang, n_ap1, num_lm) angular intermediates in the descriptor / force
+        kernels (gn_blm, gnp_blm, w_i), then the radial basis and dblm_dhat.
+        ``copy_fudge`` (1.3) matches the measured 512k-carbon per-atom cost
+        (~535 KB/atom, float32). ``_available_*`` is current free memory, so the
+        process baseline is already excluded; only ``reserve_gb`` is kept free.
         """
         esize = torch.finfo(self.dtype).bits // 8
         vol = abs(float(np.linalg.det(np.asarray(cell, dtype=float))))
@@ -523,7 +524,9 @@ class NEPCalculator:
                     + nbr_rad * (2 * (self.basis_size_radial + 1) + 7)) * esize * copy_fudge
         # N-sized scratch (q, Fp, s, w_atom, force/virial accumulators) — fixed.
         n_scratch = N * (2 * self.dim + 2 * nap1 * nlm + 12) * esize * copy_fudge
-        budget = _available_memory_bytes(self.device) * mem_fraction
+        budget = _available_memory_bytes(self.device) - reserve_gb * 1e9
+        # Always allow at least a small block, even on a tight machine.
+        budget = max(budget, 256.0 * per_atom + n_scratch)
         B = int((budget - n_scratch) / max(per_atom, 1.0))
         return max(256, min(B, N))
 
