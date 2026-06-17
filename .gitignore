@@ -29,3 +29,5 @@
 /bench_test/
 # Local-only docs / notes (diagrams, LaTeX, markdown explanations).
 /docs/
+# Local-only learning playground (from-scratch pedagogical NEP reimplementation).
+/learn/
