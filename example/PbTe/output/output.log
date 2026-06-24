@@ -1,0 +1,679 @@
+
+████████╗ ██████╗ ██████╗  ██████╗██╗  ██╗███╗   ██╗███████╗██████╗
+╚══██╔══╝██╔═══██╗██╔══██╗██╔════╝██║  ██║████╗  ██║██╔════╝██╔══██╗
+   ██║   ██║   ██║██████╔╝██║     ███████║██╔██╗ ██║█████╗  ██████╔╝
+   ██║   ██║   ██║██╔══██╗██║     ██╔══██║██║╚██╗██║██╔══╝  ██╔═══╝
+   ██║   ╚██████╔╝██║  ██║╚██████╗██║  ██║██║ ╚████║███████╗██║
+   ╚═╝    ╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝
+   torchnep  v1.0.0   author: Yongchao Wu, yongchao.wu@aalto.fi
+   2026-06-24 21:26:50
+
+Backend  : CUDA
+Devices  : 1 x NVIDIA RTX A2000 12GB  (12.5 GB total)
+PyTorch  : 2.11.0+cu126
+Precision: float32
+
+Model architecture
+------------------
+  (input)     types        2  Te Pb
+  (default)   cutoff       8.0 4.0
+  (default)   n_max        6 6
+  (default)   basis_size   6 6
+  (default)   l_max        4 1 0 0 0 0 0
+              (L_3b, q_222, q_1111, q_112, q_123, q_233, q_134)
+  (default)   neuron       30
+
+Training schedule (Stage 1)
+---------------------------
+  (default)   epoch        600
+  (input)     batch        4
+  (default)   lr           0.01
+  (default)   stop_lr      1e-06
+  (default)   lr_scheduler plateau
+  (default)   patience     15
+  (default)   factor       0.7
+  (default)   max_grad     10.0
+  (default)   lambda_e     0.01
+  (default)   lambda_f     1.0
+  (default)   lambda_v     0.01
+
+Training schedule (Stage 2)
+---------------------------
+  (default)   start_stage2 auto (0.5 * 600)
+  (default)   stage2_lr    0.001
+  (default)   stage2_scheduler_patience 15
+  (default)   stage2_scheduler_factor   0.7
+  (default)   stage2_lambda_e 1.0
+  (default)   stage2_lambda_f 0.05
+  (default)   stage2_lambda_v 0.1
+
+Data
+----
+  read 25 structures from train.xyz (energy label: energy)
+  built neighbor lists in 1.0s
+  loaded to cuda in 0.2s (cached basis)
+  coverage: 25 E / 25 F / 0 V
+
+Model
+-----
+  3033 parameters, dim=42, b1 init=3.7721
+  backend: loop (q_scaler) / bmm (training), forces: analytical
+  q_scaler in 0.2s
+  torch.compile: enabled (analytical compute method)
+
+Training: epochs 1..600, Stage 2 from epoch 300 (SWA=off)
+========================================================================
+Epoch    1 | loss 2.6892e-01 | E 0.15837 eV/atom | F 0.51833 eV/A | gnorm 23.6 | lr 1.00e-02 | 12.2s
+Epoch    2 | loss 2.9696e-02 | E 0.14355 eV/atom | F 0.17172 eV/A | gnorm 1.9 | lr 1.00e-02 | 0.1s
+Epoch    3 | loss 1.8138e-02 | E 0.08008 eV/atom | F 0.13444 eV/A | gnorm 0.6 | lr 1.00e-02 | 0.1s
+Epoch    4 | loss 1.7745e-02 | E 0.02455 eV/atom | F 0.13319 eV/A | gnorm 1.0 | lr 1.00e-02 | 0.0s
+Epoch    5 | loss 1.1908e-02 | E 0.04909 eV/atom | F 0.10901 eV/A | gnorm 0.7 | lr 1.00e-02 | 0.0s
+Epoch    6 | loss 9.3899e-03 | E 0.04173 eV/atom | F 0.09681 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch    7 | loss 7.7713e-03 | E 0.04953 eV/atom | F 0.08802 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch    8 | loss 6.6732e-03 | E 0.01371 eV/atom | F 0.08168 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch    9 | loss 6.1086e-03 | E 0.00604 eV/atom | F 0.07816 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   10 | loss 5.6915e-03 | E 0.00838 eV/atom | F 0.07544 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   11 | loss 5.8786e-03 | E 0.03016 eV/atom | F 0.07661 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.0s
+Epoch   12 | loss 5.3813e-03 | E 0.01266 eV/atom | F 0.07335 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   13 | loss 5.3828e-03 | E 0.01142 eV/atom | F 0.07336 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   14 | loss 4.9840e-03 | E 0.00817 eV/atom | F 0.07059 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   15 | loss 4.8004e-03 | E 0.01080 eV/atom | F 0.06928 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   16 | loss 4.6744e-03 | E 0.00650 eV/atom | F 0.06837 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   17 | loss 4.5438e-03 | E 0.00959 eV/atom | F 0.06740 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   18 | loss 4.5017e-03 | E 0.01188 eV/atom | F 0.06708 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   19 | loss 4.3843e-03 | E 0.01762 eV/atom | F 0.06619 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   20 | loss 4.4434e-03 | E 0.02026 eV/atom | F 0.06663 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.1s
+Epoch   21 | loss 4.2607e-03 | E 0.01171 eV/atom | F 0.06526 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   22 | loss 4.1718e-03 | E 0.01971 eV/atom | F 0.06456 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   23 | loss 4.2799e-03 | E 0.01284 eV/atom | F 0.06541 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   24 | loss 4.0299e-03 | E 0.00955 eV/atom | F 0.06347 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   25 | loss 3.8623e-03 | E 0.00460 eV/atom | F 0.06215 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   26 | loss 3.7624e-03 | E 0.00768 eV/atom | F 0.06133 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   27 | loss 3.7198e-03 | E 0.01382 eV/atom | F 0.06097 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   28 | loss 3.6862e-03 | E 0.01659 eV/atom | F 0.06069 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   29 | loss 3.7088e-03 | E 0.01438 eV/atom | F 0.06088 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   30 | loss 3.9174e-03 | E 0.02233 eV/atom | F 0.06255 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   31 | loss 3.5804e-03 | E 0.02047 eV/atom | F 0.05980 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   32 | loss 3.5033e-03 | E 0.02480 eV/atom | F 0.05914 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.1s
+Epoch   33 | loss 3.8650e-03 | E 0.02453 eV/atom | F 0.06212 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   34 | loss 3.6648e-03 | E 0.02041 eV/atom | F 0.06050 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   35 | loss 3.5880e-03 | E 0.01976 eV/atom | F 0.05987 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   36 | loss 3.8205e-03 | E 0.01198 eV/atom | F 0.06180 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.0s
+Epoch   37 | loss 3.8212e-03 | E 0.01868 eV/atom | F 0.06179 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   38 | loss 3.5760e-03 | E 0.02100 eV/atom | F 0.05976 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   39 | loss 3.3162e-03 | E 0.03484 eV/atom | F 0.05748 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   40 | loss 3.4244e-03 | E 0.02623 eV/atom | F 0.05846 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.1s
+Epoch   41 | loss 3.3821e-03 | E 0.03654 eV/atom | F 0.05804 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   42 | loss 3.4193e-03 | E 0.02702 eV/atom | F 0.05841 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   43 | loss 3.7217e-03 | E 0.03629 eV/atom | F 0.06090 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.0s
+Epoch   44 | loss 4.8135e-03 | E 0.02452 eV/atom | F 0.06934 eV/A | gnorm 0.6 | lr 1.00e-02 | 0.0s
+Epoch   45 | loss 3.7086e-03 | E 0.04039 eV/atom | F 0.06076 eV/A | gnorm 0.4 | lr 1.00e-02 | 0.0s
+Epoch   46 | loss 3.4647e-03 | E 0.05536 eV/atom | F 0.05860 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   47 | loss 3.0715e-03 | E 0.00949 eV/atom | F 0.05541 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   48 | loss 3.1248e-03 | E 0.03167 eV/atom | F 0.05581 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   49 | loss 3.0457e-03 | E 0.01222 eV/atom | F 0.05517 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   50 | loss 3.0041e-03 | E 0.02387 eV/atom | F 0.05476 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   51 | loss 2.8765e-03 | E 0.01330 eV/atom | F 0.05362 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.1s
+Epoch   52 | loss 2.8966e-03 | E 0.02890 eV/atom | F 0.05374 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   53 | loss 2.9284e-03 | E 0.02664 eV/atom | F 0.05405 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   54 | loss 2.9105e-03 | E 0.02467 eV/atom | F 0.05389 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   55 | loss 3.0091e-03 | E 0.02580 eV/atom | F 0.05479 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   56 | loss 2.8576e-03 | E 0.02108 eV/atom | F 0.05342 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   57 | loss 2.7748e-03 | E 0.04174 eV/atom | F 0.05251 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   58 | loss 2.7923e-03 | E 0.03495 eV/atom | F 0.05273 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   59 | loss 2.6351e-03 | E 0.01649 eV/atom | F 0.05131 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   60 | loss 2.5468e-03 | E 0.01865 eV/atom | F 0.05043 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   61 | loss 2.4894e-03 | E 0.00721 eV/atom | F 0.04989 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   62 | loss 2.4490e-03 | E 0.01020 eV/atom | F 0.04948 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   63 | loss 2.4907e-03 | E 0.00862 eV/atom | F 0.04990 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   64 | loss 2.7115e-03 | E 0.01946 eV/atom | F 0.05204 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   65 | loss 2.6366e-03 | E 0.00915 eV/atom | F 0.05134 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   66 | loss 2.6480e-03 | E 0.02073 eV/atom | F 0.05142 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   67 | loss 3.1253e-03 | E 0.01931 eV/atom | F 0.05587 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch   68 | loss 2.6554e-03 | E 0.01032 eV/atom | F 0.05152 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   69 | loss 2.4442e-03 | E 0.02971 eV/atom | F 0.04935 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   70 | loss 2.4354e-03 | E 0.01121 eV/atom | F 0.04934 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   71 | loss 2.3977e-03 | E 0.01475 eV/atom | F 0.04894 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   72 | loss 2.3363e-03 | E 0.01094 eV/atom | F 0.04832 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.1s
+Epoch   73 | loss 2.3078e-03 | E 0.02115 eV/atom | F 0.04799 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   74 | loss 2.2807e-03 | E 0.02001 eV/atom | F 0.04772 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   75 | loss 2.4461e-03 | E 0.02073 eV/atom | F 0.04941 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   76 | loss 2.3569e-03 | E 0.01629 eV/atom | F 0.04852 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   77 | loss 2.2337e-03 | E 0.01305 eV/atom | F 0.04724 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   78 | loss 2.1880e-03 | E 0.01687 eV/atom | F 0.04675 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   79 | loss 2.2344e-03 | E 0.01625 eV/atom | F 0.04724 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   80 | loss 2.1935e-03 | E 0.01070 eV/atom | F 0.04682 eV/A | gnorm 0.0 | lr 1.00e-02 | 0.0s
+Epoch   81 | loss 2.1990e-03 | E 0.02753 eV/atom | F 0.04681 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.1s
+Epoch   82 | loss 2.3610e-03 | E 0.01199 eV/atom | F 0.04858 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   83 | loss 2.3065e-03 | E 0.02801 eV/atom | F 0.04794 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   84 | loss 2.1363e-03 | E 0.01959 eV/atom | F 0.04618 eV/A | gnorm 0.0 | lr 1.00e-02 | 0.0s
+Epoch   85 | loss 2.0765e-03 | E 0.01507 eV/atom | F 0.04554 eV/A | gnorm 0.0 | lr 1.00e-02 | 0.0s
+Epoch   86 | loss 2.0933e-03 | E 0.01296 eV/atom | F 0.04573 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   87 | loss 2.0744e-03 | E 0.02400 eV/atom | F 0.04548 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   88 | loss 2.0393e-03 | E 0.01154 eV/atom | F 0.04514 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   89 | loss 2.8346e-03 | E 0.02212 eV/atom | F 0.05319 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.0s
+Epoch   90 | loss 4.7966e-03 | E 0.05315 eV/atom | F 0.06905 eV/A | gnorm 0.5 | lr 1.00e-02 | 0.0s
+Epoch   91 | loss 3.2707e-03 | E 0.03955 eV/atom | F 0.05705 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   92 | loss 2.8069e-03 | E 0.02391 eV/atom | F 0.05293 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch   93 | loss 2.3583e-03 | E 0.00850 eV/atom | F 0.04856 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   94 | loss 2.1843e-03 | E 0.01096 eV/atom | F 0.04672 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   95 | loss 2.2241e-03 | E 0.01469 eV/atom | F 0.04714 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   96 | loss 2.1380e-03 | E 0.02038 eV/atom | F 0.04619 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   97 | loss 2.0965e-03 | E 0.02063 eV/atom | F 0.04574 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   98 | loss 2.0797e-03 | E 0.01047 eV/atom | F 0.04559 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch   99 | loss 1.9644e-03 | E 0.00968 eV/atom | F 0.04431 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  100 | loss 1.9183e-03 | E 0.01081 eV/atom | F 0.04379 eV/A | gnorm 0.0 | lr 1.00e-02 | 0.0s
+Epoch  101 | loss 1.9468e-03 | E 0.01396 eV/atom | F 0.04410 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  102 | loss 1.9271e-03 | E 0.01755 eV/atom | F 0.04386 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  103 | loss 1.9518e-03 | E 0.01657 eV/atom | F 0.04415 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  104 | loss 1.9420e-03 | E 0.01014 eV/atom | F 0.04406 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  105 | loss 1.9626e-03 | E 0.01348 eV/atom | F 0.04428 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  106 | loss 1.9115e-03 | E 0.01242 eV/atom | F 0.04370 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  107 | loss 1.9466e-03 | E 0.00951 eV/atom | F 0.04411 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  108 | loss 1.8835e-03 | E 0.00522 eV/atom | F 0.04340 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  109 | loss 1.8866e-03 | E 0.00622 eV/atom | F 0.04343 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  110 | loss 1.8108e-03 | E 0.00457 eV/atom | F 0.04255 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  111 | loss 1.9008e-03 | E 0.00427 eV/atom | F 0.04360 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  112 | loss 1.8073e-03 | E 0.00821 eV/atom | F 0.04250 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  113 | loss 1.8166e-03 | E 0.00655 eV/atom | F 0.04262 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  114 | loss 1.8108e-03 | E 0.01598 eV/atom | F 0.04252 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  115 | loss 1.7752e-03 | E 0.00545 eV/atom | F 0.04213 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  116 | loss 2.1917e-03 | E 0.00967 eV/atom | F 0.04681 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  117 | loss 1.8765e-03 | E 0.00547 eV/atom | F 0.04332 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  118 | loss 1.8049e-03 | E 0.00737 eV/atom | F 0.04248 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  119 | loss 1.7987e-03 | E 0.01389 eV/atom | F 0.04239 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.1s
+Epoch  120 | loss 1.8120e-03 | E 0.00887 eV/atom | F 0.04256 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  121 | loss 1.7945e-03 | E 0.01238 eV/atom | F 0.04234 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  122 | loss 1.7505e-03 | E 0.00687 eV/atom | F 0.04183 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  123 | loss 1.7366e-03 | E 0.00661 eV/atom | F 0.04167 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  124 | loss 1.7171e-03 | E 0.00582 eV/atom | F 0.04143 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  125 | loss 1.7398e-03 | E 0.00886 eV/atom | F 0.04170 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  126 | loss 1.7678e-03 | E 0.01357 eV/atom | F 0.04202 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  127 | loss 1.7005e-03 | E 0.01430 eV/atom | F 0.04121 eV/A | gnorm 0.0 | lr 1.00e-02 | 0.0s
+Epoch  128 | loss 1.7611e-03 | E 0.01406 eV/atom | F 0.04194 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  129 | loss 1.9080e-03 | E 0.01883 eV/atom | F 0.04364 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  130 | loss 2.1255e-03 | E 0.01647 eV/atom | F 0.04607 eV/A | gnorm 0.3 | lr 1.00e-02 | 0.0s
+Epoch  131 | loss 1.9420e-03 | E 0.01549 eV/atom | F 0.04404 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  132 | loss 1.8816e-03 | E 0.00646 eV/atom | F 0.04337 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  133 | loss 1.9699e-03 | E 0.01356 eV/atom | F 0.04436 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  134 | loss 1.8372e-03 | E 0.01183 eV/atom | F 0.04285 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  135 | loss 1.9206e-03 | E 0.01909 eV/atom | F 0.04378 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  136 | loss 2.0148e-03 | E 0.00724 eV/atom | F 0.04488 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  137 | loss 1.9039e-03 | E 0.01449 eV/atom | F 0.04361 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  138 | loss 1.7857e-03 | E 0.02106 eV/atom | F 0.04220 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  139 | loss 1.9725e-03 | E 0.02844 eV/atom | F 0.04432 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  140 | loss 1.8304e-03 | E 0.01577 eV/atom | F 0.04275 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  141 | loss 1.7280e-03 | E 0.01411 eV/atom | F 0.04155 eV/A | gnorm 0.1 | lr 1.00e-02 | 0.0s
+Epoch  142 | loss 2.1403e-03 | E 0.00977 eV/atom | F 0.04625 eV/A | gnorm 0.2 | lr 1.00e-02 | 0.0s
+Epoch  143 | loss 2.4632e-03 | E 0.02847 eV/atom | F 0.04955 eV/A | gnorm 0.3 | lr 7.00e-03 | 0.0s
+Epoch  144 | loss 2.2019e-03 | E 0.02016 eV/atom | F 0.04688 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  145 | loss 2.3782e-03 | E 0.03072 eV/atom | F 0.04867 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  146 | loss 3.0501e-03 | E 0.01816 eV/atom | F 0.05520 eV/A | gnorm 0.3 | lr 7.00e-03 | 0.0s
+Epoch  147 | loss 2.2183e-03 | E 0.06237 eV/atom | F 0.04668 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  148 | loss 2.0783e-03 | E 0.06046 eV/atom | F 0.04519 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  149 | loss 1.9349e-03 | E 0.02816 eV/atom | F 0.04390 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  150 | loss 2.0709e-03 | E 0.02067 eV/atom | F 0.04546 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.1s
+Epoch  151 | loss 2.1239e-03 | E 0.02023 eV/atom | F 0.04604 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  152 | loss 1.9393e-03 | E 0.00472 eV/atom | F 0.04404 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  153 | loss 1.8184e-03 | E 0.02473 eV/atom | F 0.04257 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  154 | loss 1.8828e-03 | E 0.02590 eV/atom | F 0.04331 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  155 | loss 1.8174e-03 | E 0.01672 eV/atom | F 0.04260 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  156 | loss 1.7516e-03 | E 0.01584 eV/atom | F 0.04182 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  157 | loss 1.7737e-03 | E 0.02317 eV/atom | F 0.04205 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  158 | loss 1.6826e-03 | E 0.01957 eV/atom | F 0.04097 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  159 | loss 1.6841e-03 | E 0.01744 eV/atom | F 0.04100 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  160 | loss 1.6611e-03 | E 0.00815 eV/atom | F 0.04075 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  161 | loss 1.6369e-03 | E 0.00100 eV/atom | F 0.04046 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.1s
+Epoch  162 | loss 1.6666e-03 | E 0.00792 eV/atom | F 0.04082 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  163 | loss 1.7234e-03 | E 0.00824 eV/atom | F 0.04151 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  164 | loss 1.6438e-03 | E 0.00488 eV/atom | F 0.04054 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  165 | loss 1.6327e-03 | E 0.00571 eV/atom | F 0.04040 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  166 | loss 1.6217e-03 | E 0.00993 eV/atom | F 0.04026 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.1s
+Epoch  167 | loss 1.6239e-03 | E 0.00278 eV/atom | F 0.04030 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  168 | loss 1.6240e-03 | E 0.00272 eV/atom | F 0.04030 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  169 | loss 1.6183e-03 | E 0.00596 eV/atom | F 0.04022 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  170 | loss 1.6246e-03 | E 0.00872 eV/atom | F 0.04030 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  171 | loss 1.6437e-03 | E 0.00545 eV/atom | F 0.04054 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  172 | loss 1.6031e-03 | E 0.00818 eV/atom | F 0.04003 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.1s
+Epoch  173 | loss 1.6076e-03 | E 0.00261 eV/atom | F 0.04009 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  174 | loss 1.6152e-03 | E 0.00456 eV/atom | F 0.04019 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  175 | loss 1.7079e-03 | E 0.00746 eV/atom | F 0.04132 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  176 | loss 1.7184e-03 | E 0.00654 eV/atom | F 0.04145 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  177 | loss 1.6960e-03 | E 0.01070 eV/atom | F 0.04117 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  178 | loss 1.6419e-03 | E 0.00528 eV/atom | F 0.04052 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  179 | loss 1.6280e-03 | E 0.00784 eV/atom | F 0.04034 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  180 | loss 1.6692e-03 | E 0.00907 eV/atom | F 0.04085 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  181 | loss 1.6575e-03 | E 0.01008 eV/atom | F 0.04070 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  182 | loss 1.6355e-03 | E 0.01585 eV/atom | F 0.04041 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  183 | loss 1.6219e-03 | E 0.00964 eV/atom | F 0.04026 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  184 | loss 1.6295e-03 | E 0.00293 eV/atom | F 0.04037 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  185 | loss 1.5896e-03 | E 0.00220 eV/atom | F 0.03987 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  186 | loss 1.5978e-03 | E 0.00720 eV/atom | F 0.03997 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  187 | loss 1.6318e-03 | E 0.00778 eV/atom | F 0.04039 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  188 | loss 1.6029e-03 | E 0.00273 eV/atom | F 0.04004 eV/A | gnorm 0.0 | lr 7.00e-03 | 0.0s
+Epoch  189 | loss 1.5963e-03 | E 0.01172 eV/atom | F 0.03994 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  190 | loss 1.6035e-03 | E 0.00618 eV/atom | F 0.04004 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  191 | loss 1.6498e-03 | E 0.00509 eV/atom | F 0.04061 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  192 | loss 1.7111e-03 | E 0.00573 eV/atom | F 0.04136 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  193 | loss 1.9680e-03 | E 0.01253 eV/atom | F 0.04434 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  194 | loss 1.9386e-03 | E 0.01161 eV/atom | F 0.04401 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  195 | loss 2.0205e-03 | E 0.00884 eV/atom | F 0.04494 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  196 | loss 2.0399e-03 | E 0.01251 eV/atom | F 0.04515 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  197 | loss 1.8218e-03 | E 0.01306 eV/atom | F 0.04266 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  198 | loss 1.8313e-03 | E 0.00766 eV/atom | F 0.04279 eV/A | gnorm 0.2 | lr 7.00e-03 | 0.0s
+Epoch  199 | loss 1.6601e-03 | E 0.00982 eV/atom | F 0.04073 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  200 | loss 1.6479e-03 | E 0.00386 eV/atom | F 0.04059 eV/A | gnorm 0.1 | lr 7.00e-03 | 0.0s
+Epoch  201 | loss 1.6243e-03 | E 0.00414 eV/atom | F 0.04030 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  202 | loss 1.6069e-03 | E 0.00590 eV/atom | F 0.04008 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  203 | loss 1.5945e-03 | E 0.00704 eV/atom | F 0.03993 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  204 | loss 1.5780e-03 | E 0.00653 eV/atom | F 0.03972 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  205 | loss 1.5699e-03 | E 0.00602 eV/atom | F 0.03962 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  206 | loss 1.5627e-03 | E 0.00291 eV/atom | F 0.03953 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  207 | loss 1.5599e-03 | E 0.00304 eV/atom | F 0.03949 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.1s
+Epoch  208 | loss 1.5669e-03 | E 0.00590 eV/atom | F 0.03958 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  209 | loss 1.5619e-03 | E 0.00375 eV/atom | F 0.03952 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  210 | loss 1.5643e-03 | E 0.00441 eV/atom | F 0.03955 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  211 | loss 1.5848e-03 | E 0.00692 eV/atom | F 0.03980 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  212 | loss 1.6282e-03 | E 0.00678 eV/atom | F 0.04035 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  213 | loss 1.6368e-03 | E 0.00721 eV/atom | F 0.04045 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  214 | loss 1.5853e-03 | E 0.00332 eV/atom | F 0.03981 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  215 | loss 1.5759e-03 | E 0.00597 eV/atom | F 0.03969 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.1s
+Epoch  216 | loss 1.5800e-03 | E 0.00660 eV/atom | F 0.03974 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  217 | loss 1.5629e-03 | E 0.00643 eV/atom | F 0.03953 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  218 | loss 1.5553e-03 | E 0.00661 eV/atom | F 0.03943 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  219 | loss 1.5547e-03 | E 0.00963 eV/atom | F 0.03942 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  220 | loss 1.5508e-03 | E 0.00542 eV/atom | F 0.03938 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  221 | loss 1.5461e-03 | E 0.00361 eV/atom | F 0.03932 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.1s
+Epoch  222 | loss 1.5460e-03 | E 0.00118 eV/atom | F 0.03932 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  223 | loss 1.5462e-03 | E 0.00303 eV/atom | F 0.03932 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.1s
+Epoch  224 | loss 1.5483e-03 | E 0.00130 eV/atom | F 0.03935 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  225 | loss 1.5427e-03 | E 0.00201 eV/atom | F 0.03928 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  226 | loss 1.5419e-03 | E 0.00326 eV/atom | F 0.03927 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  227 | loss 1.5410e-03 | E 0.00137 eV/atom | F 0.03926 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  228 | loss 1.5414e-03 | E 0.00524 eV/atom | F 0.03926 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  229 | loss 1.5554e-03 | E 0.00529 eV/atom | F 0.03944 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  230 | loss 1.5518e-03 | E 0.00860 eV/atom | F 0.03938 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  231 | loss 1.5395e-03 | E 0.00925 eV/atom | F 0.03923 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  232 | loss 1.5500e-03 | E 0.00276 eV/atom | F 0.03937 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  233 | loss 1.5436e-03 | E 0.00688 eV/atom | F 0.03928 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  234 | loss 1.5614e-03 | E 0.01023 eV/atom | F 0.03950 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  235 | loss 1.5551e-03 | E 0.00355 eV/atom | F 0.03943 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  236 | loss 1.5542e-03 | E 0.00193 eV/atom | F 0.03942 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  237 | loss 1.5332e-03 | E 0.00128 eV/atom | F 0.03916 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  238 | loss 1.5285e-03 | E 0.00138 eV/atom | F 0.03910 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  239 | loss 1.5290e-03 | E 0.00158 eV/atom | F 0.03910 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  240 | loss 1.5298e-03 | E 0.00237 eV/atom | F 0.03911 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  241 | loss 1.5382e-03 | E 0.00282 eV/atom | F 0.03922 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  242 | loss 1.5737e-03 | E 0.00297 eV/atom | F 0.03967 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  243 | loss 1.5769e-03 | E 0.00430 eV/atom | F 0.03971 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  244 | loss 1.5813e-03 | E 0.00864 eV/atom | F 0.03976 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  245 | loss 1.5897e-03 | E 0.00643 eV/atom | F 0.03987 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  246 | loss 1.5690e-03 | E 0.00415 eV/atom | F 0.03961 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  247 | loss 1.6109e-03 | E 0.00558 eV/atom | F 0.04013 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  248 | loss 1.5738e-03 | E 0.00682 eV/atom | F 0.03966 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  249 | loss 1.5816e-03 | E 0.00240 eV/atom | F 0.03977 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  250 | loss 1.5523e-03 | E 0.00636 eV/atom | F 0.03939 eV/A | gnorm 0.0 | lr 4.90e-03 | 0.0s
+Epoch  251 | loss 1.5510e-03 | E 0.00771 eV/atom | F 0.03938 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  252 | loss 1.5827e-03 | E 0.00772 eV/atom | F 0.03978 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  253 | loss 1.5441e-03 | E 0.00420 eV/atom | F 0.03929 eV/A | gnorm 0.1 | lr 4.90e-03 | 0.0s
+Epoch  254 | loss 1.6074e-03 | E 0.00269 eV/atom | F 0.04009 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  255 | loss 1.6616e-03 | E 0.00749 eV/atom | F 0.04076 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  256 | loss 1.5441e-03 | E 0.00547 eV/atom | F 0.03929 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  257 | loss 1.5257e-03 | E 0.00559 eV/atom | F 0.03906 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  258 | loss 1.5404e-03 | E 0.00452 eV/atom | F 0.03925 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  259 | loss 1.5747e-03 | E 0.00766 eV/atom | F 0.03968 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  260 | loss 1.5817e-03 | E 0.00280 eV/atom | F 0.03977 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  261 | loss 1.7370e-03 | E 0.00538 eV/atom | F 0.04167 eV/A | gnorm 0.2 | lr 3.43e-03 | 0.0s
+Epoch  262 | loss 1.6108e-03 | E 0.00556 eV/atom | F 0.04013 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  263 | loss 1.5541e-03 | E 0.00232 eV/atom | F 0.03942 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  264 | loss 1.5359e-03 | E 0.00155 eV/atom | F 0.03919 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  265 | loss 1.5140e-03 | E 0.00328 eV/atom | F 0.03891 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  266 | loss 1.5222e-03 | E 0.00271 eV/atom | F 0.03901 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  267 | loss 1.5273e-03 | E 0.00348 eV/atom | F 0.03908 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  268 | loss 1.5120e-03 | E 0.00113 eV/atom | F 0.03888 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  269 | loss 1.5133e-03 | E 0.00182 eV/atom | F 0.03890 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  270 | loss 1.5146e-03 | E 0.00164 eV/atom | F 0.03892 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  271 | loss 1.5200e-03 | E 0.00304 eV/atom | F 0.03899 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  272 | loss 1.5120e-03 | E 0.00170 eV/atom | F 0.03888 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  273 | loss 1.5093e-03 | E 0.00307 eV/atom | F 0.03885 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  274 | loss 1.5099e-03 | E 0.00230 eV/atom | F 0.03886 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  275 | loss 1.5185e-03 | E 0.00379 eV/atom | F 0.03897 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  276 | loss 1.5171e-03 | E 0.00180 eV/atom | F 0.03895 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  277 | loss 1.5310e-03 | E 0.00434 eV/atom | F 0.03913 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  278 | loss 1.5326e-03 | E 0.00253 eV/atom | F 0.03915 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  279 | loss 1.5094e-03 | E 0.00371 eV/atom | F 0.03885 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  280 | loss 1.5086e-03 | E 0.00337 eV/atom | F 0.03884 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  281 | loss 1.5068e-03 | E 0.00207 eV/atom | F 0.03882 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.1s
+Epoch  282 | loss 1.5217e-03 | E 0.00263 eV/atom | F 0.03901 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  283 | loss 1.5541e-03 | E 0.00330 eV/atom | F 0.03942 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  284 | loss 1.5360e-03 | E 0.00428 eV/atom | F 0.03919 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+Epoch  285 | loss 1.5179e-03 | E 0.00341 eV/atom | F 0.03896 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.1s
+Epoch  286 | loss 1.5094e-03 | E 0.00271 eV/atom | F 0.03885 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  287 | loss 1.5067e-03 | E 0.00520 eV/atom | F 0.03881 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  288 | loss 1.5041e-03 | E 0.00508 eV/atom | F 0.03878 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  289 | loss 1.5048e-03 | E 0.00411 eV/atom | F 0.03879 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  290 | loss 1.5256e-03 | E 0.00479 eV/atom | F 0.03906 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  291 | loss 1.5064e-03 | E 0.00258 eV/atom | F 0.03881 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  292 | loss 1.4966e-03 | E 0.00248 eV/atom | F 0.03868 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  293 | loss 1.4992e-03 | E 0.00380 eV/atom | F 0.03872 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  294 | loss 1.5054e-03 | E 0.00187 eV/atom | F 0.03880 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  295 | loss 1.5020e-03 | E 0.00334 eV/atom | F 0.03875 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  296 | loss 1.4961e-03 | E 0.00543 eV/atom | F 0.03868 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  297 | loss 1.4945e-03 | E 0.00471 eV/atom | F 0.03866 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  298 | loss 1.5085e-03 | E 0.00394 eV/atom | F 0.03884 eV/A | gnorm 0.0 | lr 3.43e-03 | 0.0s
+Epoch  299 | loss 1.5112e-03 | E 0.00273 eV/atom | F 0.03887 eV/A | gnorm 0.1 | lr 3.43e-03 | 0.0s
+
+========================================================================
+Saved end-of-stage-1 checkpoint: checkpoint_stage1.pt (redo stage 2 from it via resume_from)
+Stage 2 started at epoch 300: E_w=1.0, F_w=0.05, V_w=0.1, lr=1.00e-03
+========================================================================
+[S2] Epoch  300 | loss 8.6233e-05 | E 0.00342 eV/atom | F 0.03861 eV/A | gnorm 0.1 | lr 1.00e-03 | 0.1s
+[S2] Epoch  301 | loss 7.7892e-05 | E 0.00185 eV/atom | F 0.03859 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  302 | loss 7.6276e-05 | E 0.00129 eV/atom | F 0.03863 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  303 | loss 7.5331e-05 | E 0.00089 eV/atom | F 0.03861 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  304 | loss 7.8093e-05 | E 0.00190 eV/atom | F 0.03859 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  305 | loss 7.7329e-05 | E 0.00169 eV/atom | F 0.03859 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  306 | loss 7.8932e-05 | E 0.00213 eV/atom | F 0.03858 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  307 | loss 7.5611e-05 | E 0.00111 eV/atom | F 0.03857 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  308 | loss 7.5048e-05 | E 0.00084 eV/atom | F 0.03856 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.1s
+[S2] Epoch  309 | loss 7.5526e-05 | E 0.00110 eV/atom | F 0.03855 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  310 | loss 7.7863e-05 | E 0.00189 eV/atom | F 0.03855 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  311 | loss 7.6096e-05 | E 0.00135 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  312 | loss 7.5486e-05 | E 0.00110 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.1s
+[S2] Epoch  313 | loss 7.5121e-05 | E 0.00093 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  314 | loss 7.5488e-05 | E 0.00111 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  315 | loss 8.1430e-05 | E 0.00268 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  316 | loss 8.2590e-05 | E 0.00289 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  317 | loss 7.8128e-05 | E 0.00196 eV/atom | F 0.03855 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  318 | loss 7.6641e-05 | E 0.00152 eV/atom | F 0.03855 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  319 | loss 7.6142e-05 | E 0.00136 eV/atom | F 0.03855 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  320 | loss 7.5804e-05 | E 0.00125 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  321 | loss 7.5638e-05 | E 0.00118 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.1s
+[S2] Epoch  322 | loss 7.4909e-05 | E 0.00082 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  323 | loss 7.5930e-05 | E 0.00130 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  324 | loss 7.6321e-05 | E 0.00145 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  325 | loss 7.6089e-05 | E 0.00136 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  326 | loss 7.5643e-05 | E 0.00118 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  327 | loss 7.7825e-05 | E 0.00189 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  328 | loss 7.5370e-05 | E 0.00106 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  329 | loss 7.4922e-05 | E 0.00082 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  330 | loss 7.5994e-05 | E 0.00132 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  331 | loss 7.4983e-05 | E 0.00086 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  332 | loss 7.4597e-05 | E 0.00060 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  333 | loss 7.4899e-05 | E 0.00081 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  334 | loss 7.5394e-05 | E 0.00108 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  335 | loss 7.5858e-05 | E 0.00128 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  336 | loss 7.5710e-05 | E 0.00121 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  337 | loss 7.7243e-05 | E 0.00173 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  338 | loss 7.8167e-05 | E 0.00198 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  339 | loss 7.6495e-05 | E 0.00149 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  340 | loss 7.5584e-05 | E 0.00114 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  341 | loss 7.6646e-05 | E 0.00154 eV/atom | F 0.03854 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.1s
+[S2] Epoch  342 | loss 7.6036e-05 | E 0.00134 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  343 | loss 7.5231e-05 | E 0.00099 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  344 | loss 7.4871e-05 | E 0.00080 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  345 | loss 7.4992e-05 | E 0.00087 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  346 | loss 7.5519e-05 | E 0.00113 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  347 | loss 7.5566e-05 | E 0.00115 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.00e-03 | 0.0s
+[S2] Epoch  348 | loss 7.5431e-05 | E 0.00109 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  349 | loss 7.4960e-05 | E 0.00085 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  350 | loss 7.4573e-05 | E 0.00059 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  351 | loss 7.4513e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  352 | loss 7.4921e-05 | E 0.00083 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  353 | loss 7.5094e-05 | E 0.00093 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  354 | loss 7.4524e-05 | E 0.00055 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  355 | loss 7.5454e-05 | E 0.00111 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  356 | loss 7.5092e-05 | E 0.00093 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  357 | loss 7.5294e-05 | E 0.00103 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  358 | loss 7.5229e-05 | E 0.00100 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  359 | loss 7.4501e-05 | E 0.00052 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  360 | loss 7.5022e-05 | E 0.00089 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  361 | loss 7.5025e-05 | E 0.00089 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  362 | loss 7.4729e-05 | E 0.00070 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  363 | loss 7.4703e-05 | E 0.00069 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  364 | loss 7.4489e-05 | E 0.00050 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  365 | loss 7.5033e-05 | E 0.00089 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  366 | loss 7.5521e-05 | E 0.00114 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  367 | loss 7.5068e-05 | E 0.00091 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  368 | loss 7.6229e-05 | E 0.00142 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  369 | loss 7.5642e-05 | E 0.00119 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  370 | loss 7.5435e-05 | E 0.00110 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  371 | loss 7.5676e-05 | E 0.00121 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  372 | loss 7.5350e-05 | E 0.00106 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  373 | loss 7.6008e-05 | E 0.00133 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  374 | loss 7.6521e-05 | E 0.00151 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  375 | loss 7.5382e-05 | E 0.00107 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  376 | loss 7.4602e-05 | E 0.00060 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  377 | loss 7.4580e-05 | E 0.00059 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.1s
+[S2] Epoch  378 | loss 7.5087e-05 | E 0.00093 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  379 | loss 7.5250e-05 | E 0.00101 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 7.00e-04 | 0.0s
+[S2] Epoch  380 | loss 8.0099e-05 | E 0.00243 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  381 | loss 7.6904e-05 | E 0.00163 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  382 | loss 7.5325e-05 | E 0.00105 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  383 | loss 7.4687e-05 | E 0.00068 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.1s
+[S2] Epoch  384 | loss 7.5080e-05 | E 0.00092 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  385 | loss 7.4680e-05 | E 0.00068 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  386 | loss 7.4567e-05 | E 0.00058 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  387 | loss 7.4473e-05 | E 0.00050 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  388 | loss 7.4456e-05 | E 0.00048 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  389 | loss 7.4821e-05 | E 0.00077 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.1s
+[S2] Epoch  390 | loss 7.4762e-05 | E 0.00074 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.1s
+[S2] Epoch  391 | loss 7.4463e-05 | E 0.00049 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  392 | loss 7.4701e-05 | E 0.00069 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  393 | loss 7.4567e-05 | E 0.00059 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  394 | loss 7.4614e-05 | E 0.00063 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  395 | loss 7.4511e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  396 | loss 7.4985e-05 | E 0.00087 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  397 | loss 7.4552e-05 | E 0.00056 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  398 | loss 7.4456e-05 | E 0.00047 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  399 | loss 7.4532e-05 | E 0.00055 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  400 | loss 7.4463e-05 | E 0.00049 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  401 | loss 7.4572e-05 | E 0.00059 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  402 | loss 7.5214e-05 | E 0.00100 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  403 | loss 7.4936e-05 | E 0.00084 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 4.90e-04 | 0.0s
+[S2] Epoch  404 | loss 7.4623e-05 | E 0.00063 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  405 | loss 7.4417e-05 | E 0.00044 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  406 | loss 7.4545e-05 | E 0.00057 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.1s
+[S2] Epoch  407 | loss 7.4446e-05 | E 0.00048 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.1s
+[S2] Epoch  408 | loss 7.4397e-05 | E 0.00042 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  409 | loss 7.4472e-05 | E 0.00050 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  410 | loss 7.4485e-05 | E 0.00052 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  411 | loss 7.4459e-05 | E 0.00049 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  412 | loss 7.4615e-05 | E 0.00063 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  413 | loss 7.4385e-05 | E 0.00042 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  414 | loss 7.5392e-05 | E 0.00109 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  415 | loss 7.5024e-05 | E 0.00090 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  416 | loss 7.4522e-05 | E 0.00055 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.1s
+[S2] Epoch  417 | loss 7.4725e-05 | E 0.00071 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  418 | loss 7.4694e-05 | E 0.00069 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.1s
+[S2] Epoch  419 | loss 7.4918e-05 | E 0.00084 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  420 | loss 7.4531e-05 | E 0.00056 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  421 | loss 7.4516e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  422 | loss 7.4484e-05 | E 0.00051 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  423 | loss 7.4628e-05 | E 0.00064 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  424 | loss 7.4552e-05 | E 0.00058 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  425 | loss 7.4424e-05 | E 0.00045 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  426 | loss 7.4492e-05 | E 0.00052 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  427 | loss 7.4520e-05 | E 0.00055 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  428 | loss 7.4726e-05 | E 0.00071 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 3.43e-04 | 0.0s
+[S2] Epoch  429 | loss 7.4559e-05 | E 0.00058 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  430 | loss 7.4603e-05 | E 0.00062 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  431 | loss 7.4592e-05 | E 0.00061 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  432 | loss 7.4620e-05 | E 0.00063 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  433 | loss 7.4686e-05 | E 0.00068 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  434 | loss 7.4858e-05 | E 0.00080 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  435 | loss 7.4529e-05 | E 0.00056 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  436 | loss 7.4512e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  437 | loss 7.4390e-05 | E 0.00042 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  438 | loss 7.4504e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  439 | loss 7.4998e-05 | E 0.00088 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  440 | loss 7.4568e-05 | E 0.00059 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  441 | loss 7.4529e-05 | E 0.00056 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  442 | loss 7.4464e-05 | E 0.00050 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  443 | loss 7.4390e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  444 | loss 7.4495e-05 | E 0.00054 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.40e-04 | 0.0s
+[S2] Epoch  445 | loss 7.4413e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  446 | loss 7.4403e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  447 | loss 7.4397e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  448 | loss 7.4392e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  449 | loss 7.4448e-05 | E 0.00049 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  450 | loss 7.4495e-05 | E 0.00053 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  451 | loss 7.4455e-05 | E 0.00050 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  452 | loss 7.4412e-05 | E 0.00045 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  453 | loss 7.4426e-05 | E 0.00046 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  454 | loss 7.4479e-05 | E 0.00052 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  455 | loss 7.4411e-05 | E 0.00045 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  456 | loss 7.4550e-05 | E 0.00058 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  457 | loss 7.4504e-05 | E 0.00054 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  458 | loss 7.5050e-05 | E 0.00092 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  459 | loss 7.5147e-05 | E 0.00097 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  460 | loss 7.4591e-05 | E 0.00062 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.68e-04 | 0.0s
+[S2] Epoch  461 | loss 7.4807e-05 | E 0.00077 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  462 | loss 7.4593e-05 | E 0.00062 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  463 | loss 7.4455e-05 | E 0.00050 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  464 | loss 7.4398e-05 | E 0.00044 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  465 | loss 7.4484e-05 | E 0.00053 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  466 | loss 7.4442e-05 | E 0.00048 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  467 | loss 7.4430e-05 | E 0.00047 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  468 | loss 7.4445e-05 | E 0.00049 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  469 | loss 7.4422e-05 | E 0.00046 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  470 | loss 7.4449e-05 | E 0.00049 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  471 | loss 7.4409e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  472 | loss 7.4410e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  473 | loss 7.4421e-05 | E 0.00046 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  474 | loss 7.4425e-05 | E 0.00046 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  475 | loss 7.4397e-05 | E 0.00043 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  476 | loss 7.4436e-05 | E 0.00048 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.18e-04 | 0.0s
+[S2] Epoch  477 | loss 7.4431e-05 | E 0.00047 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  478 | loss 7.4435e-05 | E 0.00048 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  479 | loss 7.4409e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  480 | loss 7.4394e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  481 | loss 7.4408e-05 | E 0.00045 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  482 | loss 7.4420e-05 | E 0.00046 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  483 | loss 7.4403e-05 | E 0.00044 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  484 | loss 7.4413e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  485 | loss 7.4421e-05 | E 0.00046 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  486 | loss 7.4428e-05 | E 0.00047 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  487 | loss 7.4425e-05 | E 0.00047 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  488 | loss 7.4388e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  489 | loss 7.4414e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  490 | loss 7.4386e-05 | E 0.00042 eV/atom | F 0.03853 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  491 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  492 | loss 7.4390e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 8.24e-05 | 0.0s
+[S2] Epoch  493 | loss 7.4410e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  494 | loss 7.4475e-05 | E 0.00052 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  495 | loss 7.4512e-05 | E 0.00055 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  496 | loss 7.4391e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  497 | loss 7.4393e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  498 | loss 7.4404e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  499 | loss 7.4388e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  500 | loss 7.4398e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.1s
+[S2] Epoch  501 | loss 7.4403e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  502 | loss 7.4401e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  503 | loss 7.4387e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  504 | loss 7.4386e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  505 | loss 7.4395e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  506 | loss 7.4384e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  507 | loss 7.4464e-05 | E 0.00051 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  508 | loss 7.4444e-05 | E 0.00049 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 5.76e-05 | 0.0s
+[S2] Epoch  509 | loss 7.4447e-05 | E 0.00049 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  510 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  511 | loss 7.4404e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  512 | loss 7.4385e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  513 | loss 7.4419e-05 | E 0.00046 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.1s
+[S2] Epoch  514 | loss 7.4391e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  515 | loss 7.4408e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  516 | loss 7.4392e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  517 | loss 7.4390e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  518 | loss 7.4388e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  519 | loss 7.4408e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  520 | loss 7.4411e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.1s
+[S2] Epoch  521 | loss 7.4375e-05 | E 0.00041 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  522 | loss 7.4461e-05 | E 0.00051 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  523 | loss 7.4379e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  524 | loss 7.4396e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  525 | loss 7.4408e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  526 | loss 7.4379e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  527 | loss 7.4405e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  528 | loss 7.4388e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  529 | loss 7.4387e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  530 | loss 7.4392e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  531 | loss 7.4401e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  532 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  533 | loss 7.4409e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  534 | loss 7.4398e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  535 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  536 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 4.04e-05 | 0.0s
+[S2] Epoch  537 | loss 7.4392e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  538 | loss 7.4398e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  539 | loss 7.4390e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  540 | loss 7.4419e-05 | E 0.00046 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  541 | loss 7.4399e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  542 | loss 7.4385e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  543 | loss 7.4384e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  544 | loss 7.4380e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  545 | loss 7.4399e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  546 | loss 7.4390e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  547 | loss 7.4404e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  548 | loss 7.4385e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  549 | loss 7.4388e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  550 | loss 7.4393e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  551 | loss 7.4391e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  552 | loss 7.4385e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 2.82e-05 | 0.0s
+[S2] Epoch  553 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  554 | loss 7.4391e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  555 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  556 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  557 | loss 7.4393e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  558 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  559 | loss 7.4384e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  560 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  561 | loss 7.4389e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.1s
+[S2] Epoch  562 | loss 7.4392e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.1s
+[S2] Epoch  563 | loss 7.4381e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.1s
+[S2] Epoch  564 | loss 7.4384e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  565 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  566 | loss 7.4387e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  567 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  568 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.98e-05 | 0.0s
+[S2] Epoch  569 | loss 7.4393e-05 | E 0.00044 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  570 | loss 7.4411e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  571 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  572 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  573 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  574 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  575 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  576 | loss 7.4387e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  577 | loss 7.4383e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  578 | loss 7.4389e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  579 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  580 | loss 7.4378e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  581 | loss 7.4384e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  582 | loss 7.4381e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  583 | loss 7.4380e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  584 | loss 7.4385e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 1.38e-05 | 0.0s
+[S2] Epoch  585 | loss 7.4385e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.1s
+[S2] Epoch  586 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  587 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  588 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  589 | loss 7.4374e-05 | E 0.00041 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  590 | loss 7.4404e-05 | E 0.00045 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  591 | loss 7.4415e-05 | E 0.00046 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  592 | loss 7.4385e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  593 | loss 7.4377e-05 | E 0.00041 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  594 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  595 | loss 7.4386e-05 | E 0.00043 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  596 | loss 7.4378e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  597 | loss 7.4381e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  598 | loss 7.4381e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  599 | loss 7.4381e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+[S2] Epoch  600 | loss 7.4382e-05 | E 0.00042 eV/atom | F 0.03852 eV/A | gnorm 0.0 | lr 9.69e-06 | 0.0s
+
+Done. Best loss: 7.437383e-05
+Training time: 00:00:48.5
+
+Running prediction on training set (final-epoch model)...
+  Prediction time: 0.1s
+
+Total time (data + train + predict): 00:00:54.6
+Output: output/

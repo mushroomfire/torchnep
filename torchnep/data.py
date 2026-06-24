@@ -372,7 +372,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("neuron", 30)
 
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
-    params.setdefault("num_epochs", 300)
+    params.setdefault("num_epochs", 600)
     params.setdefault("batch_size", 32)
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
@@ -393,7 +393,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)
     params.setdefault("stage2_pref_v", 0.1)
-    # start_stage2 defaults to 0.75 * num_epochs if not set — handled in trainer
+    # start_stage2 defaults to 0.5 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and
     # safely ignore it). Leading underscore so it can't collide with nep.in

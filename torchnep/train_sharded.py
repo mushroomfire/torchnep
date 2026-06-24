@@ -548,7 +548,7 @@ def train_nep_sharded(
                                  weight_decay=lambda_2, amsgrad=True)
 
     if stage2 and start_stage2 is None:
-        start_stage2 = max(1, int(num_epochs * 0.75))
+        start_stage2 = max(1, int(num_epochs * 0.5))
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -662,8 +662,6 @@ def train_nep_sharded(
         raw_model.save_nep_txt(
             os.path.join(output_dir, "nep_best.txt"),
             max_NN_rad, max_NN_ang)
-        torch.save(raw_model.state_dict(),
-                   os.path.join(output_dir, "nep_best.pt"))
 
     train_t0 = time.time()
 
@@ -981,9 +979,8 @@ def train_nep_sharded(
             raw_model.load_state_dict(swa_state)
             raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                    max_NN_rad, max_NN_ang)
-            torch.save(swa_state, os.path.join(output_dir, "nep_average.pt"))
             raw_model.load_state_dict(final_state)
-            _log("SWA model saved to nep_average.txt / nep_average.pt")
+            _log("SWA model saved to nep_average.txt")
 
         train_time = time.time() - train_t0
         h, rem = divmod(train_time, 3600)

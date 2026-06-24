@@ -188,7 +188,7 @@ def format_config_summary(config: dict) -> List[str]:
         lines.append("Training schedule (Stage 2)")
         lines.append("---------------------------")
         ss = config.get("start_stage2")
-        ss_str = f"{ss}" if ss is not None else f"auto (0.75 * {config['num_epochs']})"
+        ss_str = f"{ss}" if ss is not None else f"auto (0.5 * {config['num_epochs']})"
         lines.append(f"  {tag('start_stage2'):10}  start_stage2 {ss_str}")
         lines.append(f"  {tag('stage2_lr'):10}  stage2_lr    {config['stage2_lr']}")
         # The stage 2 scheduler can override stage 1's patience / factor.
@@ -982,7 +982,7 @@ def train_nep(
     use_autograd_forces : True -> autograd-through-rij forces (slower, gold
         standard); False (default) -> analytical chain rule.
     use_swa : True -> maintain an averaged model during stage 2 and save it
-        as ``nep_average.txt`` / ``nep_average.pt`` at the end.
+        as ``nep_average.txt`` at the end.
     use_compile : torch.compile the analytical compute method (~1.3x faster per
         epoch after a one-time first-epoch compilation cost; needs Triton, which
         ships with the CUDA PyTorch build). Ignored on the autograd force path
@@ -1072,7 +1072,7 @@ def train_nep(
     pref_v             = config["lambda_v"]
     # Optional stage-2 block
     stage2             = config["stage2"]
-    start_stage2       = config.get("start_stage2")  # may be None -> auto 0.75*num_epochs
+    start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
     stage2_lr          = config["stage2_lr"]
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
@@ -1251,7 +1251,7 @@ def train_nep(
                                  weight_decay=lambda_2, amsgrad=True)
 
     if stage2 and start_stage2 is None:
-        start_stage2 = max(1, int(num_epochs * 0.75))
+        start_stage2 = max(1, int(num_epochs * 0.5))
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -1355,8 +1355,6 @@ def train_nep(
         raw_model.save_nep_txt(
             os.path.join(output_dir, "nep_best.txt"),
             max_NN_rad, max_NN_ang)
-        torch.save(raw_model.state_dict(),
-                   os.path.join(output_dir, "nep_best.pt"))
 
     train_t0 = time.time()
 
@@ -1644,9 +1642,8 @@ def train_nep(
         raw_model.load_state_dict(swa_state)
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                max_NN_rad, max_NN_ang)
-        torch.save(swa_state, os.path.join(output_dir, "nep_average.pt"))
         raw_model.load_state_dict(final_state)
-        _log("SWA model saved to nep_average.txt / nep_average.pt")
+        _log("SWA model saved to nep_average.txt")
 
     train_time = time.time() - train_t0
     h, rem = divmod(train_time, 3600)

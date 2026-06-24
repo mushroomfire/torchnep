@@ -2,7 +2,6 @@
 /*/__py*/
 /*info
 /example/*ipynb*
-/example/*/output
 # Only example/PbTe is shipped in the repo; CrCoNi / Carbon / SiO2 are
 # kept locally on the maintainer's machine for ablation but are too big
 # to publish.

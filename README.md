@@ -8,7 +8,7 @@ A PyTorch implementation of [NEP4](https://gpumd.org/theory/nep.html) (Neuroevol
 - **Two-stage training** — Stage 1: force-focused; Stage 2: energy fine-tuning
 - **Two LR scheduler modes** — `plateau` (ReduceLROnPlateau — default, drops LR after N epochs with no improvement) or `step` (StepLR — drops LR every N epochs at a fixed rate). Stage 1 and Stage 2 share the mode
 - **Multi-GPU training** — data-sharded DDP via `train_nep_sharded` + `torchrun`
-- **Fine-tuning** — load any `nep.txt` or `nep_best.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
+- **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` as starting weights; optionally slim the model to only the element types present in the new dataset
 - **Restart** — full training state (weights + optimizer + scheduler + epoch) saved to `checkpoint.pt`
 - **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
 
@@ -204,7 +204,7 @@ all-reduce hangs.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `epoch` | `300` | Total training epochs |
+| `epoch` | `600` | Total training epochs |
 | `batch` | `32` | Structures per gradient step |
 | `lr` | `0.01` | Initial learning rate |
 | `stop_lr` | `1e-6` | Minimum learning rate (scheduler floor) |
@@ -223,7 +223,7 @@ all-reduce hangs.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
-| `start_stage2` | 75 % of epochs | Epoch to switch to Stage 2 |
+| `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
 | `stage2_lr` | `1e-3` | Stage 2 learning rate |
 | `stage2_scheduler_patience` | `scheduler_patience` | Stage 2 scheduler patience (overrides Stage 1's; same semantics — for `step` it is the epoch interval, for `plateau` it is the epochs-without-improvement window) |
 | `stage2_scheduler_factor` | `scheduler_factor` | Stage 2 LR decay factor (overrides Stage 1's). Lets the two stages span different LR ranges — e.g. stage 1 `1e-2 → 1e-3` (factor `0.794`, 10 decays over 200 epochs) and stage 2 `1e-3 → 1e-5` (factor `0.631`). When unset, Stage 2 reuses the Stage 1 values. |
@@ -252,7 +252,7 @@ launch time:
 | `precision` | `"float32"` | dtype for training + store |
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` (picks by num_types) |
 | `use_autograd_forces` | `False` | autograd-through-rij (gold standard) vs analytical |
-| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.*` |
+| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
 | `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
 | `print_interval` | `10` | log to screen every N epochs (all epochs land in `output.log`) |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
@@ -289,9 +289,9 @@ back to eager:
 
 | File | Contents |
 |------|----------|
-| `nep_best.txt` / `nep_best.pt` | **Best** model. Early in the run, saved whenever the epoch's `avg_loss` makes a new minimum; in the **last third** of the run a new minimum only nominates the weights — they are saved only if a frozen-weight evaluation over the full dataset beats the best true loss so far. The final epoch is always evaluated, so `nep_best` is never worse than `nep_final`. |
+| `nep_best.txt` | **Best** model. Early in the run, saved whenever the epoch's `avg_loss` makes a new minimum; in the **last third** of the run a new minimum only nominates the weights — they are saved only if a frozen-weight evaluation over the full dataset beats the best true loss so far. The final epoch is always evaluated, so `nep_best` is never worse than `nep_final`. |
 | `nep_final.txt`    | Model at the **last** epoch (used for the end-of-training predict) |
-| `nep_average.txt` / `nep_average.pt` | **SWA-averaged** model — only when `use_swa=True` |
+| `nep_average.txt` | **SWA-averaged** model — only when `use_swa=True` |
 | `checkpoint.pt`    | Full training state: weights + optimizer + active scheduler + stage tag + SWA state + epoch + best losses + loss weights |
 | `checkpoint_stage1.pt` | Full end-of-Stage-1 checkpoint (only when `stage2=1`) — written the instant Stage 2 kicks in. Redo Stage 2 with edited `stage2_*` settings via `resume_from=".../checkpoint_stage1.pt"` |
 | `output.log`       | Full console log |
@@ -374,14 +374,13 @@ train_nep(
     "nep.in",
     "new_data.xyz",
     output_dir="finetune_output",
-    finetune_from="pretrained/nep.txt",   # or "pretrained/nep_best.pt"
+    finetune_from="pretrained/nep.txt",   # or a "pretrained/checkpoint.pt"
     slim_types=True,
 )
 ```
 
 `finetune_from` accepts:
 - `nep.txt` — GPUMD text format (works with models trained by GPUMD or torchnep)
-- `nep_best.pt` — PyTorch state dict
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
 If the new dataset contains fewer element types than the original model, setting `slim_types=True` removes the unused types **before training begins**.  This reduces the model size and makes training faster,
