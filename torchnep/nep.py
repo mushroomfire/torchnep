@@ -1,6 +1,15 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026, Yongchao Wu.
-# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+# Copyright 2025 Yongchao Wu and the GPUMD development team
+# This file is part of GPUMD (Torchnep project).
+# GPUMD is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# GPUMD is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 NEP4 calculator for PyTorch.
@@ -285,7 +294,6 @@ class NEPCalculator:
         pi_rad, pj_rad = pair_i[rad_mask], pair_j[rad_mask]
         pi_ang, pj_ang = pair_i[ang_mask], pair_j[ang_mask]
 
-        # Descriptors
         q = ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c2, self.c3,
@@ -304,7 +312,6 @@ class NEPCalculator:
         descriptor = (q * self.q_scaler).detach() if compute_descriptor else None
         q_scaled = q * self.q_scaler
 
-        # NN (NEP) per-atom energy
         Ei_nep = ops.apply_ann(q_scaled, atom_types, self.num_types,
                                self.w0, self.b0, self.w1, self.b1,
                                self.dtype, self.device)
@@ -382,7 +389,7 @@ class NEPCalculator:
         dtype, device = self.dtype, self.device
         N = batch["N"]
 
-        # Descriptors from pre-cached basis
+        # Descriptors from pre-cached basis tensors
         q, s, gn_ang = ops.compute_descriptors_cached(
             batch["fk_rad"], batch["fk_ang"], batch["blm"],
             batch["pair_i_rad"], batch["pair_j_rad"],
@@ -403,7 +410,7 @@ class NEPCalculator:
 
         q_scaled = q * self.q_scaler
 
-        # NN forward: compute Ei and Fp = dEi/dq_scaled
+        # NN forward: Ei and Fp = dEi/dq_scaled
         Ei = torch.zeros(N, dtype=dtype, device=device)
         Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
         for t in range(self.num_types):

@@ -1,6 +1,15 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026, Yongchao Wu.
-# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+# Copyright 2025 Yongchao Wu and the GPUMD development team
+# This file is part of GPUMD (Torchnep project).
+# GPUMD is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# GPUMD is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Data loading utilities for NEP training and prediction.
@@ -248,7 +257,6 @@ def parse_nep_in(filename: str) -> Dict:
 
     with open(filename) as f:
         for line in f:
-            # Remove comments
             line = line.split("#")[0].strip()
             if not line:
                 continue
@@ -372,20 +380,19 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("scheduler_factor", 0.7)
     params.setdefault("lr_scheduler", "plateau")
     params.setdefault("max_grad_norm", 10.0)
-    params.setdefault("lambda_e", 1.0)
-    params.setdefault("lambda_f", 100.0)
-    params.setdefault("lambda_v", 1.0)
+    params.setdefault("lambda_e", 0.01)
+    params.setdefault("lambda_f", 1.0)
+    params.setdefault("lambda_v", 0.01)
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
     # Defaults for optional stage-2 parameters (only used if stage2=1).
-    # Stage 2 flips the energy/force emphasis: stage 1 is force-dominated
-    # (1/100/1) to fit geometry/forces first, stage 2 is energy-dominated
-    # (100/1/1) to refine energies at the lower stage-2 learning rate.
+    # Stage 2 raises the energy emphasis at the lower stage-2 learning rate to
+    # refine energies after the force-dominated stage 1.
     params.setdefault("stage2_lr", 1e-3)
-    params.setdefault("stage2_pref_e", 100.0)
-    params.setdefault("stage2_pref_f", 1.0)
-    params.setdefault("stage2_pref_v", 1.0)
+    params.setdefault("stage2_pref_e", 1.0)
+    params.setdefault("stage2_pref_f", 0.05)
+    params.setdefault("stage2_pref_v", 0.1)
     # start_stage2 defaults to 0.75 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and

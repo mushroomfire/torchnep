@@ -1,6 +1,15 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026, Yongchao Wu.
-# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+# Copyright 2025 Yongchao Wu and the GPUMD development team
+# This file is part of GPUMD (Torchnep project).
+# GPUMD is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# GPUMD is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Data-sharded distributed NEP training.
@@ -163,7 +172,6 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
 
-    # Aggregate across all ranks
     dist.all_reduce(q_min, op=dist.ReduceOp.MIN)
     dist.all_reduce(q_max, op=dist.ReduceOp.MAX)
 
@@ -843,7 +851,6 @@ def train_nep_sharded(
                 sum_v_structs += batch["virial_mask"].sum().item()
                 max_gn = max(max_gn, gn)
 
-            # Aggregate metrics across all ranks
             metrics = torch.tensor(
                 [sum_le, sum_lf, sum_lv, sum_ls,
                  float(sum_e_structs), float(sum_f_atoms),

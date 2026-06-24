@@ -195,7 +195,7 @@ all-reduce hangs.
 | `cutoff` | `8.0 4.0` | Radial and angular cutoff (Å) |
 | `n_max` | `6 6` | Radial and angular expansion orders |
 | `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular). Max 16 |
-| `l_max` | `4 1 0 0 0` | `L_3b q_222 q_1111 q_112 q_123 q_233 q_134` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD) enabling each higher-body invariant. `q_123`/`q_233` (4-body bispectrum, fields 5–6) need `L_3b ≥ 3`; `q_134` (field 7) needs `L_3b ≥ 4`. `q_1111` is redundant (= const × 3-body L=1 squared) — kept for compatibility but warns if set. Legacy 3-field form `L l_max_4b l_max_5b` still accepted |
+| `l_max` | `4 1 0` | `L_3b q_222 q_1111 q_112 q_123 q_233 q_134` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD) enabling each higher-body invariant. `q_123`/`q_233` (4-body bispectrum, fields 5–6) need `L_3b ≥ 3`; `q_134` (field 7) needs `L_3b ≥ 4`. `q_1111` is redundant (= const × 3-body L=1 squared) — kept for compatibility but warns if set. Legacy 3-field form `L l_max_4b l_max_5b` still accepted |
 | `neuron` | `30` | Hidden layer width |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
@@ -208,9 +208,9 @@ all-reduce hangs.
 | `batch` | `32` | Structures per gradient step |
 | `lr` | `0.01` | Initial learning rate |
 | `stop_lr` | `1e-6` | Minimum learning rate (scheduler floor) |
-| `lambda_e` | `1.0` | Energy loss weight |
-| `lambda_f` | `100.0` | Force loss weight |
-| `lambda_v` | `1.0` | Virial loss weight |
+| `lambda_e` | `0.01` | Energy loss weight |
+| `lambda_f` | `1.0` | Force loss weight |
+| `lambda_v` | `0.01` | Virial loss weight |
 | `lambda_1` | `0.0` | L1 regularisation |
 | `lambda_2` | `0.0` | L2 regularisation (weight decay) |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
@@ -228,8 +228,8 @@ all-reduce hangs.
 | `stage2_scheduler_patience` | `scheduler_patience` | Stage 2 scheduler patience (overrides Stage 1's; same semantics — for `step` it is the epoch interval, for `plateau` it is the epochs-without-improvement window) |
 | `stage2_scheduler_factor` | `scheduler_factor` | Stage 2 LR decay factor (overrides Stage 1's). Lets the two stages span different LR ranges — e.g. stage 1 `1e-2 → 1e-3` (factor `0.794`, 10 decays over 200 epochs) and stage 2 `1e-3 → 1e-5` (factor `0.631`). When unset, Stage 2 reuses the Stage 1 values. |
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
-| `stage2_lambda_f` | `100.0` | Stage 2 force weight |
-| `stage2_lambda_v` | `1.0` | Stage 2 virial weight |
+| `stage2_lambda_f` | `0.05` | Stage 2 force weight |
+| `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
 
 SWA (Stochastic Weight Averaging) is opt-in via the **function argument** `use_swa=True` (not a `nep.in` key, since it is an optional feature).
 

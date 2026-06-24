@@ -1,6 +1,15 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026, Yongchao Wu.
-# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+# Copyright 2025 Yongchao Wu and the GPUMD development team
+# This file is part of GPUMD (Torchnep project).
+# GPUMD is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# GPUMD is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Full-dataset prediction for NEP models.
@@ -278,10 +287,9 @@ def predict_dataset(
     has_virial_global = any(s.get("virial") is not None for s in structures)
     virial_ref = np.full((n_struct, 6), np.nan, dtype=np.float64)
     if has_virial_global:
-        # Per-atom virial, to match GPUMD's *_train.out columns.
-        # Symmetrize off-diagonal pairs (xy with yx, yz with zy, xz with zx)
-        # the same way we symmetrize the prediction, so the two columns are
-        # computed on the exact same definition.
+        # Per-atom virial, to match GPUMD's *_train.out columns. Off-diagonal
+        # pairs are picked the same way as the prediction, so the two columns
+        # are computed on the exact same definition.
         for i, s in enumerate(structures):
             v = s.get("virial")
             if v is None:

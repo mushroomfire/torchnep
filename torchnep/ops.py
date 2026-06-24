@@ -1,6 +1,15 @@
-# SPDX-License-Identifier: BSD-3-Clause
-# Copyright (c) 2026, Yongchao Wu.
-# Part of the torchnep project — https://github.com/mushroomfire/torchnep.
+# Copyright 2025 Yongchao Wu and the GPUMD development team
+# This file is part of GPUMD (Torchnep project).
+# GPUMD is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# GPUMD is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Core NEP operations — pure PyTorch on CPU / CUDA / MPS.
@@ -143,12 +152,8 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
 
     # Sliding window: T_prev2 = T_{k-2}, T_prev1 = T_{k-1},
     #                 U_prev2 = U_{k-2}, U_prev1 = U_{k-1}
-    T_prev2 = None  # T_0 = 1 (not needed as tensor; reuse ones trick below)
-    T_prev1 = x     # T_1
-    U_prev2 = None  # U_0 = 1
+    T_prev1 = x         # T_1
     U_prev1 = 2.0 * x   # U_1
-
-    # We need tensors for T_prev2 / U_prev2. Use explicit ones_like just once.
     T_prev2 = torch.ones_like(dij)   # T_0
     U_prev2 = torch.ones_like(dij)   # U_0
 
@@ -689,7 +694,6 @@ def compute_descriptors_cached(
     """
     _scatter_fn, _type_fn = _select_contraction_funcs(backend)
 
-    # Radial descriptor: type-lookup + contraction + scatter
     q_rad = _scatter_fn(fk_rad, pi_rad, pj_rad, atom_types, c2, N)
 
     parts = [q_rad]
