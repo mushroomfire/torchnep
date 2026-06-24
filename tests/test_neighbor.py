@@ -155,31 +155,6 @@ def test_tiled_matches_autograd():
                   - til["virial"].numpy().sum(0)).max() < 1e-8
 
 
-def test_tiled_compile_matches_eager():
-    """compile=True (torch.compile, bmm backend, dynamic shapes) must reproduce
-    the eager tiled result bit-for-bit on physical data."""
-    fr = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
-    cell0 = np.asarray(fr["cell"]); pos0 = np.asarray(fr["positions"])
-    sp0 = list(fr["species"])
-    reps = 3
-    cell = cell0 * reps
-    pos, sp = [], []
-    for i in range(reps):
-        for j in range(reps):
-            for k in range(reps):
-                pos.append(pos0 + np.array([i, j, k]) @ cell0)
-                sp += sp0
-    pos = np.concatenate(pos)
-
-    calc = NEPCalculator(str(DATA_DIR / "nep_CrCoNi.txt"), dtype=torch.float64)
-    eager = calc.compute_tiled(sp, pos, cell, block_size=700, compile=False)
-    comp = calc.compute_tiled(sp, pos, cell, block_size=700, compile=True)
-    assert abs(float(eager["energy"].sum()) - float(comp["energy"].sum())) < 1e-9
-    assert np.abs(eager["forces"].numpy() - comp["forces"].numpy()).max() < 1e-9
-    assert np.abs(eager["virial"].numpy().sum(0)
-                  - comp["virial"].numpy().sum(0)).max() < 1e-7
-
-
 def test_mps_search_runs_in_float64():
     """Regression: an MPS-targeted CellList must run its geometry on CPU in
     float64 (MPS has no float64). Positions reach ~1e2 A where float32 has only

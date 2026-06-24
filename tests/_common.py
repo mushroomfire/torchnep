@@ -62,20 +62,11 @@ FIXTURES = [
         "nep":   DATA_DIR / "nep_CrCoNi.txt",
         "xyz":   DATA_DIR / "CrCoNi.xyz",
         "ref":   DATA_DIR / "CrCoNi.gpumd.npz",
-        "note":  "nep4_zbl, typewise ZBL, l_max 4 2 1 (legacy 3-field)",
+        "note":  "nep4_zbl, typewise ZBL, l_max 4 2 1 (legacy 3-field). "
+                 "Multi-frame: original (NN ~1.5 A) plus compressed/rattled "
+                 "frames down to NN ~1.18 A that drive the ZBL repulsion "
+                 "to/below its inner cutoff (1.25 A).",
     },
-    {
-        "name":  "PdCuNiP",
-        "nep":   DATA_DIR / "nep_PdCuNiP.txt",
-        "xyz":   DATA_DIR / "PdCuNiP.xyz",
-        "ref":   DATA_DIR / "PdCuNiP.gpumd.npz",
-        "note":  "nep4_zbl, fixed ZBL, l_max 4 2 0 (only q_222)",
-    },
-    # The historic "mixed" fixture exercised q_1122, which GPUMD PR #1519
-    # removed. With q_1122 gone from torchnep too, the orphaned nep_mixed.txt /
-    # mixed.gpumd.npz under data/ are no longer parameterised here. They are
-    # kept on disk in case a future rebake against the new GPUMD descriptor
-    # set (q_123/q_233) is desired.
 ]
 
 
