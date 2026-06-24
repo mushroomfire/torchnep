@@ -1,12 +1,9 @@
-type         2 Te Pb
+type 2 Te Pb
+        
+epoch 600
+batch 4
 
-lr         1e-2         
-lr_scheduler step
-scheduler_patience 10    
-scheduler_factor   0.8
-epoch 400
-batch 1
-
-stage2 1
-start_stage2     200     
-stage2_lr        1e-4    
+stage2 1  
+start_stage2 300
+stage2_lambda_e  2.0  
+stage2_lambda_f  0.01   

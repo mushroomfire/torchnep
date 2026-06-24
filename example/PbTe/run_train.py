@@ -7,5 +7,4 @@ train_nep(
     print_interval=1,
     checkpoint_interval=50,
     use_compile=True,
-    device='mps'
 )
