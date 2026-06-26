@@ -1,8 +1,6 @@
-# torchnep tests
+# TorchNep tests
 
-Pure pytest suite (`numpy` + `torch`; `ase` only for the ASE test). GPUMD
-comparisons read a frozen reference baked into [data/](data/), so the GPUMD
-binary is not needed at test time.
+Pure pytest suite (`numpy` + `torch`; `ase` only for the ASE test).
 
 ```bash
 pytest tests/                      # full suite
