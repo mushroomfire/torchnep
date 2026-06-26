@@ -269,11 +269,7 @@ def parse_nep_in(filename: str) -> Dict:
                 params["type_names"] = parts[2 : 2 + int(parts[1])]
             elif key == "version":
                 v = int(parts[1])
-                # torchnep only implements NEP4 (single-radial-channel angular
-                # basis + per-type fitting NN + shared output bias).  Earlier
-                # NEP versions used a different architecture and aren't
-                # supported.  Fail loudly rather than silently produce wrong
-                # weights.
+                # torchnep only implements NEP4.
                 if v != 4:
                     raise ValueError(
                         f"nep.in version {v} is not supported — torchnep "
@@ -364,10 +360,6 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("n_max_angular", 6)
     params.setdefault("basis_size_radial", 6)
     params.setdefault("basis_size_angular", 6)
-    # Matches the GPUMD default ``l_max 4 1 0`` — L_max=4, q_222=1
-    # (4-body on), q_1111=0; everything beyond is off.  Fields, after the
-    # GPUMD PR #1519 removal of q_1122, are [L_3b, q_222, q_1111, q_112,
-    # q_123, q_233, q_134]; every trailing flag is normalised to 0/1 in NEPModel.
     params.setdefault("l_max", [4, 1, 0])
     params.setdefault("neuron", 30)
 
@@ -386,9 +378,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
+
     # Defaults for optional stage-2 parameters (only used if stage2=1).
-    # Stage 2 raises the energy emphasis at the lower stage-2 learning rate to
-    # refine energies after the force-dominated stage 1.
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)

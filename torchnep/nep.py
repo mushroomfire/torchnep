@@ -149,10 +149,6 @@ class NEPCalculator:
         self.basis_size_angular = int(parts[2])
         idx += 1
 
-        # ``l_max`` line: L_max + 3 GPUMD-core flags + q_123 / q_233 / q_134
-        # (the GPUMD PR #1519 layout — q_1122 is gone).  Field 2 (has_q_222) is
-        # written by ``save_nep_txt`` with the legacy "2 if on else 0"
-        # encoding (matches GPUMD fitness.cu); we normalise it back to 0/1.
         parts = lines[idx].split()
         self.l_max_3b   = int(parts[1])
         self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0

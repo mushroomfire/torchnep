@@ -304,12 +304,7 @@ def compute_descriptors(
 
     Returns
     -------
-    q : (N, dim) float   per-atom descriptor, dim =
-        (n_max_radial+1)                    radial
-      + (n_max_angular+1) * l_max_3b        3-body
-      + (n_max_angular+1) * has_q_222       q_222 (4-body original)
-      + (n_max_angular+1) * has_q_1111      q_1111 (5-body original)
-      + (n_max_angular+1) * has_q_112       q_112 (mixed L=1,L=2 cubic)
+    q : (N, dim) float   per-atom descriptor
     Zero-filled for atoms with no angular pairs (isolated atoms / dimers).
     """
     backend = resolve_backend(backend, num_types=int(c2.shape[0]))
@@ -393,8 +388,6 @@ def compute_descriptors(
                     + cb[4]*s11r*s11i*s22i)
             parts.append(q112)
 
-        # q_123 / q_233: extra 4-body bispectrum channels (GPUMD PR #1517),
-        # evaluated via the generic polynomial helper from fixed term tables.
         if has_q_123:
             parts.append(_eval_extra(s, Q123_TERMS))
         if has_q_233:

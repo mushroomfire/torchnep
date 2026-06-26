@@ -14,7 +14,7 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 
 ## Installation
 
-Install PyTorch first — see the [official guide](https://pytorch.org/get-started/locally/). TorchNEP requires only `torch >= 2.0` and `numpy`.
+TorchNEP needs only `torch >= 2.0` and `numpy`, but neither is installed automatically — install the PyTorch build that matches your CUDA/CPU setup first (see the [official guide](https://pytorch.org/get-started/locally/); numpy comes with it).
 
 Then install TorchNEP with:
 
@@ -266,7 +266,7 @@ model = NEPModel(config)
 model.load_weights_from_nep_txt("nep.txt")
 
 slimmed = slim_model(model, ["Cr", "Ni"])
-slimmed.save_nep_txt("nep_slim.txt")
+slimmed.save_nep_txt("nep_slim.txt", max_NN_radial, max_NN_angular)
 ```
 
 ---

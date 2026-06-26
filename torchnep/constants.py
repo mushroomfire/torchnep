@@ -24,9 +24,7 @@ ELEMENTS = [
     "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf",
     "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po",
     "At", "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu",
-    # Transuranics + transactinides (Z = 95–118). Datasets like MAD / MatPES
-    # include actinides up to Cm / Bk; the rest rarely appear in practice
-    # but keeping the table full through Og avoids 'X' is not in list errors.
+    # Transuranics + transactinides (Z = 95–118).
     "Am", "Cm", "Bk", "Cf", "Es", "Fm", "Md", "No", "Lr",
     "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn",
     "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
@@ -110,10 +108,6 @@ C4B = [-0.007499480826664, -0.134990654879954, 0.067495327439977,
 C5B = [0.026596810706114, 0.053193621412227, 0.026596810706114]
 
 # Mixed-L invariant (GPUMD NEP feature `has_q_112`).
-# q_112 ("4-body type 2"): cubic combinations of L=1 (s[0..2]) and L=2 (s[3..7]).
-# Values must bit-match nep_utilities.cuh::C4B2 to reproduce GPUMD.
-# (GPUMD PR #1519 removed the companion 5-body `q_1122` channel; its C5B2
-# table is no longer used.)
 C4B2 = [0.027493550848847,
         0.164961305093080,
        -0.013746775424423,
@@ -121,13 +115,6 @@ C4B2 = [0.027493550848847,
         0.082480652546540]
 
 # Higher-L 4-body bispectrum invariants (GPUMD: has_q_123 / has_q_233 / has_q_134).
-# q_123 = B(1,2,3): couples L=1, L=2, L=3 moments.
-# q_233 = B(2,3,3): couples L=2, L=3, L=3 moments.
-# q_134 = B(1,3,4): couples L=1, L=3, L=4 moments (see C4B_134 below).
-# Coefficients and monomial structure transcribed verbatim from GPUMD's
-# nep_utilities.cuh::find_q so torchnep descriptors are bit-identical to
-# GPUMD PR #1517 (a trained nep.txt loads and runs there). s-index layout
-# is shared: block L occupies lm = L*L-1 .. L*L-1+2L (L=1:0-2, 2:3-7, 3:8-14).
 C4B_123 = [-0.008418146349617, -0.016836292699234, -0.033672585398469,
            -0.042090731748086, -0.067345170796937, -0.084181463496172,
            -0.168362926992344]

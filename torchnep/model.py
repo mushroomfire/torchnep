@@ -72,11 +72,6 @@ class NEPModel(nn.Module):
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
         self.basis_size_angular = config["basis_size_angular"]
-        # ``l_max`` accepts the legacy 2-field form through GPUMD PR #1519's
-        # 6-field form. Everything past index 0 is normalised to a 0/1 flag:
-        #   [L_max, q_222, q_1111, q_112, q_123, q_233, q_134]
-        # (GPUMD PR #1519 removed the historical q_1122 slot, so field 4 is
-        # now q_112 directly — matching GPUMD's parse_l_max after the PR.)
         lm = list(config["l_max"])
         self.l_max_3b = lm[0]
         self.has_q_222  = 1 if (len(lm) > 1 and lm[1] > 0) else 0
@@ -124,9 +119,6 @@ class NEPModel(nn.Module):
                 self.zbl_rc_outer = self.zbl
                 self.zbl_typewise_factor = None
 
-        # Dimensions — angular layout matches GPUMD: 3-body, then each
-        # enabled mixed-body block in the fixed order 222 / 1111 / 112,
-        # then the optional q_123 / q_233 / q_134 bispectrum blocks.
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b = n_ap1 * self.l_max_3b
@@ -202,7 +194,7 @@ class NEPModel(nn.Module):
             pi_ang, pj_ang, atom_types, N,
             backend=backend)
         q_scaled = q * self.q_scaler
-        # See compute_properties_cached for why every per-type net is touched.
+
         Ei = torch.zeros(N, dtype=q.dtype, device=q.device)
         dummy_accum = torch.zeros((), dtype=q.dtype, device=q.device)
         dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(

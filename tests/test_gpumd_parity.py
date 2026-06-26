@@ -47,12 +47,113 @@ import torch
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
-from torchnep.data import read_xyz
+from torchnep import ops
+from torchnep.data import read_xyz, build_neighbor_list_np
 from torchnep.nep import NEPCalculator
 from torchnep.model import NEPModel
-from torchnep.predict import _build_batch, _preprocess_for_prediction
 from _common import (DTYPE_MAP, NP_DTYPE_MAP, FIXTURES, devices, dtypes,
                      load_reference)
+
+
+# Single-frame neighbor-list + batch builders. These mirror what the training
+# pipeline produces and what NEPCalculator.compute_batch consumes, but build a
+# single hand-made batch — only the parity tests below need them, so they live
+# here rather than in the shipped package.
+
+def _preprocess_for_prediction(frames, calc, np_dtype):
+    """Build neighbor lists for a list of frames. Returns structure dicts
+    with the same schema the training pipeline produces."""
+    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    max_rc = max(rc_rad, rc_ang)
+
+    structures = []
+    for frame in frames:
+        positions = np.asarray(frame["positions"], dtype=np_dtype)
+        cell = np.asarray(frame["cell"], dtype=np_dtype)
+        atom_types = np.array(
+            [calc.type_names.index(s) for s in frame["species"]],
+            dtype=np.int64)
+        pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
+        dij = np.linalg.norm(rij, axis=1)
+        structures.append({
+            "natoms": frame["natoms"],
+            "atom_types": atom_types,
+            "pair_i_rad": pair_i[dij < rc_rad],
+            "pair_j_rad": pair_j[dij < rc_rad],
+            "rij_rad":    rij[dij < rc_rad],
+            "pair_i_ang": pair_i[dij < rc_ang],
+            "pair_j_ang": pair_j[dij < rc_ang],
+            "rij_ang":    rij[dij < rc_ang],
+            "energy": frame.get("energy"),
+            "forces": frame.get("forces"),
+            "virial": frame.get("virial"),
+        })
+    return structures
+
+
+def _build_batch(structures, indices, calc, dtype, device):
+    """Collate a list of structure indices into a GPU batch with cached basis,
+    matching the dict shape NEPCalculator.compute_batch expects."""
+    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
+    l_max_3b, num_lm = calc.l_max_3b, calc.num_lm
+
+    natoms_list = [structures[i]["natoms"] for i in indices]
+    N_total = sum(natoms_list)
+    B = len(indices)
+    offsets = [0]
+    for n in natoms_list:
+        offsets.append(offsets[-1] + n)
+
+    atom_types = torch.tensor(
+        np.concatenate([structures[i]["atom_types"] for i in indices]),
+        dtype=torch.long, device=device)
+    struct_idx = torch.cat([
+        torch.full((natoms_list[k],), k, dtype=torch.long, device=device)
+        for k in range(B)])
+
+    def _cat_int(key):
+        return torch.tensor(
+            np.concatenate([structures[indices[k]][key] + offsets[k]
+                            for k in range(B)]).astype(np.int64),
+            dtype=torch.long, device=device)
+
+    def _cat_rij(key):
+        return torch.tensor(
+            np.concatenate([structures[indices[k]][key] for k in range(B)]),
+            dtype=dtype, device=device)
+
+    pi_r, pj_r = _cat_int("pair_i_rad"), _cat_int("pair_j_rad")
+    rij_r = _cat_rij("rij_rad")
+    pi_a, pj_a = _cat_int("pair_i_ang"), _cat_int("pair_j_ang")
+    rij_a = _cat_rij("rij_ang")
+
+    dr = torch.norm(rij_r, dim=-1)
+    fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+    d12inv_r = 1.0 / dr.clamp(min=1e-10)
+
+    if rij_a.shape[0] > 0:
+        da = torch.norm(rij_a, dim=-1)
+        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+        d12inv_a = 1.0 / da.clamp(min=1e-10)
+        blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
+                                rij_a[:, 1] * d12inv_a,
+                                rij_a[:, 2] * d12inv_a, l_max_3b)
+    else:
+        fk_a = torch.zeros(0, basis_a + 1, dtype=dtype, device=device)
+        fkp_a = torch.zeros(0, basis_a + 1, dtype=dtype, device=device)
+        d12inv_a = torch.zeros(0, dtype=dtype, device=device)
+        blm = torch.zeros(0, num_lm, dtype=dtype, device=device)
+
+    return {
+        "N": N_total, "num_structures": B,
+        "atom_types": atom_types, "struct_idx": struct_idx,
+        "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
+        "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
+        "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
+        "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
+        "blm": blm,
+    }
 
 
 # Tolerance vs the GPUMD fixture. GPUMD computes in float32 and writes %g
