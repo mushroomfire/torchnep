@@ -604,25 +604,12 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
     ``backend`` should match the training backend so the type-pair contraction
     order of operations (and hence the floating-point accumulation) is the
     same as what training will see.
-
-    The descriptor coefficients are forced to **1.0** for this pass (not the
-    random init), exactly matching GPUMD: at generation 0 GPUMD evaluates the
-    descriptors with a dummy parameter vector set entirely to ``initial_para``
-    (default 1.0) before taking 1/(max-min) per dimension (see
-    src/main_nep/fitness.cu and nep.cu::find_max_min). This makes q_scaler
-    deterministic and identical to GPUMD, independent of weight init.
     """
     model.eval()
     dev = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     q_min = torch.full((model.dim,), float("inf"), dtype=dtype, device=dev)
     q_max = torch.full((model.dim,), float("-inf"), dtype=dtype, device=dev)
-
-    # GPUMD computes q_scaler with all descriptor coefficients == initial_para
-    # (1.0), not the trained/initialised values.
-    c2_ones = torch.ones_like(model.c_param_2)
-    c3_ones = (torch.ones_like(model.c_param_3)
-               if model.c_param_3 is not None else None)
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -632,7 +619,7 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
-            c2_ones, c3_ones,
+            model.c_param_2, model.c_param_3,
             model.n_max_radial, model.n_max_angular,
             model.l_max_3b,
             model.has_q_222, model.has_q_1111, model.has_q_112,

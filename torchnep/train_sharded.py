@@ -150,12 +150,6 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
     q_min = torch.full((model.dim,), float("inf"), dtype=dtype, device=dev)
     q_max = torch.full((model.dim,), float("-inf"), dtype=dtype, device=dev)
 
-    # GPUMD computes q_scaler with all descriptor coefficients == 1.0 (see
-    # compute_q_scaler in train.py), not the initialised values.
-    c2_ones = torch.ones_like(model.c_param_2)
-    c3_ones = (torch.ones_like(model.c_param_3)
-               if model.c_param_3 is not None else None)
-
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
         batch = data_store.collate(list(range(start, end)))
@@ -164,7 +158,7 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
-            c2_ones, c3_ones,
+            model.c_param_2, model.c_param_3,
             model.n_max_radial, model.n_max_angular,
             model.l_max_3b,
             model.has_q_222, model.has_q_1111, model.has_q_112,
