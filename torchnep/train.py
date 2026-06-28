@@ -583,6 +583,14 @@ def compute_max_neighbors(structures):
     return max_rad, max_ang
 
 
+# The 6 unique components of the symmetric virial, picked from the row-major
+# 3x3 (length-9) layout in GPUMD order: xx, yy, zz, xy, yz, zx. The virial loss
+# must use these 6 — averaging over all 9 would weight the (symmetric)
+# off-diagonal pairs twice relative to the diagonal. Matches GPUMD's
+# 6-component virial RMSE (lambda_shear=1 by default).
+_VIRIAL_6 = [0, 4, 8, 1, 5, 6]
+
+
 @torch.no_grad()
 def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
     """Compute descriptor min/max across training set.
@@ -596,12 +604,25 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
     ``backend`` should match the training backend so the type-pair contraction
     order of operations (and hence the floating-point accumulation) is the
     same as what training will see.
+
+    The descriptor coefficients are forced to **1.0** for this pass (not the
+    random init), exactly matching GPUMD: at generation 0 GPUMD evaluates the
+    descriptors with a dummy parameter vector set entirely to ``initial_para``
+    (default 1.0) before taking 1/(max-min) per dimension (see
+    src/main_nep/fitness.cu and nep.cu::find_max_min). This makes q_scaler
+    deterministic and identical to GPUMD, independent of weight init.
     """
     model.eval()
     dev = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     q_min = torch.full((model.dim,), float("inf"), dtype=dtype, device=dev)
     q_max = torch.full((model.dim,), float("-inf"), dtype=dtype, device=dev)
+
+    # GPUMD computes q_scaler with all descriptor coefficients == initial_para
+    # (1.0), not the trained/initialised values.
+    c2_ones = torch.ones_like(model.c_param_2)
+    c3_ones = (torch.ones_like(model.c_param_3)
+               if model.c_param_3 is not None else None)
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -611,7 +632,7 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop"):
             batch["pair_i_rad"], batch["pair_j_rad"],
             batch["pair_i_ang"], batch["pair_j_ang"],
             batch["atom_types"], batch["N"],
-            model.c_param_2, model.c_param_3,
+            c2_ones, c3_ones,
             model.n_max_radial, model.n_max_angular,
             model.l_max_3b,
             model.has_q_222, model.has_q_1111, model.has_q_112,
@@ -840,7 +861,10 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
                         v_sys.scatter_add_(0, si, v_atom)
                         na = batch["natoms"][v_mask].unsqueeze(-1)
-                        v_diff = (v_sys[v_mask] - batch["virial"][v_mask]) / na
+                        # 6 unique components only (see _VIRIAL_6).
+                        v_pred6 = v_sys[:, _VIRIAL_6]
+                        v_ref6 = batch["virial"][:, _VIRIAL_6]
+                        v_diff = (v_pred6[v_mask] - v_ref6[v_mask]) / na
                         sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
                         n_v += int(v_mask.sum().item())
     finally:
@@ -1334,8 +1358,8 @@ def train_nep(
                     or os.path.getsize(loss_log_path) == 0)
     loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
     if write_header:
-        loss_log.write("epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
-                       "rmse_v(eV/atom)  rmse_stress(GPa)  gnorm\n")
+        loss_log.write("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+                       "rmse_v(eV/atom)  rmse_stress(GPa)\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
     # already printed by format_config_summary above; here we just announce
@@ -1488,8 +1512,9 @@ def train_nep(
                         v_ref = batch["virial"]
                         if v_ref.shape[1] == 9:
                             na = batch["natoms"][v_mask].unsqueeze(-1)
-                            v_pred_pa = v_sys[v_mask] / na
-                            v_ref_pa = v_ref[v_mask] / na
+                            # 6 unique components only (see _VIRIAL_6).
+                            v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
+                            v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
                             loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
                             v_diff = v_pred_pa - v_ref_pa
@@ -1555,8 +1580,7 @@ def train_nep(
                                 lr_scheduler_mode, optimizer, stop_lr)
 
             loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
-                           f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f} "
-                           f"{max_gn:.2f}\n")
+                           f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}\n")
             loss_log.flush()
 
             stage_str = "[S2] " if in_stage2 else ""
