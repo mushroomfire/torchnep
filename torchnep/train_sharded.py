@@ -213,6 +213,7 @@ def train_nep_sharded(
     slim_types: bool = False,
     energy_key: str = "energy",
     use_gpumd_qscaler: bool = True,
+    run_seed: int = None,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -234,6 +235,11 @@ def train_nep_sharded(
     ``recompute_q_scaler=True``). Runtime-exclusive differences are the DDP
     launch, CUDA/gloo backend auto-select, and distributed aggregation of
     q_scaler / epoch metrics / the frozen-weight best evaluation.
+
+    ``run_seed`` mirrors ``train_nep``: None -> a fresh random seed each run
+    (rank 0 draws it and broadcasts, so all replicas agree); pass an int for a
+    fully reproducible run. It seeds the weight init and the per-epoch shuffle,
+    and is saved into / restored from the checkpoint for exact resumption.
     """
     _clean_warning_format()
 
@@ -274,6 +280,21 @@ def train_nep_sharded(
 
     is_main = rank == 0
     dtype = torch.float32 if precision == "float32" else torch.float64
+
+    # ---- Master RNG seed -------------------------------------------------
+    # rank 0 owns the seed (picks a random one when run_seed is None) and
+    # broadcasts it so every replica seeds identically — the DDP wrapper later
+    # broadcasts rank-0 weights anyway, but a shared seed also makes the
+    # per-epoch shuffle streams reproducible for a given run_seed. Seeded here,
+    # before model construction, so the NN weight init draws from it.
+    if run_seed is None and is_main:
+        import random
+        run_seed = random.randrange(1, 2**31 - 1)
+    seed_t = torch.tensor([run_seed if run_seed is not None else 0],
+                          dtype=torch.long, device=dev)
+    dist.broadcast(seed_t, src=0)
+    run_seed = int(seed_t.item())
+    torch.manual_seed(run_seed)
 
     # Only rank 0 logs. All app output already routes through _log (is_main-
     # guarded), but Python warnings (e.g. NEPModel's q_1111 redundancy notice)
@@ -434,6 +455,7 @@ def train_nep_sharded(
     # ---- Model -----------------------------------------------------------
     _log("Model")
     _log("-----")
+    _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
 
     # use_gpumd_qscaler: reproduce GPUMD's init (descriptor coeffs uniform(-1,1)
@@ -581,8 +603,21 @@ def train_nep_sharded(
     # the optimizer (and L1), matching the single-GPU path.
     trainable_params = [p for n, p in raw_model.named_parameters()
                         if n != "b1"]
+    # Divisor for GPUMD's mean(|w|) / RMS(w) regularization (see reg block in
+    # the epoch loop). Identical on every rank (DDP replicates the model), so
+    # the reg term needs no all-reduce — each rank adds the same value and DDP's
+    # gradient averaging leaves the reg gradient at full strength.
+    n_par = sum(p.numel() for p in trainable_params)
+    # Constant L1 gradient coefficient (λ₁/N_par); the L2 coefficient depends
+    # on RMS(w) and is refreshed once per epoch below. Both are applied as
+    # fused in-place grad updates after backward (see the loop) — reg is added
+    # locally on each rank (identical params → identical value, so no all-reduce
+    # needed; DDP already averaged the data gradient).
+    l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
+    # weight_decay stays 0: L2 is applied explicitly as GPUMD's λ₂·RMS(w),
+    # not as Adam's decoupled decay (different form, not comparable).
     optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=lambda_2, amsgrad=True)
+                                 weight_decay=0.0, amsgrad=True)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -643,8 +678,13 @@ def train_nep_sharded(
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
+        # Continue the original shuffle stream (all ranks read the same file,
+        # so run_seed stays consistent across ranks). Pre-tag checkpoints have
+        # none -> keep this run's seed.
+        if info.get("run_seed") is not None:
+            run_seed = info["run_seed"]
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
-             f"best_loss={best_loss:.4e}")
+             f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
         # comes from the checkpoint moment. nep.in's lr only applies to
         # fresh runs / finetunes — and stage2_lr at a fresh stage-2 entry.
@@ -713,13 +753,24 @@ def train_nep_sharded(
             # batch_size) is identical across ranks because n_local is —
             # so DDP collectives stay in lock-step.
             g = torch.Generator()
-            g.manual_seed(epoch * world_size + rank)
+            g.manual_seed(run_seed + epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
+
+            # L2 coefficient λ₂/(N_par·RMS(w)), refreshed once per epoch (RMS
+            # drifts slowly; matches GPUMD's per-generation recompute). Params
+            # are replicated across ranks, so RMS is identical everywhere — no
+            # all-reduce needed.
+            l2_coeff = 0.0
+            if lambda_2 > 0:
+                with torch.no_grad():
+                    sq = sum(p.pow(2).sum() for p in trainable_params)
+                    rms = float(torch.sqrt(sq / n_par).item())
+                l2_coeff = lambda_2 / (n_par * max(rms, 1e-12))
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -751,7 +802,8 @@ def train_nep_sharded(
                                 epoch - 1, best_loss,
                                 loss_weights=cur_loss_weights,
                                 in_stage2=False, swa_model=None,
-                                best_true_loss=best_true_loss)
+                                best_true_loss=best_true_loss,
+                                run_seed=run_seed)
                             _log("Saved end-of-stage-1 checkpoint: "
                                  "checkpoint_stage1.pt (redo stage 2 from "
                                  "it via resume_from)")
@@ -863,12 +915,25 @@ def train_nep_sharded(
                         sum_sq_s = ((v_diff * scale) ** 2).sum()
                         sum_ls += (sum_sq_s.item() / 6.0)
 
-                if lambda_1 > 0:
-                    l1 = sum(p.abs().sum() for p in trainable_params)
-                    loss = loss + lambda_1 * l1
-
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # GPUMD-style regularization (snes.cu:524-525): gradient of
+                # λ₁·mean(|w|) + λ₂·RMS(w) added into .grad, fused across params
+                # (no autograd graph, no per-step sync). Applied after DDP has
+                # averaged the data gradient — reg is identical on every rank,
+                # so adding it locally is exactly right (must NOT be averaged).
+                # See the single-GPU path for the MSE-vs-RMSE balance caveat.
+                if l1_coeff or l2_coeff:
+                    with torch.no_grad():
+                        grads = [p.grad for p in trainable_params]
+                        if l2_coeff:
+                            torch._foreach_add_(grads, trainable_params,
+                                                alpha=l2_coeff)
+                        if l1_coeff:
+                            torch._foreach_add_(
+                                grads, torch._foreach_sign(trainable_params),
+                                alpha=l1_coeff)
 
                 if max_grad_norm > 0:
                     gn = torch.nn.utils.clip_grad_norm_(
@@ -1004,7 +1069,7 @@ def train_nep_sharded(
                     epoch, best_loss, loss_weights=cur_loss_weights,
                     in_stage2=in_stage2,
                     swa_model=swa_model if in_stage2 else None,
-                    best_true_loss=best_true_loss)
+                    best_true_loss=best_true_loss, run_seed=run_seed)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:
