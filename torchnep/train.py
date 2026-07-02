@@ -734,7 +734,8 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
                      loss_weights=None, in_stage2=False, swa_model=None,
-                     best_true_loss=None, run_seed=None):
+                     best_true_loss=None, run_seed=None,
+                     best_valid_loss=None, valid_info=None):
     """Write a full training checkpoint.
 
     ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
@@ -759,6 +760,10 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         state["swa_state"] = swa_model.state_dict()
     if best_true_loss is not None:
         state["best_true_loss"] = best_true_loss
+    if best_valid_loss is not None:
+        state["best_valid_loss"] = best_valid_loss
+    if valid_info is not None:
+        state["valid_info"] = valid_info
     torch.save(state, path)
 
 
@@ -810,6 +815,8 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "loss_weights": ckpt.get("loss_weights"),
         "in_stage2": in_stage2,
         "run_seed": ckpt.get("run_seed"),
+        "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
+        "valid_info": ckpt.get("valid_info"),
     }
 
 
@@ -846,16 +853,18 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid) so callers
-    can finish the per-sample averaging themselves — the DDP path all-reduces
-    these numbers across ranks first, which makes the aggregated loss EXACTLY
-    the full-dataset value (a sum of per-shard sums), identical to the
-    single-GPU result. ``sum_e_resid`` (Σ signed per-atom energy residual)
-    lets the caller solve the exact optimal energy offset b1 for these frozen
-    weights in this same pass: δ = sum_e_resid / n_e, and the offset-corrected
-    energy MSE is sum_le/n_e − δ².
+    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
+    callers can finish the per-sample averaging themselves — the DDP path
+    all-reduces these numbers across ranks first, which makes the aggregated
+    loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
+    to the single-GPU result. ``sum_ls`` is the stress squared-error sum in
+    (eV/Å³)² (same normalisation as the train-loop accumulator).
+    ``sum_e_resid`` (Σ signed per-atom energy residual) lets the caller solve
+    the exact optimal energy offset b1 for these frozen weights in this same
+    pass: δ = sum_e_resid / n_e, and the offset-corrected energy MSE is
+    sum_le/n_e − δ².
     """
-    sum_le = sum_lf = sum_lv = 0.0
+    sum_le = sum_lf = sum_lv = sum_ls = 0.0
     sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
     n_e = n_f = n_v = 0
 
@@ -916,12 +925,17 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         v_ref6 = batch["virial"][:, _VIRIAL_6]
                         v_diff = (v_pred6[v_mask] - v_ref6[v_mask]) / na
                         sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
+                        # Stress (eV/A**3) = virial_per_atom * natoms / V.
+                        s_scale = (batch["natoms"][v_mask]
+                                   / batch["volumes"][v_mask]).unsqueeze(-1)
+                        sum_ls += ((v_diff * s_scale) ** 2) \
+                            .mean(dim=1).sum().item()
                         n_v += int(v_mask.sum().item())
     finally:
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid
+    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
@@ -943,7 +957,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, n_e, n_f, n_v, sum_e_resid = \
+    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
         _accumulate_true_loss_sums(
             data_store, batch_size, raw_model,
             compute_props, compute_props_cached,
@@ -960,6 +974,37 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     mse_v = sum_lv / max(n_v, 1)
     true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
     return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+
+
+def _evaluate_valid_loss(valid_store, batch_size, raw_model,
+                         compute_props, compute_props_cached,
+                         use_autograd_forces, backend,
+                         pref_e, pref_f, pref_v, dtype, dev):
+    """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
+
+    Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
+    offset is fitted on training data only (the analytical b1 update in the
+    epoch loop) — re-fitting it on validation energies would leak validation
+    information into the saved model. Energy MSE is therefore the plain
+    residual mean square with the current (train-fitted) b1.
+
+    Returns (valid_loss, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
+    """
+    from .constants import EV_PER_A3_TO_GPa
+    has_forces = valid_store.has_forces and pref_f > 0
+    has_virial = valid_store.has_virial and pref_v > 0
+    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
+        _accumulate_true_loss_sums(
+            valid_store, batch_size, raw_model,
+            compute_props, compute_props_cached,
+            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    mse_e = sum_le / max(n_e, 1)
+    mse_f = sum_lf / max(n_f, 1)
+    mse_v = sum_lv / max(n_v, 1)
+    mse_s = sum_ls / max(n_v, 1)
+    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+    return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+            np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
 
 
 def _quiet_compile_logs():
@@ -1054,6 +1099,8 @@ def train_nep(
     energy_key: str = "energy",
     use_gpumd_qscaler: bool = True,
     run_seed: int = None,
+    valid_file: str = None,
+    valid_ratio: float = None,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1119,6 +1166,15 @@ def train_nep(
         saved into checkpoint.pt and restored on resume, so a resumed run
         continues along the very same shuffle stream regardless of what seed
         (or None) is passed at resume time.
+    valid_file : path to a validation .xyz. Evaluated (frozen weights, full
+        set) every epoch: nep_best is the epoch with the lowest validation
+        loss and the plateau LR scheduler steps on the validation loss —
+        both anti-overfitting. Writes GPUMD-style *_test.out files.
+    valid_ratio : alternative to valid_file — hold out this fraction of
+        data_file (e.g. 0.1) as the validation set. The split is drawn from
+        run_seed, so it is reproducible for a given seed and is preserved
+        exactly on resume (the checkpoint's seed wins). Mutually exclusive
+        with valid_file.
     """
     _clean_warning_format()
 
@@ -1189,12 +1245,71 @@ def train_nep(
     stage2_scheduler_factor   = config.get("stage2_scheduler_factor",
                                            scheduler_factor)
 
+    # ---- Resume target + master RNG seed (BEFORE data loading) ------------
+    # The seed must be settled before the data section because the validation
+    # split (valid_ratio) is drawn from it — and on resume the checkpoint's
+    # saved seed must win, or the resumed run would carve out a DIFFERENT
+    # validation subset and leak old validation frames into training. Only
+    # the seed is peeked here; the full checkpoint load happens later, after
+    # model/optimizer construction.
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    if resume_from is not None and finetune_from is not None:
+        raise ValueError("resume_from and finetune_from are mutually "
+                         "exclusive: resume_from continues a run, "
+                         "finetune_from starts a new one from weights")
+    resume_ckpt = None
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"resume_from: {resume_from} not found")
+        resume_ckpt = resume_from
+    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
+        resume_ckpt = ckpt_path
+    if resume_ckpt is not None:
+        _saved_seed = torch.load(resume_ckpt, map_location="cpu",
+                                 weights_only=False).get("run_seed")
+        if _saved_seed is not None:
+            run_seed = _saved_seed  # continue the original streams + split
+    if run_seed is None:
+        import random
+        run_seed = random.randrange(1, 2**31 - 1)
+
     # ---- Data ------------------------------------------------------------
     _log("Data")
     _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
+
+    # ---- Validation set ----------------------------------------------------
+    # valid_file: separate .xyz. valid_ratio: hold out a random fraction of
+    # data_file, drawn from run_seed via a dedicated generator (the global
+    # torch RNG is untouched, so weight init matches a no-valid run). Sorted
+    # indices keep the *_test.out rows in input-xyz order.
+    if valid_file is not None and valid_ratio is not None:
+        raise ValueError("valid_file and valid_ratio are mutually exclusive")
+    valid_frames = None
+    if valid_file is not None:
+        valid_frames = read_xyz(valid_file, energy_key=energy_key)
+        _log(f"  read {len(valid_frames)} validation structures "
+             f"from {valid_file}")
+    elif valid_ratio is not None:
+        if not 0.0 < valid_ratio < 1.0:
+            raise ValueError(f"valid_ratio must be in (0, 1), "
+                             f"got {valid_ratio}")
+        g = torch.Generator()
+        g.manual_seed(run_seed)
+        perm = torch.randperm(len(frames), generator=g).tolist()
+        n_val = max(1, int(round(valid_ratio * len(frames))))
+        if n_val >= len(frames):
+            raise ValueError(f"valid_ratio={valid_ratio} leaves no "
+                             f"training frames ({len(frames)} total)")
+        val_idx = sorted(perm[:n_val])
+        val_set = set(val_idx)
+        valid_frames = [frames[i] for i in val_idx]
+        frames = [f for i, f in enumerate(frames) if i not in val_set]
+        _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
+             f"validation, {len(frames)} remain for training "
+             f"(split drawn from run_seed)")
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -1210,6 +1325,9 @@ def train_nep(
     _slim_keep = None  # None = no slimming; list = types to keep
     if slim_types:
         seen_species = set(s for f in frames for s in f["species"])
+        if valid_frames is not None:
+            seen_species |= set(s for f in valid_frames
+                                for s in f["species"])
         keep = [t for t in orig_config["type_names"] if t in seen_species]
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
@@ -1237,6 +1355,22 @@ def train_nep(
     _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
     _log(f"  coverage: {data_store.n_energy} E / "
          f"{data_store.n_forces} F / {data_store.n_virial} V")
+
+    valid_store = None
+    if valid_frames is not None:
+        t0 = time.time()
+        structures_v = preprocess_structures(valid_frames, config, np_dtype)
+        # nep.txt records max neighbor counts for MD buffer sizing — cover
+        # the validation frames too (in ratio mode they came from data_file,
+        # so this matches what a no-valid run would have written).
+        vNN_rad, vNN_ang = compute_max_neighbors(structures_v)
+        max_NN_rad = max(max_NN_rad, vNN_rad)
+        max_NN_ang = max(max_NN_ang, vNN_ang)
+        valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        del structures_v, valid_frames
+        _log(f"  validation set ready in {time.time() - t0:.1f}s — "
+             f"coverage: {valid_store.n_energy} E / "
+             f"{valid_store.n_forces} F / {valid_store.n_virial} V")
     _log("")
 
     # ---- Master RNG seed -------------------------------------------------
@@ -1244,11 +1378,8 @@ def train_nep(
     # init (model.py nn.init.*) and the descriptor-coeff re-init below draw
     # deterministically from it. A given run_seed therefore fixes the initial
     # weights; the same seed also drives the per-epoch shuffle (see the loop).
-    # None -> a fresh random seed each run (stochastic testing). On resume the
-    # saved seed overrides this so the shuffle stream stays continuous.
-    if run_seed is None:
-        import random
-        run_seed = random.randrange(1, 2**31 - 1)
+    # The seed itself was settled before data loading (checkpoint's seed on
+    # resume, user int, or a fresh random draw) — see the resume/seed block.
     torch.manual_seed(run_seed)
 
     # ---- Model -----------------------------------------------------------
@@ -1428,22 +1559,14 @@ def train_nep(
         "stage2_pref_v": stage2_pref_v,
     }
 
-    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    # resume_ckpt / ckpt_path were resolved before data loading (the seed
+    # peek); here the full training state is actually restored.
     start_epoch = 1
     best_loss = float("inf")
     best_true_loss = float("inf")
+    best_valid_loss = float("inf")
+    cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
-    if resume_from is not None and finetune_from is not None:
-        raise ValueError("resume_from and finetune_from are mutually "
-                         "exclusive: resume_from continues a run, "
-                         "finetune_from starts a new one from weights")
-    resume_ckpt = None
-    if resume_from is not None:
-        if not os.path.exists(resume_from):
-            raise FileNotFoundError(f"resume_from: {resume_from} not found")
-        resume_ckpt = resume_from
-    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
-        resume_ckpt = ckpt_path
     if resume_ckpt is not None:
         info = _load_checkpoint(resume_ckpt, model, optimizer,
                                 lr_scheduler, stage2_scheduler,
@@ -1451,10 +1574,15 @@ def train_nep(
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
-        # Continue the original shuffle stream: the seed the run started with
-        # (pre-tag checkpoints have none -> keep this run's seed).
-        if info.get("run_seed") is not None:
-            run_seed = info["run_seed"]
+        best_valid_loss = info["best_valid_loss"]
+        saved_valid_info = info.get("valid_info")
+        if saved_valid_info is not None and saved_valid_info != cur_valid_info:
+            _log("WARNING: validation settings changed since the checkpoint "
+                 "was saved — the train/valid split is NOT the one this run "
+                 "started with (old validation frames may enter training).")
+            _log(f"  saved:   {saved_valid_info}")
+            _log(f"  current: {cur_valid_info}")
+            best_valid_loss = float("inf")
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
@@ -1472,6 +1600,7 @@ def train_nep(
             _log(f"  current: {cur_loss_weights}")
             best_loss = float("inf")
             best_true_loss = float("inf")
+            best_valid_loss = float("inf")
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -1488,8 +1617,15 @@ def train_nep(
                     or os.path.getsize(loss_log_path) == 0)
     loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
     if write_header:
-        loss_log.write("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
-                       "rmse_v(eV/atom)  rmse_stress(GPa)\n")
+        hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+               "rmse_v(eV/atom)  rmse_stress(GPa)")
+        if valid_store is not None:
+            # GPUMD loss.out convention: train RMSEs, then test RMSEs.
+            # (The loss column is then the VALIDATION loss — it is what
+            # drives the scheduler and the best-model choice.)
+            hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
+                    "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+        loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
     # already printed by format_config_summary above; here we just announce
@@ -1571,7 +1707,9 @@ def train_nep(
                             model, optimizer, lr_scheduler, epoch - 1,
                             best_loss, loss_weights=cur_loss_weights,
                             in_stage2=False, swa_model=None,
-                            best_true_loss=best_true_loss, run_seed=run_seed)
+                            best_true_loss=best_true_loss, run_seed=run_seed,
+                            best_valid_loss=best_valid_loss,
+                            valid_info=cur_valid_info)
                         _log("Saved end-of-stage-1 checkpoint: "
                              "checkpoint_stage1.pt (redo stage 2 from it "
                              "via resume_from)")
@@ -1579,6 +1717,7 @@ def train_nep(
                             pg['lr'] = stage2_lr
                         best_loss = float("inf")
                         best_true_loss = float("inf")
+                        best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                              f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -1743,26 +1882,52 @@ def train_nep(
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
+
+            # Validation: frozen-weight full pass every epoch (b1 already
+            # train-fitted by the analytical update above; never re-fitted on
+            # validation data). This loss drives the plateau scheduler and
+            # the best-model choice below — the anti-overfitting signal.
+            valid_loss = None
+            if valid_store is not None:
+                valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s = \
+                    _evaluate_valid_loss(
+                        valid_store, batch_size, raw_model,
+                        compute_props, compute_props_cached,
+                        use_autograd_forces, train_backend,
+                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
             dt = time.time() - t_epoch
 
+            # With a validation set, the validation loss IS the run's loss:
+            # it drives the plateau scheduler, the best-model choice, and the
+            # displayed/logged "loss" value (the train RMSE columns remain).
+            sched_loss = valid_loss if valid_loss is not None else avg_loss
             if in_stage2 and stage2_scheduler is not None:
-                _scheduler_step(stage2_scheduler, avg_loss,
+                _scheduler_step(stage2_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                _scheduler_step(lr_scheduler, avg_loss,
+                _scheduler_step(lr_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
 
-            loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
-                           f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}\n")
+            row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
+                   f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+            if valid_loss is not None:
+                row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
+                        f"{v_rmse_s:.4f}")
+            loss_log.write(row + "\n")
             loss_log.flush()
 
             stage_str = "[S2] " if in_stage2 else ""
             cur_lr = optimizer.param_groups[0]['lr']
             v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                      if has_virial else "")
-            line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+            valid_str = ""
+            if valid_loss is not None:
+                valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
+                             + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
+                                if has_virial else ""))
+            line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                    f"{v_str} | gnorm {max_gn:.1f} | "
+                    f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
@@ -1770,8 +1935,15 @@ def train_nep(
                 _out_log_file.write(line + "\n")
                 _out_log_file.flush()
 
-            # Best-model bookkeeping. avg_loss averages over weights that
-            # keep moving within the epoch, so it is a noisy proxy for the
+            # Best-model bookkeeping.
+            # With a validation set, nep_best is simply the epoch with the
+            # lowest validation loss — valid_loss is already a frozen-weight
+            # true evaluation (computed every epoch), so the noisy-proxy /
+            # true-eval two-step below is unnecessary. best_loss still tracks
+            # the train loss for the log / checkpoint.
+            #
+            # Without validation: avg_loss averages over weights that keep
+            # moving within the epoch, so it is a noisy proxy for the
             # end-of-epoch weights actually saved. Early in the run that is
             # fine (the model improves much faster than the noise). In the
             # last third — where best really gets decided — a new avg_loss
@@ -1783,7 +1955,11 @@ def train_nep(
             new_min = avg_loss < best_loss
             if new_min:
                 best_loss = avg_loss
-            if epoch < true_eval_start:
+            if valid_store is not None:
+                if valid_loss < best_valid_loss:
+                    best_valid_loss = valid_loss
+                    _save_best()
+            elif epoch < true_eval_start:
                 if new_min:
                     _save_best()
             elif new_min or epoch == num_epochs:
@@ -1803,7 +1979,9 @@ def train_nep(
                     epoch, best_loss, loss_weights=cur_loss_weights,
                     in_stage2=in_stage2,
                     swa_model=swa_model if in_stage2 else None,
-                    best_true_loss=best_true_loss, run_seed=run_seed)
+                    best_true_loss=best_true_loss, run_seed=run_seed,
+                    best_valid_loss=best_valid_loss,
+                    valid_info=cur_valid_info)
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights
@@ -1822,6 +2000,11 @@ def train_nep(
                 predict_from_store(raw_model, data_store, output_dir,
                                    batch_size=batch_size, backend=backend,
                                    verbose=False)
+                if valid_store is not None:
+                    predict_from_store(raw_model, valid_store, output_dir,
+                                       batch_size=batch_size,
+                                       backend=backend, verbose=False,
+                                       suffix="test")
     finally:
         if loss_log is not None:
             loss_log.close()
@@ -1850,7 +2033,11 @@ def train_nep(
     train_time = time.time() - train_t0
     h, rem = divmod(train_time, 3600)
     m_, s = divmod(rem, 60)
-    _log(f"\nDone. Best loss: {best_loss:.6e}")
+    if valid_store is not None:
+        _log(f"\nDone. Best validation loss (nep_best): "
+             f"{best_valid_loss:.6e}")
+    else:
+        _log(f"\nDone. Best loss: {best_loss:.6e}")
     _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
     # End-of-training predict reuses the in-memory data_store (no xyz re-read)
@@ -1860,6 +2047,10 @@ def train_nep(
     predict_from_store(raw_model, data_store, output_dir,
                        batch_size=batch_size, backend=backend,
                        verbose=False)
+    if valid_store is not None:
+        predict_from_store(raw_model, valid_store, output_dir,
+                           batch_size=batch_size, backend=backend,
+                           verbose=False, suffix="test")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     total_time = time.time() - total_t0

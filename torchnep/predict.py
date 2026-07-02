@@ -400,7 +400,8 @@ def predict_dataset(
 def predict_from_store(model, data_store, output_dir: str,
                        batch_size: int = 1000,
                        backend: str = "auto",
-                       verbose: bool = True):
+                       verbose: bool = True,
+                       suffix: str = "train"):
     """Run prediction using an already-loaded NEPModel + GPUDataStore.
 
     Designed for the end of training: reuses the preprocessed data_store so
@@ -412,6 +413,9 @@ def predict_from_store(model, data_store, output_dir: str,
       energy_train.out  — per-frame (pred, ref) in eV/atom
       force_train.out   — per-atom (fx,fy,fz pred, ref) in eV/A
       virial_train.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
+
+    ``suffix`` picks the file-name tail: "train" (default) for the training
+    set, "test" for the validation set (GPUMD's *_test.out naming).
     """
     def _log(msg):
         if verbose:
@@ -489,11 +493,11 @@ def predict_from_store(model, data_store, output_dir: str,
 
     os.makedirs(output_dir, exist_ok=True)
     t_write = time.time()
-    np.savetxt(os.path.join(output_dir, "energy_train.out"),
+    np.savetxt(os.path.join(output_dir, f"energy_{suffix}.out"),
                np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "force_train.out"),
+    np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "virial_train.out"),
+    np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
     # Stress (GPa) = +virial_total / V * conversion (GPUMD sign; see
@@ -505,11 +509,11 @@ def predict_from_store(model, data_store, output_dir: str,
                                       keep_missing=False)
     stress_ref = _stress_from_virial(virial_ref, nat_col, vol_col,
                                      keep_missing=True)
-    np.savetxt(os.path.join(output_dir, "stress_train.out"),
+    np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
 
 
 # ---------------------------------------------------------------------------
@@ -595,16 +599,17 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
 
 def _write_predictions(output_dir: str, n_total_frames: int,
                        natoms, volumes,
-                       e_pred, e_ref, f_pred, f_ref, v_pred, v_ref):
-    """Write the four *_train.out files in frame-order. All arrays are
+                       e_pred, e_ref, f_pred, f_ref, v_pred, v_ref,
+                       suffix: str = "train"):
+    """Write the four *_{suffix}.out files in frame-order. All arrays are
     already in global input-xyz order (frame 0 first)."""
     os.makedirs(output_dir, exist_ok=True)
 
-    np.savetxt(os.path.join(output_dir, "energy_train.out"),
+    np.savetxt(os.path.join(output_dir, f"energy_{suffix}.out"),
                np.column_stack([e_pred, e_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "force_train.out"),
+    np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
                np.column_stack([f_pred, f_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, "virial_train.out"),
+    np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, v_ref]), fmt="%.10g")
 
     # Stress (GPa), GPUMD sign (+virial/V); missing refs keep -1e6 unscaled.
@@ -614,7 +619,7 @@ def _write_predictions(output_dir: str, n_total_frames: int,
                                       keep_missing=False)
     stress_ref = _stress_from_virial(v_ref, nat_col, vol_col,
                                      keep_missing=True)
-    np.savetxt(os.path.join(output_dir, "stress_train.out"),
+    np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
 
@@ -622,10 +627,11 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                                 n_total_frames: int, output_dir: str,
                                 batch_size: int = 1000,
                                 backend: str = "auto",
-                                verbose: bool = True):
+                                verbose: bool = True,
+                                suffix: str = "train"):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
     data-store shard, arrays are gathered to rank 0, rank 0 writes the four
-    ``*_train.out`` files in input-xyz order.
+    ``*_{suffix}.out`` files in input-xyz order ("train" or "test").
 
     No xyz re-read, no neighbor-list rebuild, no temp nep.txt model file.
 
@@ -712,6 +718,6 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                        natoms_g, volumes_g,
                        e_pred_g, e_ref_g,
                        f_pred_g, f_ref_g,
-                       v_pred_g, v_ref_g)
+                       v_pred_g, v_ref_g, suffix=suffix)
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")

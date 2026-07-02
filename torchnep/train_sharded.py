@@ -214,6 +214,8 @@ def train_nep_sharded(
     energy_key: str = "energy",
     use_gpumd_qscaler: bool = True,
     run_seed: int = None,
+    valid_file: str = None,
+    valid_ratio: float = None,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -240,6 +242,13 @@ def train_nep_sharded(
     (rank 0 draws it and broadcasts, so all replicas agree); pass an int for a
     fully reproducible run. It seeds the weight init and the per-epoch shuffle,
     and is saved into / restored from the checkpoint for exact resumption.
+
+    ``valid_file`` / ``valid_ratio`` mirror ``train_nep``: a validation set
+    (own .xyz, or a run_seed-drawn holdout fraction of data_file) evaluated
+    every epoch — nep_best and the plateau LR schedule then follow the
+    validation loss. The validation frames are sharded across ranks like the
+    training frames; the error sums are all-reduced, so every rank sees the
+    identical validation loss (schedulers stay in lock-step).
     """
     _clean_warning_format()
 
@@ -281,7 +290,30 @@ def train_nep_sharded(
     is_main = rank == 0
     dtype = torch.float32 if precision == "float32" else torch.float64
 
-    # ---- Master RNG seed -------------------------------------------------
+    # ---- Resume target + master RNG seed -----------------------------------
+    # Resolved BEFORE data loading: the validation split (valid_ratio) draws
+    # from the seed, so on resume the checkpoint's saved seed must win here —
+    # otherwise the resumed run would carve out a DIFFERENT validation subset
+    # and leak old validation frames into training. Only the seed is peeked;
+    # the full checkpoint restore happens after model/optimizer construction.
+    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    if resume_from is not None and finetune_from is not None:
+        raise ValueError("resume_from and finetune_from are mutually "
+                         "exclusive: resume_from continues a run, "
+                         "finetune_from starts a new one from weights")
+    resume_ckpt = None
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"resume_from: {resume_from} not found")
+        resume_ckpt = resume_from
+    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
+        resume_ckpt = ckpt_path
+    if resume_ckpt is not None:
+        _saved_seed = torch.load(resume_ckpt, map_location="cpu",
+                                 weights_only=False).get("run_seed")
+        if _saved_seed is not None:
+            run_seed = _saved_seed  # continue the original streams + split
+
     # rank 0 owns the seed (picks a random one when run_seed is None) and
     # broadcasts it so every replica seeds identically — the DDP wrapper later
     # broadcasts rank-0 weights anyway, but a shared seed also makes the
@@ -366,14 +398,47 @@ def train_nep_sharded(
     _log("Data")
     _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
-    n_total = len(frames)
-    _log(f"  read {n_total} structures from {data_file} "
+    _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
+
+    # ---- Validation set (same semantics as train_nep) ---------------------
+    # The ratio split draws from run_seed via a dedicated generator —
+    # identical on every rank (seed was broadcast above), so all ranks agree
+    # on the partition. Sorted indices keep *_test.out rows in input order.
+    if valid_file is not None and valid_ratio is not None:
+        raise ValueError("valid_file and valid_ratio are mutually exclusive")
+    valid_frames = None
+    if valid_file is not None:
+        valid_frames = read_xyz(valid_file, energy_key=energy_key)
+        _log(f"  read {len(valid_frames)} validation structures "
+             f"from {valid_file}")
+    elif valid_ratio is not None:
+        if not 0.0 < valid_ratio < 1.0:
+            raise ValueError(f"valid_ratio must be in (0, 1), "
+                             f"got {valid_ratio}")
+        vg = torch.Generator()
+        vg.manual_seed(run_seed)
+        vperm = torch.randperm(len(frames), generator=vg).tolist()
+        n_val = max(1, int(round(valid_ratio * len(frames))))
+        if n_val >= len(frames):
+            raise ValueError(f"valid_ratio={valid_ratio} leaves no "
+                             f"training frames ({len(frames)} total)")
+        val_idx = sorted(vperm[:n_val])
+        val_set = set(val_idx)
+        valid_frames = [frames[i] for i in val_idx]
+        frames = [f for i, f in enumerate(frames) if i not in val_set]
+        _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
+             f"validation, {len(frames)} remain for training "
+             f"(split drawn from run_seed)")
+    n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
     _slim_keep = None
     if slim_types:
         seen_species = set(s for f in frames for s in f["species"])
+        if valid_frames is not None:
+            seen_species |= set(s for f in valid_frames
+                                for s in f["species"])
         keep = [t for t in orig_config["type_names"] if t in seen_species]
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
@@ -429,7 +494,37 @@ def train_nep_sharded(
                 max_ang = max(max_ang, int(counts.max()))
         return max_rad, max_ang
 
+    # Validation frames: sharded across ranks with the same padded-perm
+    # scheme as the training frames (equal shard sizes keep the per-epoch
+    # eval time balanced; a padding duplicate contributes its error twice in
+    # both numerator and denominator of the all-reduced sums — loss-fair,
+    # same argument as the training shards).
+    structures_v = None
+    valid_local_global_idx = None
+    n_valid_total = 0
+    if valid_frames is not None:
+        n_valid_total = len(valid_frames)
+        vsh_g = torch.Generator()
+        vsh_g.manual_seed(0)
+        vperm_sh = torch.randperm(n_valid_total, generator=vsh_g).tolist()
+        n_vlocal = (n_valid_total + world_size - 1) // world_size  # ceil
+        vpad = n_vlocal * world_size - n_valid_total
+        if vpad:
+            vperm_sh = vperm_sh + vperm_sh[:vpad]
+        valid_local_global_idx = \
+            vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
+        structures_v = preprocess_structures(
+            [valid_frames[i] for i in valid_local_global_idx],
+            config, np_dtype)
+        del valid_frames
+
     local_max_rad, local_max_ang = _compute_max_neighbors_local(structures)
+    if structures_v is not None:
+        # nep.txt records max neighbor counts for MD buffer sizing — cover
+        # the validation frames too (folded into the same all-reduce).
+        v_max_rad, v_max_ang = _compute_max_neighbors_local(structures_v)
+        local_max_rad = max(local_max_rad, v_max_rad)
+        local_max_ang = max(local_max_ang, v_max_ang)
     nn_t = torch.tensor([local_max_rad, local_max_ang], dtype=torch.long,
                         device=dev)
     dist.all_reduce(nn_t, op=dist.ReduceOp.MAX)
@@ -438,6 +533,10 @@ def train_nep_sharded(
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
+    valid_store = None
+    if structures_v is not None:
+        valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        del structures_v
     if cuda_available:
         torch.cuda.synchronize()
     _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
@@ -450,6 +549,20 @@ def train_nep_sharded(
     dist.all_reduce(counts_t)
     g_n, g_ne, g_nf, g_nv = counts_t.tolist()
     _log(f"  coverage (global): {g_ne} E / {g_nf} F / {g_nv} V")
+    if valid_store is not None:
+        vcounts_t = torch.tensor(
+            [valid_store.n_energy, valid_store.n_forces,
+             valid_store.n_virial, int(valid_store.has_forces),
+             int(valid_store.has_virial)],
+            dtype=torch.long, device=dev)
+        dist.all_reduce(vcounts_t)
+        gv_ne, gv_nf, gv_nv = vcounts_t[:3].tolist()
+        # Global channel flags for the per-epoch validation eval — per-rank
+        # shards may lack a channel that other shards have.
+        valid_has_forces = bool(vcounts_t[3].item() > 0)
+        valid_has_virial = bool(vcounts_t[4].item() > 0)
+        _log(f"  validation coverage (global, incl. padding): "
+             f"{gv_ne} E / {gv_nf} F / {gv_nv} V")
     _log("")
 
     # ---- Model -----------------------------------------------------------
@@ -650,22 +763,14 @@ def train_nep_sharded(
         "stage2_pref_v": stage2_pref_v,
     }
 
-    ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    # resume_ckpt / ckpt_path were resolved before data loading (the seed
+    # peek); here the full training state is actually restored.
     start_epoch = 1
     best_loss = float("inf")
     best_true_loss = float("inf")
+    best_valid_loss = float("inf")
+    cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
-    if resume_from is not None and finetune_from is not None:
-        raise ValueError("resume_from and finetune_from are mutually "
-                         "exclusive: resume_from continues a run, "
-                         "finetune_from starts a new one from weights")
-    resume_ckpt = None
-    if resume_from is not None:
-        if not os.path.exists(resume_from):
-            raise FileNotFoundError(f"resume_from: {resume_from} not found")
-        resume_ckpt = resume_from
-    elif restart and os.path.exists(ckpt_path) and finetune_from is None:
-        resume_ckpt = ckpt_path
     if resume_ckpt is not None:
         # Every rank loads the same file; model weights go into raw_model
         # (the plain NEPModel — keeps checkpoints interchangeable with
@@ -678,11 +783,15 @@ def train_nep_sharded(
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
-        # Continue the original shuffle stream (all ranks read the same file,
-        # so run_seed stays consistent across ranks). Pre-tag checkpoints have
-        # none -> keep this run's seed.
-        if info.get("run_seed") is not None:
-            run_seed = info["run_seed"]
+        best_valid_loss = info["best_valid_loss"]
+        saved_valid_info = info.get("valid_info")
+        if saved_valid_info is not None and saved_valid_info != cur_valid_info:
+            _log("WARNING: validation settings changed since the checkpoint "
+                 "was saved — the train/valid split is NOT the one this run "
+                 "started with (old validation frames may enter training).")
+            _log(f"  saved:   {saved_valid_info}")
+            _log(f"  current: {cur_valid_info}")
+            best_valid_loss = float("inf")
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
@@ -700,6 +809,7 @@ def train_nep_sharded(
             _log(f"  current: {cur_loss_weights}")
             best_loss = float("inf")
             best_true_loss = float("inf")
+            best_valid_loss = float("inf")
 
     n_local = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -717,8 +827,15 @@ def train_nep_sharded(
                         or os.path.getsize(loss_log_path) == 0)
         loss_log = open(loss_log_path, "w" if start_epoch == 1 else "a")
         if write_header:
-            loss_log.write("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
-                           "rmse_v(eV/atom)  rmse_stress(GPa)\n")
+            hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
+                   "rmse_v(eV/atom)  rmse_stress(GPa)")
+            if valid_store is not None:
+                # GPUMD loss.out convention: train RMSEs, then test RMSEs.
+                # (The loss column is then the VALIDATION loss — it is what
+                # drives the scheduler and the best-model choice.)
+                hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
+                        "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+            loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
     # already printed by format_config_summary above; here we just announce
@@ -803,7 +920,9 @@ def train_nep_sharded(
                                 loss_weights=cur_loss_weights,
                                 in_stage2=False, swa_model=None,
                                 best_true_loss=best_true_loss,
-                                run_seed=run_seed)
+                                run_seed=run_seed,
+                                best_valid_loss=best_valid_loss,
+                                valid_info=cur_valid_info)
                             _log("Saved end-of-stage-1 checkpoint: "
                                  "checkpoint_stage1.pt (redo stage 2 from "
                                  "it via resume_from)")
@@ -811,6 +930,7 @@ def train_nep_sharded(
                             pg['lr'] = stage2_lr
                         best_loss = float("inf")
                         best_true_loss = float("inf")
+                        best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
                              f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
@@ -992,27 +1112,71 @@ def train_nep_sharded(
             rmse_f = np.sqrt(mse_f)                           # eV/A
             rmse_v = np.sqrt(mse_v)                           # eV/atom
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
+
+            # Validation (COLLECTIVE): each rank evaluates its valid shard
+            # with frozen weights, the error sums are all-reduced, so every
+            # rank sees the bit-identical validation loss — required because
+            # this loss drives the scheduler and best-save branch on all
+            # ranks. b1 stays train-fitted (never re-fitted on validation —
+            # that would leak validation info into the saved model).
+            valid_loss = None
+            if valid_store is not None:
+                v_sums = _accumulate_true_loss_sums(
+                    valid_store, batch_size, raw_model,
+                    raw_model.compute_properties, _shim._compute_cached,
+                    use_autograd_forces, train_backend,
+                    valid_has_forces and cur_pref_f > 0,
+                    valid_has_virial and cur_pref_v > 0, dtype, dev)
+                v_sums_t = torch.tensor(v_sums, device=dev,
+                                        dtype=torch.float64)
+                dist.all_reduce(v_sums_t)
+                (v_le, v_lf, v_lv, v_ls,
+                 v_ne, v_nf, v_nv, _) = v_sums_t.tolist()
+                v_mse_e = v_le / max(v_ne, 1.0)
+                v_mse_f = v_lf / max(v_nf, 1.0)
+                v_mse_v = v_lv / max(v_nv, 1.0)
+                v_mse_s = v_ls / max(v_nv, 1.0)
+                valid_loss = (cur_pref_e * v_mse_e + cur_pref_f * v_mse_f
+                              + cur_pref_v * v_mse_v)
+                v_rmse_e = np.sqrt(v_mse_e)
+                v_rmse_f = np.sqrt(v_mse_f)
+                v_rmse_v = np.sqrt(v_mse_v)
+                v_rmse_s = np.sqrt(v_mse_s) * EV_PER_A3_TO_GPa
             dt = time.time() - t_epoch
 
+            # With a validation set, the validation loss IS the run's loss:
+            # it drives the plateau scheduler, the best-model choice, and the
+            # displayed/logged "loss" value (the train RMSE columns remain).
+            sched_loss = valid_loss if valid_loss is not None else avg_loss
             if in_stage2 and stage2_scheduler is not None:
-                _scheduler_step(stage2_scheduler, avg_loss,
+                _scheduler_step(stage2_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
             elif not in_stage2:
-                _scheduler_step(lr_scheduler, avg_loss,
+                _scheduler_step(lr_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
 
             if is_main:
-                loss_log.write(f"{epoch} {avg_loss:.6e} {rmse_e:.6f} "
-                               f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}\n")
+                row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
+                       f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+                if valid_loss is not None:
+                    row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
+                            f"{v_rmse_s:.4f}")
+                loss_log.write(row + "\n")
                 loss_log.flush()
 
                 stage_str = "[S2] " if in_stage2 else ""
                 cur_lr = optimizer.param_groups[0]['lr']
                 v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                          if has_virial else "")
-                line = (f"{stage_str}Epoch {epoch:4d} | loss {avg_loss:.4e} | "
+                valid_str = ""
+                if valid_loss is not None:
+                    valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
+                                 + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
+                                    if has_virial else ""))
+                line = (f"{stage_str}Epoch {epoch:4d} | "
+                        f"loss {sched_loss:.4e} | "
                         f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                        f"{v_str} | gnorm {max_gn:.1f} | "
+                        f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                         f"lr {cur_lr:.2e} | {dt:.1f}s")
                 if epoch % print_interval == 0 or epoch == 1:
                     _log(line)
@@ -1033,7 +1197,16 @@ def train_nep_sharded(
             new_min = avg_loss < best_loss
             if new_min:
                 best_loss = avg_loss
-            if epoch < true_eval_start:
+            if valid_store is not None:
+                # Valid-based selection: valid_loss is already a frozen-
+                # weight true evaluation (all-reduced, identical on every
+                # rank), so the noisy-proxy / true-eval two-step below is
+                # unnecessary. Only rank 0 writes the file.
+                if valid_loss < best_valid_loss:
+                    best_valid_loss = valid_loss
+                    if is_main:
+                        _save_best()
+            elif epoch < true_eval_start:
                 if new_min and is_main:
                     _save_best()
             elif new_min or epoch == num_epochs:
@@ -1045,7 +1218,8 @@ def train_nep_sharded(
                 sums_t = torch.tensor(local_sums, device=dev,
                                       dtype=torch.float64)
                 dist.all_reduce(sums_t)
-                s_le, s_lf, s_lv, n_e, n_f, n_v, s_e_resid = sums_t.tolist()
+                (s_le, s_lf, s_lv, _s_ls,
+                 n_e, n_f, n_v, s_e_resid) = sums_t.tolist()
                 # Exact optimal b1 for these frozen weights, from the global
                 # (all-reduced) residual — identical on every rank.
                 delta = s_e_resid / n_e if n_e > 0 else 0.0
@@ -1069,7 +1243,9 @@ def train_nep_sharded(
                     epoch, best_loss, loss_weights=cur_loss_weights,
                     in_stage2=in_stage2,
                     swa_model=swa_model if in_stage2 else None,
-                    best_true_loss=best_true_loss, run_seed=run_seed)
+                    best_true_loss=best_true_loss, run_seed=run_seed,
+                    best_valid_loss=best_valid_loss,
+                    valid_info=cur_valid_info)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:
@@ -1089,6 +1265,13 @@ def train_nep_sharded(
                     output_dir=output_dir,
                     batch_size=batch_size, backend=backend,
                     verbose=False)
+                if valid_store is not None:
+                    predict_from_store_sharded(
+                        raw_model, valid_store, valid_local_global_idx,
+                        n_total_frames=n_valid_total,
+                        output_dir=output_dir,
+                        batch_size=batch_size, backend=backend,
+                        verbose=False, suffix="test")
     finally:
         if is_main and loss_log is not None:
             loss_log.close()
@@ -1112,7 +1295,11 @@ def train_nep_sharded(
         train_time = time.time() - train_t0
         h, rem = divmod(train_time, 3600)
         m_, s = divmod(rem, 60)
-        _log(f"\nDone. Best loss: {best_loss:.6e}")
+        if valid_store is not None:
+            _log(f"\nDone. Best validation loss (nep_best): "
+                 f"{best_valid_loss:.6e}")
+        else:
+            _log(f"\nDone. Best loss: {best_loss:.6e}")
         _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
         _log("\nRunning prediction on training set (final-epoch model)...")
@@ -1128,11 +1315,18 @@ def train_nep_sharded(
         output_dir=output_dir,
         batch_size=batch_size, backend=backend,
         verbose=is_main)
+    if valid_store is not None:
+        predict_from_store_sharded(
+            raw_model, valid_store, valid_local_global_idx,
+            n_total_frames=n_valid_total,
+            output_dir=output_dir,
+            batch_size=batch_size, backend=backend,
+            verbose=False, suffix="test")
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     # data_store is no longer needed — free it now that predict is done.
-    del data_store
+    del data_store, valid_store
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 

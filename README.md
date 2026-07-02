@@ -89,8 +89,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `lambda_e` | `0.01` | Energy loss weight |
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
-| `lambda_1` | `0.0` | L1 regularisation |
-| `lambda_2` | `0.0` | L2 regularisation (weight decay) |
+| `lambda_1` | `0.0` | L1 regularisation weight |
+| `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
@@ -127,6 +127,9 @@ function (`train_nep` / `train_nep_sharded`):
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
 | `use_gpumd_qscaler` | `True` | use GPUMD's `q_scaler` (coeffs `c=1`); fresh training only |
+| `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
+| `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
+| `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
 
 ---
 
@@ -140,11 +143,12 @@ function (`train_nep` / `train_nep_sharded`):
 | `checkpoint.pt`    | Full training state |
 | `checkpoint_stage1.pt` | Full end-of-Stage-1 checkpoint |
 | `output.log`       | Full console log |
-| `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa), gnorm |
+| `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa); with a validation set, four more columns (test RMSE_E/F/V/stress) and the loss column is the validation loss |
 | `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
 | `force_train.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
 | `virial_train.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
 | `stress_train.out` | Per-frame predicted vs reference stress (GPa) |
+| `*_test.out` | Same four files for the validation set (GPUMD `test.xyz` naming/format); only written when `valid_file`/`valid_ratio` is used |
 
 ---
 
@@ -156,6 +160,10 @@ function (`train_nep` / `train_nep_sharded`):
 # run_train.py
 from torchnep import train_nep
 train_nep("nep.in", "train.xyz", output_dir="output")
+
+# with a validation set (either form):
+train_nep("nep.in", "train.xyz", output_dir="output", valid_file="valid.xyz")
+train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
 ```
 
 ```bash
@@ -230,6 +238,8 @@ train_nep("nep.in", "train.xyz", output_dir="output",
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
 | `stage2_scheduler_patience` / `stage2_scheduler_factor` | Yes | Applied immediately to the Stage 2 scheduler |
 | `lr` (Stage 1) | **No** | Resume keeps the checkpoint's LR |
+| `run_seed` | **No** (ignored) | The checkpoint's saved seed wins on resume — keeps the shuffle stream and the `valid_ratio` split unchanged |
+| `valid_file` / `valid_ratio` | Not recommended | Changing them on resume changes the train/valid split — a warning is logged and the best-validation gate resets |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
 
 ---
