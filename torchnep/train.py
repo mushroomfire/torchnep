@@ -1101,6 +1101,7 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    sam_rho: float = 0.0,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1175,6 +1176,13 @@ def train_nep(
         run_seed, so it is reproducible for a given seed and is preserved
         exactly on resume (the checkpoint's seed wins). Mutually exclusive
         with valid_file.
+    sam_rho : SAM (sharpness-aware minimization) radius rho, default 0 = off.
+        Each step the gradient is re-evaluated at the L2 worst-case weight
+        perturbation eps = rho * g/||g|| and the optimizer steps with THAT
+        gradient — descending on sharpness as well as loss. Flat minima give
+        smoother potentials with tamer extrapolation (the same implicit bias
+        SNES gets from its population noise). Costs a second forward+backward
+        per step (~2x epoch time). Typical range 0.01-0.1.
     """
     _clean_warning_format()
 
@@ -1541,6 +1549,49 @@ def train_nep(
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
 
+    def _sam_batch_loss(batch, hf, hv, pe, pf, pv):
+        """Weighted data loss of ``batch`` at the CURRENT weights — SAM's
+        second pass. Mirrors the epoch-loop loss construction exactly (same
+        masks, prefs and per-sample averaging) but skips every logging
+        accumulator; keep the two in sync when editing either.
+        """
+        if use_autograd_forces:
+            result = compute_props(
+                batch["rij_rad"], batch["rij_ang"],
+                batch["pair_i_rad"], batch["pair_j_rad"],
+                batch["pair_i_ang"], batch["pair_j_ang"],
+                batch["atom_types"], batch["N"],
+                batch["struct_idx"], batch["num_structures"],
+                need_forces=hf, need_virial=hv, backend=backend)
+        else:
+            result = compute_props_cached(
+                batch, need_forces=hf, need_virial=hv,
+                backend=train_backend)
+        loss = torch.tensor(0.0, dtype=dtype, device=dev)
+        e_mask = batch["energy_mask"]
+        if e_mask.any():
+            e_pa_pred = result["Etot"] / batch["natoms"]
+            e_pa_ref = batch["energy"] / batch["natoms"]
+            loss = loss + pe * _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
+        if hf:
+            f_mask = batch["force_mask"]
+            if f_mask.any():
+                loss = loss + pf * _loss_fn(result["forces"][f_mask],
+                                            batch["forces"][f_mask])
+        if hv and "virial" in result and batch["virial"].shape[1] == 9:
+            v_mask = batch["virial_mask"]
+            if v_mask.any():
+                v_atom = result["virial"]
+                v_sys = torch.zeros(batch["num_structures"], 9,
+                                    dtype=dtype, device=dev)
+                si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
+                v_sys.scatter_add_(0, si, v_atom)
+                na = batch["natoms"][v_mask].unsqueeze(-1)
+                loss = loss + pv * _loss_fn(
+                    v_sys[:, _VIRIAL_6][v_mask] / na,
+                    batch["virial"][:, _VIRIAL_6][v_mask] / na)
+        return loss
+
     swa_model = None
     stage2_scheduler = None
     if stage2:
@@ -1639,6 +1690,9 @@ def train_nep(
     true_eval_start = (2 * num_epochs) // 3 + 1
     _log("")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
+    if sam_rho > 0:
+        _log(f"SAM: rho={sam_rho} (worst-case gradient, "
+             f"2 forward/backward passes per step)")
     _log("=" * 72)
 
     def _save_best():
@@ -1813,6 +1867,37 @@ def train_nep(
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # SAM two-pass step (Foret et al. 2021). eps is the L2
+                # worst-case ascent direction of radius rho; the gradient
+                # re-evaluated there replaces the plain one, so the optimizer
+                # descends on sharpness too. Fully fused + sync-free: the
+                # scale is a 0-dim GPU tensor (no .item()), and a zero/NaN
+                # first gradient makes scale 0 -> eps 0 -> pass 2 harmlessly
+                # recomputes the same point (the existing non-finite gnorm
+                # check below still skips the step). Stats (sum_l*) were
+                # already taken from pass 1; reg/clipping act on the SAM
+                # gradient below, exactly as they act on the plain gradient.
+                if sam_rho > 0:
+                    with torch.no_grad():
+                        sam_params = [p for p in trainable_params
+                                      if p.grad is not None]
+                        sam_grads = [p.grad for p in sam_params]
+                        gn_sam = torch.linalg.vector_norm(
+                            torch.stack(torch._foreach_norm(sam_grads)))
+                        scale = torch.where(
+                            torch.isfinite(gn_sam) & (gn_sam > 0),
+                            sam_rho / (gn_sam + 1e-12),
+                            torch.zeros_like(gn_sam))
+                        eps = torch._foreach_mul(sam_grads, scale)
+                        torch._foreach_add_(sam_params, eps)
+                    optimizer.zero_grad(set_to_none=True)
+                    sam_loss = _sam_batch_loss(
+                        batch, has_forces, has_virial,
+                        cur_pref_e, cur_pref_f, cur_pref_v)
+                    sam_loss.backward()
+                    with torch.no_grad():
+                        torch._foreach_sub_(sam_params, eps)
 
                 # GPUMD-style regularization (snes.cu:524-525): the gradient of
                 # λ₁·mean(|w|) + λ₂·RMS(w) is added straight into .grad, fused

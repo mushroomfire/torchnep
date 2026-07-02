@@ -216,6 +216,7 @@ def train_nep_sharded(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    sam_rho: float = 0.0,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -249,6 +250,13 @@ def train_nep_sharded(
     validation loss. The validation frames are sharded across ranks like the
     training frames; the error sums are all-reduced, so every rank sees the
     identical validation loss (schedulers stay in lock-step).
+
+    ``sam_rho`` mirrors ``train_nep`` (SAM flat-minimum training, 0 = off).
+    DDP-safe by construction: the first backward all-reduces the gradient,
+    so every rank computes the IDENTICAL perturbation eps and the replicas
+    never drift; the second backward all-reduces the SAM gradient the
+    optimizer steps with. Costs a second forward+backward (+1 all-reduce)
+    per step.
     """
     _clean_warning_format()
 
@@ -742,6 +750,44 @@ def train_nep_sharded(
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
 
+    def _sam_batch_loss(batch, hf, hv, pe, pf, pv, n_e_g, n_f_g, n_v_g):
+        """Weighted data loss of ``batch`` at the CURRENT weights — SAM's
+        second pass. Mirrors the epoch-loop loss construction exactly
+        (sum-of-squares over GLOBAL counts, * world_size to cancel DDP's
+        gradient averaging) but skips every logging accumulator; keep the
+        two in sync when editing either. Reuses the batch's already
+        all-reduced counts — no extra collective. Forward goes through the
+        DDP wrapper so the reducer arms the backward all-reduce.
+        """
+        result = model(batch, use_autograd_forces, hf, hv, train_backend)
+        ws = float(world_size)
+        loss = torch.tensor(0.0, dtype=dtype, device=dev)
+        e_mask = batch["energy_mask"]
+        if e_mask.any():
+            e_pa_pred = result["Etot"] / batch["natoms"]
+            e_pa_ref = batch["energy"] / batch["natoms"]
+            diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
+            loss = loss + pe * (diff_e ** 2).sum() * ws / n_e_g
+        if hf:
+            f_mask = batch["force_mask"]
+            if f_mask.any():
+                sum_sq_f = ((result["forces"][f_mask]
+                             - batch["forces"][f_mask]) ** 2).sum()
+                loss = loss + pf * sum_sq_f * ws / (3.0 * n_f_g)
+        if hv and "virial" in result and batch["virial"].shape[1] == 9:
+            v_mask = batch["virial_mask"]
+            if v_mask.any():
+                v_atom = result["virial"]
+                v_sys = torch.zeros(batch["num_structures"], 9,
+                                    dtype=dtype, device=dev)
+                si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
+                v_sys.scatter_add_(0, si, v_atom)
+                na = batch["natoms"][v_mask].unsqueeze(-1)
+                v_diff = (v_sys[:, _VIRIAL_6][v_mask]
+                          - batch["virial"][:, _VIRIAL_6][v_mask]) / na
+                loss = loss + pv * (v_diff ** 2).sum() * ws / (6.0 * n_v_g)
+        return loss
+
     swa_model = None
     stage2_scheduler = None
     if stage2:
@@ -845,6 +891,9 @@ def train_nep_sharded(
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
     _log("")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
+    if sam_rho > 0:
+        _log(f"SAM: rho={sam_rho} (worst-case gradient, "
+             f"2 forward/backward passes per step)")
     _log("=" * 72)
 
     # In the last third of the run a candidate best is verified by a
@@ -1037,6 +1086,35 @@ def train_nep_sharded(
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+
+                # SAM two-pass step — see train.py for the algorithm notes.
+                # DDP: the first backward has already ALL-REDUCED the
+                # gradient, so gn_sam/eps are bit-identical on every rank
+                # and the perturbed replicas stay in sync; the second
+                # backward all-reduces the SAM gradient. Sync-free scale
+                # (0-dim GPU tensor); zero/NaN first gradient -> eps 0 ->
+                # harmless recompute, caught by the gnorm check below.
+                if sam_rho > 0:
+                    with torch.no_grad():
+                        sam_params = [p for p in trainable_params
+                                      if p.grad is not None]
+                        sam_grads = [p.grad for p in sam_params]
+                        gn_sam = torch.linalg.vector_norm(
+                            torch.stack(torch._foreach_norm(sam_grads)))
+                        scale = torch.where(
+                            torch.isfinite(gn_sam) & (gn_sam > 0),
+                            sam_rho / (gn_sam + 1e-12),
+                            torch.zeros_like(gn_sam))
+                        eps = torch._foreach_mul(sam_grads, scale)
+                        torch._foreach_add_(sam_params, eps)
+                    optimizer.zero_grad(set_to_none=True)
+                    sam_loss = _sam_batch_loss(
+                        batch, has_forces, has_virial,
+                        cur_pref_e, cur_pref_f, cur_pref_v,
+                        n_e_g, n_f_g, n_v_g)
+                    sam_loss.backward()
+                    with torch.no_grad():
+                        torch._foreach_sub_(sam_params, eps)
 
                 # GPUMD-style regularization (snes.cu:524-525): gradient of
                 # λ₁·mean(|w|) + λ₂·RMS(w) added into .grad, fused across params
