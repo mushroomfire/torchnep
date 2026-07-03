@@ -131,6 +131,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
 | `sam_rho` | `0.0` | SAM (sharpness-aware minimization) radius; `0` = off. Steps with the gradient re-evaluated at the worst-case weight perturbation of L2 radius ρ — flatter minima, smoother extrapolation, ~2× time per epoch. Typical `0.01–0.1` |
+| `sam_interval` | `1` | apply SAM only every N-th minibatch (plain step otherwise) — keeps most of the benefit at ~1/N overhead (N=2 → ~1.5×, N=4 → ~1.25× epoch time) |
 
 ---
 

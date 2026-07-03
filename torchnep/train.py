@@ -1102,6 +1102,7 @@ def train_nep(
     valid_file: str = None,
     valid_ratio: float = None,
     sam_rho: float = 0.0,
+    sam_interval: int = 1,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1183,6 +1184,12 @@ def train_nep(
         smoother potentials with tamer extrapolation (the same implicit bias
         SNES gets from its population noise). Costs a second forward+backward
         per step (~2x epoch time). Typical range 0.01-0.1.
+    sam_interval : apply the SAM two-pass step only every N-th minibatch
+        (plain Adam step otherwise), default 1 = every step. Periodic SAM
+        keeps most of the flat-minimum benefit at a fraction of the cost
+        (ESAM/LookSAM-style): overhead is ~1/N, so N=2 -> ~1.5x epoch time,
+        N=4 -> ~1.25x. The phase is batch-index based, so it is stable
+        across epochs and resume.
     """
     _clean_warning_format()
 
@@ -1691,8 +1698,12 @@ def train_nep(
     _log("")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
     if sam_rho > 0:
-        _log(f"SAM: rho={sam_rho} (worst-case gradient, "
-             f"2 forward/backward passes per step)")
+        if sam_interval < 1:
+            raise ValueError(f"sam_interval must be >= 1, got {sam_interval}")
+        every = ("every step" if sam_interval == 1
+                 else f"every {sam_interval} steps")
+        _log(f"SAM: rho={sam_rho}, applied {every} "
+             f"(2 forward/backward passes on SAM steps)")
     _log("=" * 72)
 
     def _save_best():
@@ -1878,7 +1889,7 @@ def train_nep(
                 # check below still skips the step). Stats (sum_l*) were
                 # already taken from pass 1; reg/clipping act on the SAM
                 # gradient below, exactly as they act on the plain gradient.
-                if sam_rho > 0:
+                if sam_rho > 0 and (start // batch_size) % sam_interval == 0:
                     with torch.no_grad():
                         sam_params = [p for p in trainable_params
                                       if p.grad is not None]

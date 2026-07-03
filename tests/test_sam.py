@@ -62,6 +62,22 @@ def test_sam_runs_and_is_reproducible(tmp_path):
             == (tmp_path / "b" / "nep_final.txt").read_text())
 
 
+def test_sam_interval(tmp_path):
+    """sam_interval=2 runs, is reproducible, and differs from interval=1."""
+    nepin, xyz = _write_run_files(tmp_path)
+    _train(nepin, xyz, tmp_path / "i2", run_seed=7, sam_rho=0.05,
+           sam_interval=2)
+    _train(nepin, xyz, tmp_path / "i2b", run_seed=7, sam_rho=0.05,
+           sam_interval=2)
+    _train(nepin, xyz, tmp_path / "i1", run_seed=7, sam_rho=0.05,
+           sam_interval=1)
+    assert np.isfinite(_last_loss(tmp_path / "i2"))
+    assert ((tmp_path / "i2" / "nep_final.txt").read_text()
+            == (tmp_path / "i2b" / "nep_final.txt").read_text())
+    assert ((tmp_path / "i2" / "nep_final.txt").read_text()
+            != (tmp_path / "i1" / "nep_final.txt").read_text())
+
+
 def test_sam_changes_training(tmp_path):
     """Same seed, sam on vs off -> different weights (the perturbed
     gradient actually reaches the optimizer)."""

@@ -217,6 +217,7 @@ def train_nep_sharded(
     valid_file: str = None,
     valid_ratio: float = None,
     sam_rho: float = 0.0,
+    sam_interval: int = 1,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -256,7 +257,9 @@ def train_nep_sharded(
     so every rank computes the IDENTICAL perturbation eps and the replicas
     never drift; the second backward all-reduces the SAM gradient the
     optimizer steps with. Costs a second forward+backward (+1 all-reduce)
-    per step.
+    per step. ``sam_interval`` applies SAM only every N-th minibatch
+    (overhead ~1/N); the batch-index phase is identical on every rank, so
+    all ranks take the SAM branch in lock-step.
     """
     _clean_warning_format()
 
@@ -892,8 +895,12 @@ def train_nep_sharded(
     _log("")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
     if sam_rho > 0:
-        _log(f"SAM: rho={sam_rho} (worst-case gradient, "
-             f"2 forward/backward passes per step)")
+        if sam_interval < 1:
+            raise ValueError(f"sam_interval must be >= 1, got {sam_interval}")
+        every = ("every step" if sam_interval == 1
+                 else f"every {sam_interval} steps")
+        _log(f"SAM: rho={sam_rho}, applied {every} "
+             f"(2 forward/backward passes on SAM steps)")
     _log("=" * 72)
 
     # In the last third of the run a candidate best is verified by a
@@ -1094,7 +1101,7 @@ def train_nep_sharded(
                 # backward all-reduces the SAM gradient. Sync-free scale
                 # (0-dim GPU tensor); zero/NaN first gradient -> eps 0 ->
                 # harmless recompute, caught by the gnorm check below.
-                if sam_rho > 0:
+                if sam_rho > 0 and (start // batch_size) % sam_interval == 0:
                     with torch.no_grad():
                         sam_params = [p for p in trainable_params
                                       if p.grad is not None]
