@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 Data-sharded distributed NEP training.
@@ -582,20 +582,29 @@ def train_nep_sharded(
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
 
-    # use_gpumd_qscaler: reproduce GPUMD's init (descriptor coeffs uniform(-1,1)
-    # + c=1 q_scaler). Re-init on rank 0 then broadcast so every replica starts
-    # identical; skipped under finetune_from (keep the loaded coefficients).
+    # use_gpumd_qscaler: reproduce GPUMD's init (SNES mu init — every parameter
+    # uniform(-1,1): descriptor coeffs AND NN weights — plus the c=1 q_scaler).
+    # Re-init on rank 0 then broadcast so every replica starts identical;
+    # skipped under finetune_from (keep the loaded parameters).
     if use_gpumd_qscaler and finetune_from is None:
         with torch.no_grad():
             if rank == 0:
                 torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
                 if model.c_param_3 is not None:
                     torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
+                for net in model.fitting_nets:
+                    torch.nn.init.uniform_(net.w0, -1.0, 1.0)
+                    torch.nn.init.uniform_(net.b0, -1.0, 1.0)
+                    torch.nn.init.uniform_(net.w1, -1.0, 1.0)
             dist.broadcast(model.c_param_2.data, src=0)
             if model.c_param_3 is not None:
                 dist.broadcast(model.c_param_3.data, src=0)
-        _log("  use_gpumd_qscaler: descriptor coeffs re-init uniform(-1,1), "
-             "q_scaler will use c=1 (GPUMD-consistent)")
+            for net in model.fitting_nets:
+                dist.broadcast(net.w0.data, src=0)
+                dist.broadcast(net.b0.data, src=0)
+                dist.broadcast(net.w1.data, src=0)
+        _log("  use_gpumd_qscaler: descriptor coeffs + NN weights re-init "
+             "uniform(-1,1), q_scaler will use c=1 (GPUMD-consistent)")
 
     # b1 (global energy offset) is determined analytically (folded into the
     # training pass + the best-model eval), not by gradient descent — keep it

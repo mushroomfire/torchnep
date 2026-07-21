@@ -1,4 +1,6 @@
 /.*/
+# ...but keep the GitHub Actions workflows tracked.
+!/.github/
 /*/__py*/
 /*info
 /example/*ipynb*

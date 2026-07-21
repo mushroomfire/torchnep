@@ -1,15 +1,15 @@
-# Copyright 2025 Yongchao Wu and the GPUMD development team
-# This file is part of GPUMD (Torchnep project).
-# GPUMD is free software: you can redistribute it and/or modify
+# Copyright 2025 Yongchao Wu
+# This file is part of the TorchNEP project.
+# TorchNEP is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# GPUMD is distributed in the hope that it will be useful,
+# TorchNEP is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 # You should have received a copy of the GNU General Public License
-# along with GPUMD.  If not, see <http://www.gnu.org/licenses/>.
+# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
 """
 NEP training with PyTorch — single-GPU / CPU entry point.
@@ -1154,12 +1154,14 @@ def train_nep(
     energy_key : name of the comment-line tag read as the reference energy
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
-    use_gpumd_qscaler : Default True — reproduce GPUMD's initialization:
-        descriptor coefficients are re-initialised uniform(-1, 1) and the
-        q_scaler is computed with all coefficients = 1.0 (GPUMD's generation-0
-        ``initial_para``). False uses the self-consistent q_scaler (computed
-        from the model's actual init coefficients). Only applies to fresh
-        training (ignored under finetune_from).
+    use_gpumd_qscaler : Default True — reproduce GPUMD's initialization: every
+        parameter is re-initialised uniform(-1, 1) — the descriptor
+        coefficients AND the NN weights (w0/b0/w1), matching SNES's mu init —
+        and the q_scaler is computed with all coefficients = 1.0 (GPUMD's
+        generation-0 ``initial_para``). False leaves torch's default NN init in
+        place and uses the self-consistent q_scaler (computed from the model's
+        actual init coefficients). Only applies to fresh training (ignored
+        under finetune_from).
     run_seed : master RNG seed for this run. None (default) -> a fresh random
         seed each run, so repeated runs differ (independent weight init AND
         per-epoch batch shuffle) — the stochastic-testing behaviour. Pass an
@@ -1403,17 +1405,25 @@ def train_nep(
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
 
-    # use_gpumd_qscaler: reproduce GPUMD's init for fresh training — descriptor
-    # coefficients uniform(-1, 1) (GPUMD initialises every parameter this way)
-    # paired with the c=1 q_scaler computed below. Skipped under finetune_from,
-    # where the loaded trained coefficients must be kept.
+    # use_gpumd_qscaler: reproduce GPUMD's init for fresh training. GPUMD (SNES
+    # mu init, snes.cu initialize_mu_and_sigma) draws EVERY parameter
+    # uniform(-1, 1) — both the descriptor coefficients and the NN weights — so
+    # to stay consistent we re-init both here, paired with the c=1 q_scaler
+    # computed below. Re-initialising the descriptor coeffs alone would leave the
+    # NN at torch's small-variance init, whose shallow binding landscape does not
+    # match the one GPUMD's models inherit from their large init. Skipped under
+    # finetune_from, where the loaded trained parameters must be kept.
     if use_gpumd_qscaler and finetune_from is None:
         with torch.no_grad():
             torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
             if model.c_param_3 is not None:
                 torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
-        _log("  use_gpumd_qscaler: descriptor coeffs re-init uniform(-1,1), "
-             "q_scaler will use c=1 (GPUMD-consistent)")
+            for net in model.fitting_nets:
+                torch.nn.init.uniform_(net.w0, -1.0, 1.0)
+                torch.nn.init.uniform_(net.b0, -1.0, 1.0)
+                torch.nn.init.uniform_(net.w1, -1.0, 1.0)
+        _log("  use_gpumd_qscaler: descriptor coeffs + NN weights re-init "
+             "uniform(-1,1), q_scaler will use c=1 (GPUMD-consistent)")
 
     # b1 (global energy offset) is determined analytically each epoch, not by
     # gradient descent (see recompute_b1_shift) — exclude it from the optimizer.

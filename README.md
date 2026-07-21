@@ -25,7 +25,8 @@ pip install torchnep -U
 or install from source code:
 
 ```bash
-cd GPUMD/torchnep
+git clone https://github.com/mushroomfire/torchnep.git
+cd torchnep
 pip install .
 ```
 
