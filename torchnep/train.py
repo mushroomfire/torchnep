@@ -40,7 +40,7 @@ from datetime import datetime
 from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
-from .model import NEPModel, slim_model
+from .model import NEPModel, slim_model, gpumd_init_parameters
 from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
@@ -451,7 +451,7 @@ class GPUDataStore:
                               dtype=self.dtype, device=self.device)
 
         volumes = self.volumes[torch.as_tensor(indices, device=self.device,
-                                                dtype=torch.long)]
+                                               dtype=torch.long)]
 
         batch = {
             "N": N_total, "num_structures": B,
@@ -1101,8 +1101,6 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    sam_rho: float = 0.0,
-    sam_interval: int = 1,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1179,19 +1177,6 @@ def train_nep(
         run_seed, so it is reproducible for a given seed and is preserved
         exactly on resume (the checkpoint's seed wins). Mutually exclusive
         with valid_file.
-    sam_rho : SAM (sharpness-aware minimization) radius rho, default 0 = off.
-        Each step the gradient is re-evaluated at the L2 worst-case weight
-        perturbation eps = rho * g/||g|| and the optimizer steps with THAT
-        gradient — descending on sharpness as well as loss. Flat minima give
-        smoother potentials with tamer extrapolation (the same implicit bias
-        SNES gets from its population noise). Costs a second forward+backward
-        per step (~2x epoch time). Typical range 0.01-0.1.
-    sam_interval : apply the SAM two-pass step only every N-th minibatch
-        (plain Adam step otherwise), default 1 = every step. Periodic SAM
-        keeps most of the flat-minimum benefit at a fraction of the cost
-        (ESAM/LookSAM-style): overhead is ~1/N, so N=2 -> ~1.5x epoch time,
-        N=4 -> ~1.25x. The phase is batch-index based, so it is stable
-        across epochs and resume.
     """
     _clean_warning_format()
 
@@ -1240,6 +1225,7 @@ def train_nep(
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
+    early_stop         = int(config.get("early_stop", 0))  # 0 = off
     scheduler_factor   = config["scheduler_factor"]
     lr_scheduler_mode  = config["lr_scheduler"]     # "plateau" | "step"
     max_grad_norm      = config["max_grad_norm"]
@@ -1414,14 +1400,7 @@ def train_nep(
     # match the one GPUMD's models inherit from their large init. Skipped under
     # finetune_from, where the loaded trained parameters must be kept.
     if use_gpumd_qscaler and finetune_from is None:
-        with torch.no_grad():
-            torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
-            if model.c_param_3 is not None:
-                torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
-            for net in model.fitting_nets:
-                torch.nn.init.uniform_(net.w0, -1.0, 1.0)
-                torch.nn.init.uniform_(net.b0, -1.0, 1.0)
-                torch.nn.init.uniform_(net.w1, -1.0, 1.0)
+        gpumd_init_parameters(model)
         _log("  use_gpumd_qscaler: descriptor coeffs + NN weights re-init "
              "uniform(-1,1), q_scaler will use c=1 (GPUMD-consistent)")
 
@@ -1566,49 +1545,6 @@ def train_nep(
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
 
-    def _sam_batch_loss(batch, hf, hv, pe, pf, pv):
-        """Weighted data loss of ``batch`` at the CURRENT weights — SAM's
-        second pass. Mirrors the epoch-loop loss construction exactly (same
-        masks, prefs and per-sample averaging) but skips every logging
-        accumulator; keep the two in sync when editing either.
-        """
-        if use_autograd_forces:
-            result = compute_props(
-                batch["rij_rad"], batch["rij_ang"],
-                batch["pair_i_rad"], batch["pair_j_rad"],
-                batch["pair_i_ang"], batch["pair_j_ang"],
-                batch["atom_types"], batch["N"],
-                batch["struct_idx"], batch["num_structures"],
-                need_forces=hf, need_virial=hv, backend=backend)
-        else:
-            result = compute_props_cached(
-                batch, need_forces=hf, need_virial=hv,
-                backend=train_backend)
-        loss = torch.tensor(0.0, dtype=dtype, device=dev)
-        e_mask = batch["energy_mask"]
-        if e_mask.any():
-            e_pa_pred = result["Etot"] / batch["natoms"]
-            e_pa_ref = batch["energy"] / batch["natoms"]
-            loss = loss + pe * _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
-        if hf:
-            f_mask = batch["force_mask"]
-            if f_mask.any():
-                loss = loss + pf * _loss_fn(result["forces"][f_mask],
-                                            batch["forces"][f_mask])
-        if hv and "virial" in result and batch["virial"].shape[1] == 9:
-            v_mask = batch["virial_mask"]
-            if v_mask.any():
-                v_atom = result["virial"]
-                v_sys = torch.zeros(batch["num_structures"], 9,
-                                    dtype=dtype, device=dev)
-                si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                v_sys.scatter_add_(0, si, v_atom)
-                na = batch["natoms"][v_mask].unsqueeze(-1)
-                loss = loss + pv * _loss_fn(
-                    v_sys[:, _VIRIAL_6][v_mask] / na,
-                    batch["virial"][:, _VIRIAL_6][v_mask] / na)
-        return loss
-
     swa_model = None
     stage2_scheduler = None
     if stage2:
@@ -1706,20 +1642,28 @@ def train_nep(
     # written (see the best-save block in the loop).
     true_eval_start = (2 * num_epochs) // 3 + 1
     _log("")
+    if early_stop:
+        monitored = "validation loss" if valid_store is not None else "train loss"
+        if early_stop <= scheduler_patience:
+            _log(f"WARNING: early_stop ({early_stop}) <= scheduler_patience "
+                 f"({scheduler_patience}); the LR may never decay before the "
+                 f"run stops. Use early_stop > scheduler_patience.")
+        _log(f"Early stopping: stop if {monitored} does not improve for "
+             f"{early_stop} epochs")
     _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
-    if sam_rho > 0:
-        if sam_interval < 1:
-            raise ValueError(f"sam_interval must be >= 1, got {sam_interval}")
-        every = ("every step" if sam_interval == 1
-                 else f"every {sam_interval} steps")
-        _log(f"SAM: rho={sam_rho}, applied {every} "
-             f"(2 forward/backward passes on SAM steps)")
     _log("=" * 72)
 
     def _save_best():
         raw_model.save_nep_txt(
             os.path.join(output_dir, "nep_best.txt"),
             max_NN_rad, max_NN_ang)
+
+    # Early-stopping tracker on the monitored metric (sched_loss: validation
+    # loss when a valid set is present, else the epoch train loss). Reset when
+    # stage 2 starts, since the loss scale changes with the stage-2 weights.
+    es_best = float("inf")
+    es_wait = 0
+    prev_in_stage2 = False
 
     train_t0 = time.time()
 
@@ -1889,37 +1833,6 @@ def train_nep(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # SAM two-pass step (Foret et al. 2021). eps is the L2
-                # worst-case ascent direction of radius rho; the gradient
-                # re-evaluated there replaces the plain one, so the optimizer
-                # descends on sharpness too. Fully fused + sync-free: the
-                # scale is a 0-dim GPU tensor (no .item()), and a zero/NaN
-                # first gradient makes scale 0 -> eps 0 -> pass 2 harmlessly
-                # recomputes the same point (the existing non-finite gnorm
-                # check below still skips the step). Stats (sum_l*) were
-                # already taken from pass 1; reg/clipping act on the SAM
-                # gradient below, exactly as they act on the plain gradient.
-                if sam_rho > 0 and (start // batch_size) % sam_interval == 0:
-                    with torch.no_grad():
-                        sam_params = [p for p in trainable_params
-                                      if p.grad is not None]
-                        sam_grads = [p.grad for p in sam_params]
-                        gn_sam = torch.linalg.vector_norm(
-                            torch.stack(torch._foreach_norm(sam_grads)))
-                        scale = torch.where(
-                            torch.isfinite(gn_sam) & (gn_sam > 0),
-                            sam_rho / (gn_sam + 1e-12),
-                            torch.zeros_like(gn_sam))
-                        eps = torch._foreach_mul(sam_grads, scale)
-                        torch._foreach_add_(sam_params, eps)
-                    optimizer.zero_grad(set_to_none=True)
-                    sam_loss = _sam_batch_loss(
-                        batch, has_forces, has_virial,
-                        cur_pref_e, cur_pref_f, cur_pref_v)
-                    sam_loss.backward()
-                    with torch.no_grad():
-                        torch._foreach_sub_(sam_params, eps)
-
                 # GPUMD-style regularization (snes.cu:524-525): the gradient of
                 # λ₁·mean(|w|) + λ₂·RMS(w) is added straight into .grad, fused
                 # across all parameters with torch._foreach_* (no autograd
@@ -2014,6 +1927,26 @@ def train_nep(
                 _scheduler_step(lr_scheduler, sched_loss,
                                 lr_scheduler_mode, optimizer, stop_lr)
 
+            # Early stopping on the monitored metric. Improvement uses the same
+            # 1e-4 relative threshold as ReduceLROnPlateau, so "no improvement"
+            # means the same thing to both. The counter resets when stage 2
+            # begins (the loss scale shifts with the stage-2 weights). In DDP
+            # every rank sees the identical (all-reduced) sched_loss, so all
+            # ranks reach the same decision and stop together.
+            stop_now = False
+            if early_stop:
+                if in_stage2 and not prev_in_stage2:
+                    es_best = float("inf")
+                    es_wait = 0
+                if sched_loss < es_best * (1.0 - 1e-4):
+                    es_best = sched_loss
+                    es_wait = 0
+                else:
+                    es_wait += 1
+                    if es_wait >= early_stop:
+                        stop_now = True
+            prev_in_stage2 = in_stage2
+
             row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
                    f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
             if valid_loss is not None:
@@ -2068,7 +2001,7 @@ def train_nep(
             elif epoch < true_eval_start:
                 if new_min:
                     _save_best()
-            elif new_min or epoch == num_epochs:
+            elif new_min or epoch == num_epochs or stop_now:
                 t_loss, _te, _tf, _tv = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
@@ -2078,7 +2011,7 @@ def train_nep(
                     best_true_loss = t_loss
                     _save_best()
 
-            if epoch % checkpoint_interval == 0 or epoch == num_epochs:
+            if epoch % checkpoint_interval == 0 or epoch == num_epochs or stop_now:
                 _save_checkpoint(
                     ckpt_path, model, optimizer,
                     stage2_scheduler if in_stage2 else lr_scheduler,
@@ -2111,6 +2044,12 @@ def train_nep(
                                        batch_size=batch_size,
                                        backend=backend, verbose=False,
                                        suffix="test")
+
+            if stop_now:
+                _log(f"Early stop: {monitored} did not improve for "
+                     f"{early_stop} epochs (stopped at epoch {epoch}/"
+                     f"{num_epochs}).")
+                break
     finally:
         if loss_log is not None:
             loss_log.close()

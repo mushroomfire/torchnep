@@ -317,6 +317,8 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lr"] = float(parts[1])
             elif key == "scheduler_patience":
                 params["scheduler_patience"] = int(parts[1])
+            elif key == "early_stop":
+                params["early_stop"] = int(parts[1])
             elif key == "scheduler_factor":
                 params["scheduler_factor"] = float(parts[1])
             elif key == "stop_lr":
@@ -369,6 +371,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
     params.setdefault("scheduler_patience", 15)
+    params.setdefault("early_stop", 0)
     params.setdefault("scheduler_factor", 0.7)
     params.setdefault("lr_scheduler", "plateau")
     params.setdefault("max_grad_norm", 10.0)

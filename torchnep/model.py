@@ -587,6 +587,26 @@ class NEPModel(nn.Module):
             f.write("\n".join(lines) + "\n")
 
 
+@torch.no_grad()
+def gpumd_init_parameters(model: NEPModel) -> None:
+    """Re-initialise every trainable parameter uniform(-1, 1) in place — the
+    SNES ``mu`` init GPUMD starts from (``snes.cu`` initialize_mu_and_sigma).
+
+    Both the descriptor coefficients (``c_param_2`` / ``c_param_3``) and the
+    fitting-network weights (``w0`` / ``b0`` / ``w1``) are covered, so a model
+    trained on top of GPUMD's ``c=1`` q_scaler starts from the same
+    large-amplitude landscape GPUMD's models inherit. Used for fresh training
+    only (never on a fine-tuned / loaded model, whose weights must be kept).
+    """
+    torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
+    if model.c_param_3 is not None:
+        torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
+    for net in model.fitting_nets:
+        torch.nn.init.uniform_(net.w0, -1.0, 1.0)
+        torch.nn.init.uniform_(net.b0, -1.0, 1.0)
+        torch.nn.init.uniform_(net.w1, -1.0, 1.0)
+
+
 def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
     """Return a new NEPModel containing only the specified element types.
 

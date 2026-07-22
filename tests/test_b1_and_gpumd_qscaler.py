@@ -27,7 +27,7 @@ import torch
 from torchnep.data import read_xyz, parse_nep_in
 from torchnep.train import (preprocess_structures, GPUDataStore,
                             compute_q_scaler, recompute_b1_shift, train_nep)
-from torchnep.model import NEPModel
+from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
 
 # PbTe example carries per-frame energy + forces (the CrCoNi fixture has no
@@ -116,6 +116,61 @@ def test_gpumd_init_qscaler_matches_c1_and_differs_from_self():
 
     assert torch.allclose(g_min, r_min) and torch.allclose(g_max, r_max)
     assert not torch.allclose(g_max - g_min, s_max - s_min)
+
+
+def test_gpumd_init_parameters_reinits_nn_and_coeffs():
+    """gpumd_init_parameters draws every parameter — descriptor coeffs AND the
+    NN weights (w0/b0/w1) — from uniform(-1, 1), a much larger amplitude than
+    torch's default small-variance NN init."""
+    torch.manual_seed(3)
+    cfg = _cfg_from_nepin()
+    m = NEPModel(cfg).to(torch.float64)
+
+    # torch's default init is small; b0 starts at exactly zero.
+    assert m.fitting_nets[0].w0.abs().max().item() < 0.5
+    assert torch.count_nonzero(m.fitting_nets[0].b0) == 0
+
+    gpumd_init_parameters(m)
+
+    for net in m.fitting_nets:
+        for name, p in (("w0", net.w0), ("b0", net.b0), ("w1", net.w1)):
+            assert p.min().item() >= -1.0 and p.max().item() <= 1.0, name
+        # uniform(-1,1) reaches near the edges — far wider than the small init.
+        assert net.w0.abs().max().item() > 0.5
+        assert net.b0.abs().max().item() > 0.0     # no longer all-zero
+    assert m.c_param_2.min().item() >= -1.0 and m.c_param_2.max().item() <= 1.0
+
+
+def _weight_rms(cfg, nep_txt):
+    m = NEPModel(cfg).to(torch.float64)
+    m.load_weights_from_nep_txt(nep_txt)
+    sq, n = 0.0, 0
+    for net in m.fitting_nets:
+        for p in (net.w0, net.b0, net.w1):
+            sq += float((p.detach() ** 2).sum()); n += p.numel()
+    return (sq / n) ** 0.5
+
+
+def test_l2_regularization_shrinks_weights(tmp_path):
+    """With the same seed/init/data order, a positive lambda_2 (GPUMD-form L2)
+    drives the NN weights to a smaller RMS than an unregularized run — the only
+    difference between the two runs is the reg gradient, which points to 0."""
+    _, xyz = _write_run_files(tmp_path)
+    base = tmp_path / "nep0.in"
+    base.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0\n")
+    reg = tmp_path / "nepR.in"
+    reg.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0.2\n")
+
+    kw = dict(data_file=xyz, device="cpu", precision="float64",
+              print_interval=100, restart=False, checkpoint_interval=10000,
+              prediction_interval=10000, run_seed=7)
+    train_nep(config_file=str(base), output_dir=str(tmp_path / "o0"), **kw)
+    train_nep(config_file=str(reg), output_dir=str(tmp_path / "oR"), **kw)
+
+    cfg = parse_nep_in(str(base))
+    rms0 = _weight_rms(cfg, str(tmp_path / "o0" / "nep_final.txt"))
+    rmsR = _weight_rms(cfg, str(tmp_path / "oR" / "nep_final.txt"))
+    assert rmsR < rms0, f"L2 did not shrink weights: reg={rmsR} vs none={rms0}"
 
 
 def _write_run_files(tmp_path, n_frames=20):

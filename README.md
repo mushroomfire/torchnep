@@ -95,6 +95,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
+| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
 | `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
@@ -127,12 +128,10 @@ function (`train_nep` / `train_nep_sharded`):
 | `recompute_q_scaler` | `False` | only with `finetune_from`: recompute the descriptor scaler on the new data instead of keeping the source model's |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
-| `use_gpumd_qscaler` | `True` | use GPUMD's `q_scaler` (coeffs `c=1`); fresh training only |
+| `use_gpumd_qscaler` | `True` | reproduce GPUMD's init (SNES `mu`): re-init every parameter — descriptor coeffs **and** NN weights — uniform(−1,1), and compute `q_scaler` with coeffs `c=1`. Fresh training only |
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `sam_rho` | `0.0` | SAM (sharpness-aware minimization) radius; `0` = off. Steps with the gradient re-evaluated at the worst-case weight perturbation of L2 radius ρ — flatter minima, smoother extrapolation, ~2× time per epoch. Typical `0.01–0.1` |
-| `sam_interval` | `1` | apply SAM only every N-th minibatch (plain step otherwise) — keeps most of the benefit at ~1/N overhead (N=2 → ~1.5×, N=4 → ~1.25× epoch time) |
 
 ---
 

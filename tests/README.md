@@ -15,7 +15,8 @@ TEST_DEVICE=cpu pytest tests/      # restrict device (default: cpu + cuda if pre
 | `test_neighbor.py` | Cell-list vs brute-force neighbor search; tiled / auto-block paths. |
 | `test_parsing.py` | Legacy and current `l_max` nep.in / nep.txt parsing. |
 | `test_ase_calculator.py` | Optional ASE calculator (energy/forces/stress, ZBL split). |
-| `test_b1_and_gpumd_qscaler.py` | Analytical `b1` offset (residual → 0, `nep_best` ≤ `nep_final`); `use_gpumd_qscaler` reproduces GPUMD's `c=1` q_scaler. |
+| `test_b1_and_gpumd_qscaler.py` | Analytical `b1` offset (residual → 0, `nep_best` ≤ `nep_final`); `use_gpumd_qscaler` reproduces GPUMD's `c=1` q_scaler; `gpumd_init_parameters` re-inits coeffs **and** NN weights uniform(−1,1); L2 (`lambda_2`) shrinks the weights. |
+| `test_run_seed_and_valid.py` | `run_seed` reproducibility; `valid_file` / `valid_ratio` deterministic split, best-model selection on validation loss, `*_test.out`, split preserved across resume; `early_stop` fires on a plateau (validation-loss branch) and is off by default. |
 
 **Tolerance vs GPUMD:** `rtol=1e-5, atol=2e-4`.
 

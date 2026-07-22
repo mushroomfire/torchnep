@@ -86,6 +86,46 @@ def _valid_energy_mse(cfg, frames, nep_txt):
 
 
 # --------------------------------------------------------------------------
+# early stopping
+# --------------------------------------------------------------------------
+
+def _loss_out_epochs(out):
+    lines = [l for l in (out / "loss.out").read_text().splitlines()
+             if l.strip() and not l.startswith("#")]
+    return len(lines)
+
+
+def test_early_stop_triggers_on_plateau_with_validation(tmp_path):
+    """early_stop halts the run once the monitored loss plateaus. lr=0 freezes
+    the weights, so after the analytical b1 settles the (validation) loss stops
+    improving and the run stops well before `epoch`. Exercises the valid-loss
+    branch (valid_ratio active) and leaves a consistent final state."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nearly_stop 3\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2)
+
+    n_epochs = _loss_out_epochs(out)
+    assert n_epochs < 40, "early_stop never fired"
+    assert n_epochs >= 3, "stopped before the patience window elapsed"
+    # Final state is still written and self-consistent.
+    assert (out / "nep_final.txt").exists()
+    assert (out / "nep_best.txt").exists()
+    assert (out / "energy_test.out").exists()   # valid branch was active
+
+
+def test_no_early_stop_when_disabled(tmp_path):
+    """Default (early_stop unset) runs all epochs even on a flat lr=0 plateau."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 6\nbatch 8\nlr 0\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0)
+    assert _loss_out_epochs(out) == 6
+
+
+# --------------------------------------------------------------------------
 # run_seed
 # --------------------------------------------------------------------------
 
