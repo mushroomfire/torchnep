@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Compiled autograd forces** (`use_autograd_forces=True` +
+  `use_compile=True`, single-GPU `train_nep`): the autograd force path can
+  now be `torch.compile`d — the first-order dE/drij gradient is materialized
+  into the graph with `make_fx` (DeepMD/DPA route), so no runtime double
+  backward remains. Outputs and parameter gradients match eager autograd to
+  ~1e-5 (float32); ~4x faster per epoch, on par with the compiled
+  analytical path.
+
 - **Per-stage `early_stop`** (MACE-style): a stage-1 plateau with `stage2 1`
   configured now jumps straight into Stage 2 at the next epoch instead of
   terminating the run; only a plateau in the final stage stops training. The

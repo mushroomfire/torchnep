@@ -1798,8 +1798,13 @@ def train_nep(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            # The nested create_graph=True double backward cannot be lowered
+            # directly, but the make_fx route (materialize the first-order
+            # gradient as ordinary FX ops, then compile) can — see
+            # torchnep/compiled_autograd.py.
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (autograd forces via "
+                           "make_fx-materialized gradient)")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
@@ -1855,14 +1860,18 @@ def train_nep(
     compute_props_cached = raw_model.compute_properties_cached
     if compile_on:
         _quiet_compile_logs()
-        compute_props_cached = torch.compile(
-            raw_model.compute_properties_cached, dynamic=True)
-        if stream_mode:
-            # Fuse the per-batch basis kernels too — same numerical status
-            # as the compiled compute (Inductor-level ~1e-7 deviations).
-            data_store.compile_basis()
-            if valid_store is not None:
-                valid_store.compile_basis()
+        if use_autograd_forces:
+            from .compiled_autograd import CompiledAutogradForce
+            compute_props = CompiledAutogradForce(raw_model).compute_properties
+        else:
+            compute_props_cached = torch.compile(
+                raw_model.compute_properties_cached, dynamic=True)
+            if stream_mode:
+                # Fuse the per-batch basis kernels too — same numerical
+                # status as the compiled compute (~1e-7 Inductor deviations).
+                data_store.compile_basis()
+                if valid_store is not None:
+                    valid_store.compile_basis()
     if compile_msg is not None:
         _log(compile_msg)
 

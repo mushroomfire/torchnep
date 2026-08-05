@@ -124,7 +124,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` |
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
-| `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
+| `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). Analytical path: compiles `compute_properties_cached`. Autograd path (`use_autograd_forces=True`, single-GPU `train_nep`): the nested double-backward cannot be compiled directly, so the first-order force gradient is materialized via `make_fx` and the resulting graph compiled (the DeepMD/DPA route) — ~4x faster than eager autograd, on par with the compiled analytical path |
 | `print_interval` | `10` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
