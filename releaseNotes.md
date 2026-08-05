@@ -2,38 +2,17 @@
 
 ## Unreleased
 
-- **Streaming is now the only data path** — the preloaded GPU data store
-  (and the `stream_mode` option) has been removed. The dataset stays in
-  host memory and batches are streamed to the device; benchmarks across
-  1–16 element types show speed parity with preloading under
-  `use_compile` (and ≤ a few percent cost in eager mode) at ~10–15x less
-  GPU memory, so the preload path had no remaining use case.
-- **`backend="auto"` eager threshold raised**: eager mode now picks the
-  `loop` contraction backend unless there are ≥20 element types (was ≥8) —
-  benchmarked crossover is near ~20; under `use_compile` auto still picks
-  `bmm`.
-
-- **Compiled autograd forces** (`use_autograd_forces=True` +
-  `use_compile=True`, single-GPU `train_nep`): the autograd force path can
-  now be `torch.compile`d — the first-order dE/drij gradient is materialized
-  into the graph with `make_fx`, so no runtime double
-  backward remains. Outputs and parameter gradients match eager autograd to
-  ~1e-5 (float32); ~4x faster per epoch, on par with the compiled
-  analytical path.
-
-- **Per-stage `early_stop`** (MACE-style): a stage-1 plateau with `stage2 1`
-  configured now jumps straight into Stage 2 at the next epoch instead of
-  terminating the run; only a plateau in the final stage stops training. The
-  advanced stage-2 start epoch is saved in the checkpoint, so resumed runs
-  stay in Stage 2.
-
-- **`stream_mode`** (`train_nep` and `train_nep_sharded`): keep the dataset
-  (or each rank's shard) in host memory and stream only the current batch to
-  the GPU, computing the Chebyshev / angular basis on the fly (CPU batch
-  assembly prefetched one batch ahead). GPU memory scales with `batch`
-  instead of dataset size. Eager runs are bit-identical to the default
-  preloaded mode; under `use_compile=True` the per-batch basis is compiled
-  too.
+- **Streaming-only data path**: the preloaded GPU data store and the
+  `stream_mode` option are removed — the dataset stays in host memory and
+  batches are streamed to the device. Same speed, ~10–15x less GPU memory.
+- **`backend="auto"`**: eager mode now uses `loop` below 20 element types
+  (was 8); `bmm` under `use_compile`.
+- **Compiled autograd forces**: `use_autograd_forces=True` +
+  `use_compile=True` now works (first-order gradient materialized via
+  `make_fx`) — ~4x faster than eager autograd.
+- **Per-stage `early_stop`**: a stage-1 plateau jumps into Stage 2 instead
+  of ending the run; only a final-stage plateau stops training (kept across
+  resume).
 
 ## 1.0.1
 

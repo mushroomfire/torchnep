@@ -101,7 +101,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
-| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Per-stage (MACE-style): a stage-1 plateau with `stage2 1` configured jumps straight into Stage 2 instead of ending the run — only a plateau in the final stage terminates it (the advanced stage-2 start is kept across resume). Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
+| `early_stop` | `0` | Stop if the monitored loss (validation loss when a validation set is used, else training loss) hasn't improved for N epochs (`0` = off). Per-stage: a stage-1 plateau jumps into Stage 2 instead of ending the run. Use a value larger than `scheduler_patience` |
 | `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
@@ -138,8 +138,6 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-
-GPU memory: the dataset always stays in **host memory** and only the current batch is streamed to the device (basis computed on the fly, CPU batch assembly prefetched one batch ahead), so GPU memory scales with `batch`, not dataset size (~10–15x less than full preloading on typical datasets). The batch pipeline hides the streaming cost behind the GPU compute — benchmarked at speed parity with a preloaded store under `use_compile` and within a few percent in eager mode, which is why preloading was removed entirely.
 
 ---
 
