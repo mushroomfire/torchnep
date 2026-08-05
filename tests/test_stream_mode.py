@@ -172,7 +172,8 @@ def test_train_stream_reproduces_default(tmp_path):
 
     out_a = tmp_path / "out_default"
     out_b = tmp_path / "out_stream"
-    _train(nepin, xyz, out_a, run_seed=77, prediction_interval=2)
+    _train(nepin, xyz, out_a, run_seed=77, prediction_interval=2,
+           stream_mode=False)
     _train(nepin, xyz, out_b, run_seed=77, prediction_interval=2,
            stream_mode=True)
 
@@ -189,7 +190,8 @@ def test_train_stream_with_validation(tmp_path):
 
     out_a = tmp_path / "out_default"
     out_b = tmp_path / "out_stream"
-    _train(nepin, xyz, out_a, run_seed=5, valid_ratio=0.25)
+    _train(nepin, xyz, out_a, run_seed=5, valid_ratio=0.25,
+           stream_mode=False)
     _train(nepin, xyz, out_b, run_seed=5, valid_ratio=0.25, stream_mode=True)
 
     for f in ("loss.out", "nep_best.txt",
@@ -204,7 +206,7 @@ train_nep_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3],
                   precision="float64", print_interval=100,
                   checkpoint_interval=10000, prediction_interval=10000,
                   restart=False, run_seed=99,
-                  stream_mode=(sys.argv[4] == "stream"))
+                  stream_mode=(sys.argv[4] == "stream"))  # "default" -> False
 """
 
 

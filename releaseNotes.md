@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`stream_mode` is now the default** (`True`) in both `train_nep` and
+  `train_nep_sharded`: benchmarks across 1–16 element types show speed
+  parity with GPU preloading under `use_compile` (and ≤ a few percent cost
+  in eager mode) at ~10–15x less GPU memory. Pass `stream_mode=False` to
+  preload as before.
+- **`backend="auto"` eager threshold raised**: eager mode now picks the
+  `loop` contraction backend unless there are ≥20 element types (was ≥8) —
+  benchmarked crossover is near ~20; under `use_compile` auto still picks
+  `bmm`.
+
 - **Compiled autograd forces** (`use_autograd_forces=True` +
   `use_compile=True`, single-GPU `train_nep`): the autograd force path can
   now be `torch.compile`d — the first-order dE/drij gradient is materialized

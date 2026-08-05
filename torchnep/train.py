@@ -1411,7 +1411,7 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    stream_mode: bool = False,
+    stream_mode: bool = True,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1488,16 +1488,18 @@ def train_nep(
         run_seed, so it is reproducible for a given seed and is preserved
         exactly on resume (the checkpoint's seed wins). Mutually exclusive
         with valid_file.
-    stream_mode : False (default) -> all structure data and the cached basis
-        are pre-loaded to the device (fastest; GPU memory grows with dataset
-        size). True -> the dataset stays in host memory and only the current
-        batch is shipped to the device, with its basis computed on the fly —
-        GPU memory then scales with ``batch`` instead of dataset size, at a
-        modest per-epoch speed cost. Eager runs are numerically identical
-        to the default (the streamed batches are bit-identical to the
-        preloaded ones); with ``use_compile=True`` the per-batch basis is
-        compiled too, adding only the same ~1e-7-level deviations the
-        compiled compute already introduces.
+    stream_mode : True (default) -> the dataset stays in host memory and
+        only the current batch is shipped to the device, with its basis
+        computed on the fly — GPU memory scales with ``batch`` instead of
+        dataset size. False -> all structure data and the cached basis are
+        pre-loaded to the device; benchmarks show at most a few percent
+        speed advantage (none at all under ``use_compile``), so preloading
+        is only worth it when host RAM, not GPU memory, is the constraint.
+        The streamed batches are bit-identical to the preloaded ones, so
+        the two modes produce the same training trajectory; with
+        ``use_compile=True`` the per-batch basis is compiled too, adding
+        only the same ~1e-7-level deviations the compiled compute already
+        introduces.
     """
     _clean_warning_format()
 

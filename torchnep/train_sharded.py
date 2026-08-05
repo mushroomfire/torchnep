@@ -220,7 +220,7 @@ def train_nep_sharded(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    stream_mode: bool = False,
+    stream_mode: bool = True,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).

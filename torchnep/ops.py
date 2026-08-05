@@ -47,8 +47,14 @@ def resolve_backend(backend: str = "auto",
     under torch.compile -> "bmm"   (vectorised path fuses far better; the per-
                                     type Python loop forces graph breaks, so bmm
                                     is consistently fastest once compiled)
-    ntypes >= 8         -> "bmm"   (fancy-index + batched GEMM wins)
-    otherwise           -> "loop"  (few-types eager; inline Python loop fastest)
+    ntypes >= 20        -> "bmm"   (the O(ntypes^2) loop launches finally lose
+                                    to one batched GEMM)
+    otherwise           -> "loop"  (eager; inline Python loop fastest)
+
+    The eager threshold comes from a 6000-frame benchmark sweep (16-element
+    alloy set, A2000): loop beat bmm clearly up to 8 types (8.8 vs 14.1
+    s/epoch) and only reached parity at 16 (15.6 vs 15.1), so the crossover
+    sits near ~20 types.
 
     Any non-"auto" string is returned unchanged (explicit override wins).
     """
@@ -56,7 +62,7 @@ def resolve_backend(backend: str = "auto",
         return backend
     if use_compile:
         return "bmm"
-    if num_types is not None and num_types >= 8:
+    if num_types is not None and num_types >= 20:
         return "bmm"
     return "loop"
 

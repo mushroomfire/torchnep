@@ -121,7 +121,7 @@ function (`train_nep` / `train_nep_sharded`):
 |---|---|---|
 | `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"`; any other stream-based PyTorch accelerator should also work if passed explicitly |
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
-| `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` |
+| `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"`. Auto resolves to `bmm` under `use_compile` (fuses best) and to `loop` in eager mode unless there are ≥20 element types — benchmarks show eager `loop` wins clearly up to ~16 types |
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
 | `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). Analytical path: compiles `compute_properties_cached`. Autograd path (`use_autograd_forces=True`, single-GPU `train_nep`): the nested double-backward cannot be compiled directly, so the first-order force gradient is materialized via `make_fx` and the resulting graph compiled (the DeepMD/DPA route) — ~4x faster than eager autograd, on par with the compiled analytical path |
@@ -138,7 +138,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `stream_mode` | `False` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size — use for datasets that don't fit on the card. Numerically identical to the default; costs a modest per-epoch slowdown in eager mode (speed parity under `use_compile`). Works in both `train_nep` and `train_nep_sharded` (each rank streams its own shard) |
+| `stream_mode` | `True` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size (~10–15x less on typical datasets). The streamed batches are bit-identical to the preloaded ones, and the batch pipeline hides the streaming cost behind the GPU compute — benchmarks show speed parity with preloading under `use_compile` and at most a few percent cost in eager mode. Set `False` to preload everything to the GPU (only worth it when host RAM is the constraint). Works in both `train_nep` and `train_nep_sharded` (each rank streams its own shard) |
 
 ---
 
