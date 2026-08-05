@@ -32,3 +32,4 @@
 /docs/
 # Local-only learning playground (from-scratch pedagogical NEP reimplementation).
 /learn/
+/test_stream/
