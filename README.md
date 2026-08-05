@@ -132,7 +132,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `stream_mode` | `False` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size — use for datasets that don't fit on the card. Numerically identical to the default; costs a modest per-epoch slowdown. Single-GPU `train_nep` only for now |
+| `stream_mode` | `False` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size — use for datasets that don't fit on the card. Numerically identical to the default; costs a modest per-epoch slowdown in eager mode (speed parity under `use_compile`). Works in both `train_nep` and `train_nep_sharded` (each rank streams its own shard) |
 
 ---
 

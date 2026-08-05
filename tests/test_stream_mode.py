@@ -174,3 +174,53 @@ def test_train_stream_with_validation(tmp_path):
            (out_b / "nep_best.txt").read_text()
     for f in ("energy_test.out", "force_test.out", "virial_test.out"):
         assert (out_a / f).read_text() == (out_b / f).read_text(), f
+
+
+_SHARDED_RUNNER = """
+import sys
+from torchnep.train_sharded import train_nep_sharded
+train_nep_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3],
+                  precision="float64", print_interval=100,
+                  checkpoint_interval=10000, prediction_interval=10000,
+                  restart=False, run_seed=99,
+                  stream_mode=(sys.argv[4] == "stream"))
+"""
+
+
+def test_sharded_stream_matches_default(tmp_path):
+    """2-rank DDP (CPU/gloo): stream_mode reproduces the default sharded
+    run bit-for-bit.
+
+    Opt-in (local only): multi-process rendezvous can hang on constrained
+    CI runners, so this is skipped unless TORCHNEP_TEST_DDP=1 is set.
+    Run locally with:  TORCHNEP_TEST_DDP=1 pytest tests/test_stream_mode.py
+    """
+    import os
+    import shutil
+    import subprocess
+    if os.environ.get("TORCHNEP_TEST_DDP") != "1":
+        pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
+    torchrun = shutil.which("torchrun")
+    if torchrun is None:
+        pytest.skip("torchrun not on PATH")
+
+    nepin, xyz = _write_run_files(tmp_path, n_frames=16, epochs=3)
+    runner = tmp_path / "runner.py"
+    runner.write_text(_SHARDED_RUNNER)
+
+    import os
+    root = str(DATA_DIR.parent.parent)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    for out, mode in (("out_default", "default"), ("out_stream", "stream")):
+        r = subprocess.run(
+            [torchrun, "--standalone", "--nproc_per_node=2", str(runner),
+             nepin, xyz, str(tmp_path / out), mode],
+            capture_output=True, text=True, env=env, timeout=600)
+        assert r.returncode == 0, r.stderr[-2000:]
+
+    a, b = tmp_path / "out_default", tmp_path / "out_stream"
+    assert (a / "loss.out").read_text() == (b / "loss.out").read_text()
+    assert (a / "nep_best.txt").read_text() == (b / "nep_best.txt").read_text()
+    for f in ("energy_train.out", "force_train.out", "virial_train.out"):
+        assert (a / f).read_text() == (b / f).read_text(), f

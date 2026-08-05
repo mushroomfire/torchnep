@@ -2,12 +2,13 @@
 
 ## Unreleased
 
-- **`stream_mode`** (single-GPU `train_nep`): keep the dataset in host memory
-  and stream only the current batch to the GPU, computing the Chebyshev /
-  angular basis on the fly (CPU batch assembly prefetched one batch ahead).
-  GPU memory scales with `batch` instead of dataset size. Eager runs are
-  bit-identical to the default preloaded mode; under `use_compile=True` the
-  per-batch basis is compiled too.
+- **`stream_mode`** (`train_nep` and `train_nep_sharded`): keep the dataset
+  (or each rank's shard) in host memory and stream only the current batch to
+  the GPU, computing the Chebyshev / angular basis on the fly (CPU batch
+  assembly prefetched one batch ahead). GPU memory scales with `batch`
+  instead of dataset size. Eager runs are bit-identical to the default
+  preloaded mode; under `use_compile=True` the per-batch basis is compiled
+  too.
 
 ## 1.0.1
 

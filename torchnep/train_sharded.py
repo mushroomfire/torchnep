@@ -120,7 +120,7 @@ class _NEPDDPShim(nn.Module):
 
 from .train import (
     _BANNER, _AUTHOR,
-    _backend_info, GPUDataStore,
+    _backend_info, GPUDataStore, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
@@ -216,6 +216,7 @@ def train_nep_sharded(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    stream_mode: bool = False,
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -249,6 +250,13 @@ def train_nep_sharded(
     validation loss. The validation frames are sharded across ranks like the
     training frames; the error sums are all-reduced, so every rank sees the
     identical validation loss (schedulers stay in lock-step).
+
+    ``stream_mode`` mirrors ``train_nep``: each rank keeps its shard in host
+    memory and streams only the current batch to its GPU (basis computed on
+    the fly, CPU assembly prefetched one batch ahead) — per-GPU memory then
+    scales with ``batch`` instead of shard size. Combines with sharding:
+    ranks stream independent shards, DDP collectives are untouched (same
+    step count per rank, gradients all-reduced as usual).
     """
     _clean_warning_format()
 
@@ -532,15 +540,20 @@ def train_nep_sharded(
     max_NN_rad, max_NN_ang = int(nn_t[0].item()), int(nn_t[1].item())
 
     t0 = time.time()
-    data_store = GPUDataStore(structures, dev, dtype, config=config)
+    _StoreCls = StreamDataStore if stream_mode else GPUDataStore
+    data_store = _StoreCls(structures, dev, dtype, config=config)
     del structures
     valid_store = None
     if structures_v is not None:
-        valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        valid_store = _StoreCls(structures_v, dev, dtype, config=config)
         del structures_v
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    if stream_mode:
+        _log(f"  stream_mode: shard kept in host memory, batches "
+             f"streamed to {dev} ({time.time() - t0:.1f}s)")
+    else:
+        _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
@@ -683,10 +696,14 @@ def train_nep_sharded(
             _log("  q_scaler: RECOMPUTED from the new dataset "
                  "(recompute_q_scaler=True) — the loaded weights will "
                  "see rescaled descriptors and must re-adapt")
-        # q_scaler: local shard -> all_reduce
+        # q_scaler: local shard -> all_reduce. In stream mode the pass uses
+        # the training batch size so its transient GPU footprint stays
+        # batch-bound (min/max is chunking-invariant — result unchanged).
         t_qs = time.time()
         q_min, q_max = _compute_q_scaler_sharded(
-            model, data_store, backend=backend, gpumd_init=use_gpumd_qscaler)
+            model, data_store, backend=backend,
+            batch_size=batch_size if stream_mode else 1000,
+            gpumd_init=use_gpumd_qscaler)
         model.set_q_scaler(q_min, q_max)
         if cuda_available:
             torch.cuda.synchronize()
@@ -703,6 +720,12 @@ def train_nep_sharded(
         _log(compile_msg)
     if compile_on:
         _quiet_compile_logs()
+        if stream_mode:
+            # Fuse the per-batch basis kernels too — same numerical status
+            # as the compiled compute (Inductor-level ~1e-7 deviations).
+            data_store.compile_basis()
+            if valid_store is not None:
+                valid_store.compile_basis()
     shim = _NEPDDPShim(model, use_compile=compile_on)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
@@ -972,9 +995,9 @@ def train_nep_sharded(
             has_forces = global_has_forces and cur_pref_f > 0
             has_virial = global_has_virial and cur_pref_v > 0
 
-            for start in range(0, n_local, batch_size):
-                idx = perm[start:start + batch_size]
-                batch = data_store.collate(idx)
+            batch_indices = [perm[start:start + batch_size]
+                             for start in range(0, n_local, batch_size)]
+            for batch in iter_collated(data_store, batch_indices):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
