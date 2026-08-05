@@ -1864,8 +1864,15 @@ def train_nep(
             from .compiled_autograd import CompiledAutogradForce
             compute_props = CompiledAutogradForce(raw_model).compute_properties
         else:
-            compute_props_cached = torch.compile(
-                raw_model.compute_properties_cached, dynamic=True)
+            # Compile the branch-free core only — ZBL and result assembly
+            # stay eager in the wrapper. Compiling the whole method instead
+            # leaves 3 graph breaks (per-type masks + ZBL autograd.grad) and
+            # ~2.7x the kernel launches.
+            import functools
+            _compiled_core = torch.compile(raw_model._cached_core,
+                                           dynamic=True)
+            compute_props_cached = functools.partial(
+                raw_model.compute_properties_cached, core_fn=_compiled_core)
             if stream_mode:
                 # Fuse the per-batch basis kernels too — same numerical
                 # status as the compiled compute (~1e-7 Inductor deviations).

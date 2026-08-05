@@ -98,8 +98,12 @@ class _NEPDDPShim(nn.Module):
         # torch.compile's donated-buffer optimisation). See train.py for the
         # single-device counterpart.
         if use_compile and hasattr(torch, "compile"):
-            self._compute_cached = torch.compile(
-                model.compute_properties_cached, dynamic=True)
+            # Compile the branch-free core; ZBL + assembly stay eager in the
+            # wrapper (see NEPModel._cached_core).
+            import functools
+            self._compute_cached = functools.partial(
+                model.compute_properties_cached,
+                core_fn=torch.compile(model._cached_core, dynamic=True))
         else:
             self._compute_cached = model.compute_properties_cached
 
