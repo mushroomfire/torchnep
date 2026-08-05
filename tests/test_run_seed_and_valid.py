@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from torchnep.data import read_xyz, parse_nep_in
-from torchnep.train import (preprocess_structures, GPUDataStore, train_nep)
+from torchnep.train import (preprocess_structures, StreamDataStore, train_nep)
 from torchnep.model import NEPModel
 from _common import DATA_DIR
 
@@ -70,7 +70,7 @@ def _expected_split(n_frames, seed, ratio):
 def _valid_energy_mse(cfg, frames, nep_txt):
     """Energy MSE of a saved model on the given frames (per-atom, eV/atom)."""
     structs = preprocess_structures(frames, cfg, np.float64)
-    ds = GPUDataStore(structs, torch.device("cpu"), torch.float64, config=cfg)
+    ds = StreamDataStore(structs, torch.device("cpu"), torch.float64, config=cfg)
     m = NEPModel(cfg).to(torch.float64)
     m.load_weights_from_nep_txt(nep_txt)
     sq, n = 0.0, 0

@@ -21,7 +21,7 @@ import pytest
 import torch
 
 from torchnep.data import read_xyz, parse_nep_in
-from torchnep.train import GPUDataStore, preprocess_structures
+from torchnep.train import StreamDataStore, preprocess_structures
 from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
 
@@ -42,7 +42,7 @@ def _setup(tmp_path, n_frames=24):
     cfg = parse_nep_in(str(p))
     frames = read_xyz(str(PBTE))[:n_frames]
     structs = preprocess_structures(frames, cfg, np.float32)
-    store = GPUDataStore(structs, dev, dtype, config=cfg)
+    store = StreamDataStore(structs, dev, dtype, config=cfg)
     torch.manual_seed(11)
     model = NEPModel(cfg).to(dtype).to(dev)
     gpumd_init_parameters(model)

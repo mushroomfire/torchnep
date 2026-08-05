@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-- **`stream_mode` is now the default** (`True`) in both `train_nep` and
-  `train_nep_sharded`: benchmarks across 1–16 element types show speed
-  parity with GPU preloading under `use_compile` (and ≤ a few percent cost
-  in eager mode) at ~10–15x less GPU memory. Pass `stream_mode=False` to
-  preload as before.
+- **Streaming is now the only data path** — the preloaded GPU data store
+  (and the `stream_mode` option) has been removed. The dataset stays in
+  host memory and batches are streamed to the device; benchmarks across
+  1–16 element types show speed parity with preloading under
+  `use_compile` (and ≤ a few percent cost in eager mode) at ~10–15x less
+  GPU memory, so the preload path had no remaining use case.
 - **`backend="auto"` eager threshold raised**: eager mode now picks the
   `loop` contraction backend unless there are ≥20 element types (was ≥8) —
   benchmarked crossover is near ~20; under `use_compile` auto still picks

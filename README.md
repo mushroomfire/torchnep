@@ -138,7 +138,8 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `stream_mode` | `True` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size (~10–15x less on typical datasets). The streamed batches are bit-identical to the preloaded ones, and the batch pipeline hides the streaming cost behind the GPU compute — benchmarks show speed parity with preloading under `use_compile` and at most a few percent cost in eager mode. Set `False` to preload everything to the GPU (only worth it when host RAM is the constraint). Works in both `train_nep` and `train_nep_sharded` (each rank streams its own shard) |
+
+GPU memory: the dataset always stays in **host memory** and only the current batch is streamed to the device (basis computed on the fly, CPU batch assembly prefetched one batch ahead), so GPU memory scales with `batch`, not dataset size (~10–15x less than full preloading on typical datasets). The batch pipeline hides the streaming cost behind the GPU compute — benchmarked at speed parity with a preloaded store under `use_compile` and within a few percent in eager mode, which is why preloading was removed entirely.
 
 ---
 
@@ -367,8 +368,9 @@ The `torchnep/` package is organised as follows:
 | `ops.py` | Core differentiable kernels — Chebyshev/angular basis, descriptors, ANN evaluation, ZBL; pure-PyTorch `loop`/`bmm` backends |
 | `nep.py` | `NEPCalculator` — loads a `nep.txt` and computes energy/forces/virial/descriptors for single structures |
 | `predict.py` | Batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
-| `train.py` | Single-GPU/CPU training (`train_nep`): data store, two-stage loop, schedulers, checkpoint/restart, periodic predict |
+| `train.py` | Single-GPU/CPU training (`train_nep`): host-resident streaming data store (`StreamDataStore` + prefetching `iter_collated`), two-stage loop, schedulers, checkpoint/restart, periodic predict |
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
+| `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx` (DeepMD/DPA route), so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 

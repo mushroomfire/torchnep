@@ -393,7 +393,7 @@ def predict_dataset(
 
 
 # ---------------------------------------------------------------------------
-# End-of-training prediction that reuses the in-memory model + GPUDataStore
+# End-of-training prediction that reuses the in-memory model + data store
 # (no xyz re-read, no neighbor-list rebuild, no second GPU upload).
 # ---------------------------------------------------------------------------
 
@@ -402,7 +402,7 @@ def predict_from_store(model, data_store, output_dir: str,
                        backend: str = "auto",
                        verbose: bool = True,
                        suffix: str = "train"):
-    """Run prediction using an already-loaded NEPModel + GPUDataStore.
+    """Run prediction using an already-loaded NEPModel + StreamDataStore.
 
     Designed for the end of training: reuses the preprocessed data_store so
     there is no xyz re-read / neighbor-list rebuild / GPU upload. The
@@ -638,7 +638,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     Parameters
     ----------
     model : NEPModel  (DDP replica — parameters are in sync across ranks).
-    data_store : GPUDataStore  (this rank's local shard).
+    data_store : StreamDataStore  (this rank's local shard).
     local_global_idx : list[int]  original xyz-frame index for each local
         frame (length == ``data_store.n``). Supplied by the random shard
         assignment in ``train_nep_sharded``.
