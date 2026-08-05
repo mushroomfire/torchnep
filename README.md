@@ -124,7 +124,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"`. Auto resolves to `bmm` under `use_compile` (fuses best) and to `loop` in eager mode unless there are ≥20 element types — benchmarks show eager `loop` wins clearly up to ~16 types |
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
-| `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). Analytical path: compiles `compute_properties_cached`. Autograd path (`use_autograd_forces=True`, single-GPU `train_nep`): the nested double-backward cannot be compiled directly, so the first-order force gradient is materialized via `make_fx` and the resulting graph compiled (the DeepMD/DPA route) — ~4x faster than eager autograd, on par with the compiled analytical path |
+| `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). Analytical path: compiles `compute_properties_cached`. Autograd path (`use_autograd_forces=True`, single-GPU `train_nep`): the nested double-backward cannot be compiled directly, so the first-order force gradient is materialized via `make_fx` and the resulting graph compiled — ~4x faster than eager autograd, on par with the compiled analytical path |
 | `print_interval` | `10` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
@@ -370,7 +370,7 @@ The `torchnep/` package is organised as follows:
 | `predict.py` | Batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
 | `train.py` | Single-GPU/CPU training (`train_nep`): host-resident streaming data store (`StreamDataStore` + prefetching `iter_collated`), two-stage loop, schedulers, checkpoint/restart, periodic predict |
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
-| `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx` (DeepMD/DPA route), so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
+| `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 

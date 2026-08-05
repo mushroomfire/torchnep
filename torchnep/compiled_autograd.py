@@ -11,13 +11,13 @@
 # You should have received a copy of the GNU General Public License
 # along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
-"""torch.compile for the AUTOGRAD force path (the DeepMD/DPA make_fx route).
+"""torch.compile for the AUTOGRAD force path via make_fx.
 
 The autograd path computes forces as F = -dE/drij by a nested
 ``autograd.grad(create_graph=True)``, which torch.compile cannot lower
 directly — that is why ``use_compile`` used to be ignored for
-``use_autograd_forces=True``. The workaround (used by DeepMD-kit / DPA and
-by the ctp project this port follows):
+``use_autograd_forces=True``. The workaround (the approach follows the idea
+used by DeepMD-kit's compiled models):
 
   1. write (energy, forces) as a PURE function of (params+buffers, batch
      geometry) — parameters enter as function inputs, so a normal
@@ -107,8 +107,8 @@ def strip_detach(gm):
 
 
 def inductor_options():
-    """Conservative Inductor options (ported from DPA's compile options via
-    ctp): the default pipeline runs heavy fusion/autotune on the large
+    """Conservative Inductor options: the default pipeline runs heavy
+    fusion/autotune on the large
     materialized second-order graph — minutes of codegen, and small GPUs
     can't even run max_autotune_gemm. This cuts compile to seconds."""
     opts = {
@@ -215,8 +215,8 @@ class CompiledAutogradForce:
     # -- tracing --------------------------------------------------------------
 
     def _prime_args(self, args):
-        """Synthetic tracing inputs with PRIME atom/pair counts (the DPA
-        trick): make_fx then derives clean symbolic dims, so no batch dim can
+        """Synthetic tracing inputs with PRIME atom/pair counts: make_fx
+        then derives clean symbolic dims, so no batch dim can
         accidentally equal a channel/basis count and get mis-specialized as
         a constant."""
         pvals = args[0]
