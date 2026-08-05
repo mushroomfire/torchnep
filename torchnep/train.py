@@ -1037,12 +1037,19 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
                      loss_weights=None, in_stage2=False, swa_model=None,
                      best_true_loss=None, run_seed=None,
-                     best_valid_loss=None, valid_info=None):
+                     best_valid_loss=None, valid_info=None,
+                     start_stage2=None):
     """Write a full training checkpoint.
 
     ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
     lr_scheduler otherwise); ``in_stage2`` records which it was so the load
     side can restore the state into the right object.
+
+    ``start_stage2`` records the EFFECTIVE stage-2 start epoch — it can be
+    earlier than nep.in's value when a stage-1 early stop jumped into stage 2
+    ahead of schedule. The load side restores it only for checkpoints already
+    in stage 2, so a resumed run stays there (stage-1 checkpoints defer to
+    nep.in, keeping the documented redo-stage-2-with-edited-settings flow).
     """
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
@@ -1053,6 +1060,7 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "optimizer_state": optimizer.state_dict(),
         "in_stage2": in_stage2,
         "run_seed": run_seed,
+        "start_stage2": start_stage2,
     }
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
@@ -1119,6 +1127,7 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "run_seed": ckpt.get("run_seed"),
         "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
         "valid_info": ckpt.get("valid_info"),
+        "start_stage2": ckpt.get("start_stage2"),
     }
 
 
@@ -1907,6 +1916,12 @@ def train_nep(
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
         best_valid_loss = info["best_valid_loss"]
+        # A checkpoint already in stage 2 pins the EFFECTIVE stage-2 start —
+        # possibly earlier than nep.in's, when a stage-1 early stop jumped
+        # ahead of schedule. Stage-1 checkpoints defer to nep.in (so the
+        # redo-stage-2-with-edited-settings flow keeps working).
+        if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
+            start_stage2 = info["start_stage2"]
         saved_valid_info = info.get("valid_info")
         if saved_valid_info is not None and saved_valid_info != cur_valid_info:
             _log("WARNING: validation settings changed since the checkpoint "
@@ -2261,6 +2276,13 @@ def train_nep(
             # begins (the loss scale shifts with the stage-2 weights). In DDP
             # every rank sees the identical (all-reduced) sched_loss, so all
             # ranks reach the same decision and stop together.
+            #
+            # Early stop is per-STAGE (MACE-style): if stage 1 plateaus while
+            # a stage 2 is configured but not yet started, the run jumps into
+            # stage 2 at the next epoch instead of terminating — only a
+            # plateau in the final stage ends the run. The advanced
+            # start_stage2 is saved in the checkpoint so a resumed run stays
+            # in stage 2 (nep.in's start_stage2 would say otherwise).
             stop_now = False
             if early_stop:
                 if in_stage2 and not prev_in_stage2:
@@ -2272,7 +2294,16 @@ def train_nep(
                 else:
                     es_wait += 1
                     if es_wait >= early_stop:
-                        stop_now = True
+                        if stage2 and not in_stage2:
+                            _log(f"Early stop (stage 1): {monitored} did "
+                                 f"not improve for {early_stop} epochs — "
+                                 f"starting stage 2 at epoch {epoch + 1} "
+                                 f"(was scheduled for epoch {start_stage2}).")
+                            start_stage2 = epoch + 1
+                            es_best = float("inf")
+                            es_wait = 0
+                        else:
+                            stop_now = True
             prev_in_stage2 = in_stage2
 
             row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
@@ -2348,7 +2379,8 @@ def train_nep(
                     swa_model=swa_model if in_stage2 else None,
                     best_true_loss=best_true_loss, run_seed=run_seed,
                     best_valid_loss=best_valid_loss,
-                    valid_info=cur_valid_info)
+                    valid_info=cur_valid_info,
+                    start_stage2=start_stage2)
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights

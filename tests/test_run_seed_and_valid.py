@@ -115,6 +115,52 @@ def test_early_stop_triggers_on_plateau_with_validation(tmp_path):
     assert (out / "energy_test.out").exists()   # valid branch was active
 
 
+def test_early_stop_stage1_jumps_to_stage2(tmp_path):
+    """Per-stage early stop (MACE-style): a stage-1 plateau with a stage 2
+    still pending JUMPS into stage 2 at the next epoch instead of ending the
+    run; only a stage-2 plateau then terminates it. lr=0 (both stages) makes
+    every stage plateau within `early_stop` epochs, so the run must enter
+    stage 2 well before its scheduled epoch-30 start and stop shortly after —
+    far short of the full 40 epochs."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nearly_stop 3\n"
+                     "stage2 1\nstart_stage2 30\nstage2_lr 0\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2)
+
+    log = (out / "output.log").read_text()
+    assert "Early stop (stage 1)" in log        # jumped, not stopped
+    assert "Stage 2 started at epoch" in log    # stage 2 actually ran
+    assert "Early stop:" in log                 # final stop was in stage 2
+    n_epochs = _loss_out_epochs(out)
+    assert n_epochs < 30, "run should end long before the scheduled stage-2 start"
+    assert n_epochs > 4, "stage 2 must have run at least a few epochs"
+
+
+def test_early_stop_stage2_jump_survives_resume(tmp_path):
+    """After an early-stop jump into stage 2, a resumed run must stay in
+    stage 2 (the checkpoint pins the effective start_stage2) — without the
+    persisted value, nep.in's start_stage2=30 would put the resumed epochs
+    back into stage 1."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nearly_stop 3\n"
+                     "stage2 1\nstart_stage2 30\nstage2_lr 0\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2)
+    log1 = (out / "output.log").read_text()
+    assert "Early stop (stage 1)" in log1
+    n_first = _loss_out_epochs(out)
+    assert n_first < 30
+
+    # Resume from the early-stopped checkpoint (auto pickup via restart=True).
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2, restart=True)
+    log2 = (out / "output.log").read_text()
+    assert "Stage 2 resumed at epoch" in log2, \
+        "resumed run fell back to stage 1 — start_stage2 not restored"
+
+
 def test_no_early_stop_when_disabled(tmp_path):
     """Default (early_stop unset) runs all epochs even on a flat lr=0 plateau."""
     _, xyz = _write_run_files(tmp_path, n_frames=20)

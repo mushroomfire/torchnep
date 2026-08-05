@@ -811,6 +811,11 @@ def train_nep_sharded(
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
         best_valid_loss = info["best_valid_loss"]
+        # A checkpoint already in stage 2 pins the EFFECTIVE stage-2 start
+        # (may be earlier than nep.in's after a stage-1 early-stop jump);
+        # stage-1 checkpoints defer to nep.in — see train_nep.
+        if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
+            start_stage2 = info["start_stage2"]
         saved_valid_info = info.get("valid_info")
         if saved_valid_info is not None and saved_valid_info != cur_valid_info:
             _log("WARNING: validation settings changed since the checkpoint "
@@ -1196,7 +1201,9 @@ def train_nep_sharded(
                                 lr_scheduler_mode, optimizer, stop_lr)
 
             # Early stopping (see train_nep). Every rank sees the identical
-            # all-reduced sched_loss, so all ranks stop on the same epoch.
+            # all-reduced sched_loss, so all ranks stop on the same epoch —
+            # and, per-stage (MACE-style), all ranks jump into stage 2
+            # together when stage 1 plateaus with a stage 2 still pending.
             stop_now = False
             if early_stop:
                 if in_stage2 and not prev_in_stage2:
@@ -1208,7 +1215,16 @@ def train_nep_sharded(
                 else:
                     es_wait += 1
                     if es_wait >= early_stop:
-                        stop_now = True
+                        if stage2 and not in_stage2:
+                            _log(f"Early stop (stage 1): {monitored} did "
+                                 f"not improve for {early_stop} epochs — "
+                                 f"starting stage 2 at epoch {epoch + 1} "
+                                 f"(was scheduled for epoch {start_stage2}).")
+                            start_stage2 = epoch + 1
+                            es_best = float("inf")
+                            es_wait = 0
+                        else:
+                            stop_now = True
             prev_in_stage2 = in_stage2
 
             if is_main:
@@ -1301,7 +1317,8 @@ def train_nep_sharded(
                     swa_model=swa_model if in_stage2 else None,
                     best_true_loss=best_true_loss, run_seed=run_seed,
                     best_valid_loss=best_valid_loss,
-                    valid_info=cur_valid_info)
+                    valid_info=cur_valid_info,
+                    start_stage2=start_stage2)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Per-stage `early_stop`** (MACE-style): a stage-1 plateau with `stage2 1`
+  configured now jumps straight into Stage 2 at the next epoch instead of
+  terminating the run; only a plateau in the final stage stops training. The
+  advanced stage-2 start epoch is saved in the checkpoint, so resumed runs
+  stay in Stage 2.
+
 - **`stream_mode`** (`train_nep` and `train_nep_sharded`): keep the dataset
   (or each rank's shard) in host memory and stream only the current batch to
   the GPU, computing the Chebyshev / angular basis on the fly (CPU batch

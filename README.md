@@ -95,7 +95,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
-| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
+| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Per-stage (MACE-style): a stage-1 plateau with `stage2 1` configured jumps straight into Stage 2 instead of ending the run — only a plateau in the final stage terminates it (the advanced stage-2 start is kept across resume). Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
 | `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
