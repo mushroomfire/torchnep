@@ -137,10 +137,37 @@ def _train(nepin, xyz, out, **kw):
     train_nep(config_file=nepin, data_file=xyz, output_dir=str(out), **kw)
 
 
+def _assert_files_numerically_equal(pa, pb, rtol=1e-8, atol=1e-12):
+    """Token-wise comparison: text tokens must match exactly, numeric tokens
+    within (rtol, atol).
+
+    Byte-for-byte equality would be the ideal assertion (and holds on most
+    machines), but the training forward passes go through BLAS matmuls whose
+    reduction order can depend on heap alignment (MKL/OpenBLAS "conditional
+    reproducibility") — on some CI hosts that costs ~1 ULP between two runs
+    in the same process. The streamed inputs themselves ARE bit-exact (see
+    test_collate_bit_exact, which is pure elementwise math and stays a strict
+    torch.equal); any real divergence would exceed these tolerances by orders
+    of magnitude.
+    """
+    import math
+    ta, tb = pa.read_text().split(), pb.read_text().split()
+    assert len(ta) == len(tb), f"{pa.name}: token count {len(ta)} != {len(tb)}"
+    for k, (x, y) in enumerate(zip(ta, tb)):
+        try:
+            fx, fy = float(x), float(y)
+        except ValueError:
+            assert x == y, f"{pa.name} token {k}: {x!r} != {y!r}"
+            continue
+        assert math.isclose(fx, fy, rel_tol=rtol, abs_tol=atol), \
+            f"{pa.name} token {k}: {x} vs {y}"
+
+
 def test_train_stream_reproduces_default(tmp_path):
-    """Same seed, stream_mode on vs off: identical loss.out, identical
-    nep_final.txt and identical end-of-training predictions (CPU float64 is
-    deterministic, and the streamed batches are bit-identical)."""
+    """Same seed, stream_mode on vs off: matching loss.out, nep_final.txt
+    and end-of-training predictions (the streamed batches are bit-identical;
+    outputs compared numerically to tolerate BLAS-alignment ULP noise on
+    some CI hosts — see _assert_files_numerically_equal)."""
     nepin, xyz = _write_run_files(tmp_path, n_frames=16, epochs=3)
 
     out_a = tmp_path / "out_default"
@@ -149,14 +176,10 @@ def test_train_stream_reproduces_default(tmp_path):
     _train(nepin, xyz, out_b, run_seed=77, prediction_interval=2,
            stream_mode=True)
 
-    assert (out_a / "loss.out").read_text() == (out_b / "loss.out").read_text()
-    assert (out_a / "nep_final.txt").read_text() == \
-           (out_b / "nep_final.txt").read_text()
-    assert (out_a / "nep_best.txt").read_text() == \
-           (out_b / "nep_best.txt").read_text()
-    for f in ("energy_train.out", "force_train.out", "virial_train.out",
+    for f in ("loss.out", "nep_final.txt", "nep_best.txt",
+              "energy_train.out", "force_train.out", "virial_train.out",
               "stress_train.out"):
-        assert (out_a / f).read_text() == (out_b / f).read_text(), f
+        _assert_files_numerically_equal(out_a / f, out_b / f)
 
 
 def test_train_stream_with_validation(tmp_path):
@@ -169,11 +192,9 @@ def test_train_stream_with_validation(tmp_path):
     _train(nepin, xyz, out_a, run_seed=5, valid_ratio=0.25)
     _train(nepin, xyz, out_b, run_seed=5, valid_ratio=0.25, stream_mode=True)
 
-    assert (out_a / "loss.out").read_text() == (out_b / "loss.out").read_text()
-    assert (out_a / "nep_best.txt").read_text() == \
-           (out_b / "nep_best.txt").read_text()
-    for f in ("energy_test.out", "force_test.out", "virial_test.out"):
-        assert (out_a / f).read_text() == (out_b / f).read_text(), f
+    for f in ("loss.out", "nep_best.txt",
+              "energy_test.out", "force_test.out", "virial_test.out"):
+        _assert_files_numerically_equal(out_a / f, out_b / f)
 
 
 _SHARDED_RUNNER = """
@@ -189,7 +210,8 @@ train_nep_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3],
 
 def test_sharded_stream_matches_default(tmp_path):
     """2-rank DDP (CPU/gloo): stream_mode reproduces the default sharded
-    run bit-for-bit.
+    run (numeric comparison, same tolerance rationale as the single-GPU
+    reproduction test).
 
     Opt-in (local only): multi-process rendezvous can hang on constrained
     CI runners, so this is skipped unless TORCHNEP_TEST_DDP=1 is set.
@@ -220,7 +242,6 @@ def test_sharded_stream_matches_default(tmp_path):
         assert r.returncode == 0, r.stderr[-2000:]
 
     a, b = tmp_path / "out_default", tmp_path / "out_stream"
-    assert (a / "loss.out").read_text() == (b / "loss.out").read_text()
-    assert (a / "nep_best.txt").read_text() == (b / "nep_best.txt").read_text()
-    for f in ("energy_train.out", "force_train.out", "virial_train.out"):
-        assert (a / f).read_text() == (b / f).read_text(), f
+    for f in ("loss.out", "nep_best.txt",
+              "energy_train.out", "force_train.out", "virial_train.out"):
+        _assert_files_numerically_equal(a / f, b / f)
