@@ -22,6 +22,12 @@ Then install TorchNEP with:
 pip install torchnep -U
 ```
 
+or install the latest development version directly from GitHub:
+
+```bash
+pip install git+https://github.com/mushroomfire/torchnep.git
+```
+
 or install from source code:
 
 ```bash
