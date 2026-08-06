@@ -358,3 +358,51 @@ def test_resume_preserves_valid_split(tmp_path):
     expected = np.array([frames[i]["energy"] / len(frames[i]["species"])
                          for i in val_idx])
     assert np.allclose(ref_resumed, expected, atol=1e-8)
+
+
+def test_export_valid_split_matches_train_nep(tmp_path):
+    """export_valid_split writes GPUMD-ready train/test files that
+    reproduce exactly the valid_ratio split train_nep uses: the reference
+    energies in energy_test.out equal the exported test.xyz energies (in
+    order), the two files partition the input verbatim, and the export is
+    deterministic."""
+    from torchnep import export_valid_split
+    nepin, xyz = _write_run_files(tmp_path)
+
+    out = tmp_path / "run"
+    train_nep(config_file=nepin, data_file=xyz, output_dir=str(out),
+              device="cpu", precision="float64", print_interval=100,
+              restart=False, checkpoint_interval=1000,
+              prediction_interval=1000, run_seed=11, valid_ratio=0.25)
+
+    tp, vp, n_tr, n_va = export_valid_split(
+        xyz, valid_ratio=0.25, run_seed=11,
+        output_dir=str(tmp_path / "split"))
+
+    orig = read_xyz(xyz)
+    tr, va = read_xyz(tp), read_xyz(vp)
+    assert n_tr == len(tr) and n_va == len(va)
+    assert len(tr) + len(va) == len(orig)
+
+    # Reference per-atom energies in energy_test.out (col 2) must equal the
+    # exported test.xyz frames, same order.
+    rows = np.loadtxt(out / "energy_test.out", ndmin=2)
+    assert rows.shape[0] == len(va)
+    ref = rows[:, 1]
+    exp = np.array([f["energy"] / f["natoms"] for f in va])
+    assert np.allclose(ref, exp, atol=1e-10)
+
+    # Verbatim: re-reading the two exports and the original gives the same
+    # frame multiset (match on energy + natoms fingerprints).
+    def fp(frames):
+        return sorted((f["natoms"], round(float(f["energy"]), 10))
+                      for f in frames)
+    assert fp(tr) + fp(va) != []  # sanity
+    assert sorted(fp(tr) + fp(va)) == fp(orig)
+
+    # Deterministic: exporting again is byte-identical.
+    tp2, vp2, _, _ = export_valid_split(
+        xyz, valid_ratio=0.25, run_seed=11,
+        output_dir=str(tmp_path / "split2"))
+    assert open(tp).read() == open(tp2).read()
+    assert open(vp).read() == open(vp2).read()
