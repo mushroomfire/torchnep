@@ -16,7 +16,9 @@ __version__ = "1.0.2a1"
 from .predict import predict_dataset
 from .train import train_nep
 from .train_sharded import train_nep_sharded
+from .data import export_valid_split
 
 __all__ = [
     "predict_dataset", "train_nep", "train_nep_sharded",
+    "export_valid_split",
 ]

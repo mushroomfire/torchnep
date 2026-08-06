@@ -42,7 +42,7 @@ from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
 from .model import NEPModel, gpumd_init_parameters
-from .data import read_xyz, parse_nep_in
+from .data import read_xyz, parse_nep_in, valid_split_indices
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
@@ -423,22 +423,13 @@ def train_nep_sharded(
         _log(f"  read {len(valid_frames)} validation structures "
              f"from {valid_file}")
     elif valid_ratio is not None:
-        if not 0.0 < valid_ratio < 1.0:
-            raise ValueError(f"valid_ratio must be in (0, 1), "
-                             f"got {valid_ratio}")
-        vg = torch.Generator()
-        vg.manual_seed(run_seed)
-        vperm = torch.randperm(len(frames), generator=vg).tolist()
-        n_val = max(1, int(round(valid_ratio * len(frames))))
-        if n_val >= len(frames):
-            raise ValueError(f"valid_ratio={valid_ratio} leaves no "
-                             f"training frames ({len(frames)} total)")
-        val_idx = sorted(vperm[:n_val])
-        val_set = set(val_idx)
+        # Same draw as export_valid_split / train_nep (see data.py).
+        train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                 run_seed)
         valid_frames = [frames[i] for i in val_idx]
-        frames = [f for i, f in enumerate(frames) if i not in val_set]
-        _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
-             f"validation, {len(frames)} remain for training "
+        frames = [frames[i] for i in train_idx]
+        _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} frames "
+             f"for validation, {len(frames)} remain for training "
              f"(split drawn from run_seed)")
     n_total = len(frames)
 

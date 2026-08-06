@@ -180,6 +180,12 @@ train_nep("nep.in", "train.xyz", output_dir="output")
 # with a validation set (either form):
 train_nep("nep.in", "train.xyz", output_dir="output", valid_file="valid.xyz")
 train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
+
+# export the exact valid_ratio split as GPUMD-ready files — train the same
+# partition in GPUMD (or anything else) and compare loss curves directly:
+from torchnep import export_valid_split
+export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
+                   output_dir="split")   # writes split/train.xyz + split/test.xyz
 ```
 
 ```bash

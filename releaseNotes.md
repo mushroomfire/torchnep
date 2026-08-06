@@ -1,5 +1,12 @@
 # Release Notes
 
+## Unreleased
+
+- **`export_valid_split`**: write the exact `valid_ratio` split
+  `train_nep` uses as verbatim GPUMD-ready `train.xyz` / `test.xyz`
+  files, so the same data partition can be trained in GPUMD and the loss
+  curves compared directly.
+
 ## 1.0.2a1
 
 - **Streaming-only data path**: the preloaded GPU data store and the
