@@ -5,15 +5,7 @@
 - **Streaming-only data path**: the preloaded GPU data store and the
   `stream_mode` option are removed — the dataset stays in host memory and
   batches are streamed to the device. Same speed, ~10–15x less GPU memory.
-- **Automatic backend, `backend` option removed**: the type-pair
-  contraction backend is now picked automatically from an 8-variant sweep
-  over 1–87 element types on MI250X, V100 and A2000. New `mulsum`
-  contraction (one-hot matmul + fused multiply/sum — no BLAS calls, no
-  atomic `index_put` in the backward) is used under `use_compile` at every
-  type count and eagerly up to 32 types; `bmm` above. On an AMD MI250X
-  compiled training gets ~9x faster than before (44 → 5 ms/step, 4-type
-  system); NVIDIA also gains. The compiled-autograd force path uses it
-  too (and now works on ROCm — `torch.backends.opt_einsum` import fix).
+- **Automatic backend, `backend` option removed**: auto selected is best.
 - **Compiled autograd forces**: `use_autograd_forces=True` +
   `use_compile=True` now works (first-order gradient materialized via
   `make_fx`) — ~4x faster than eager autograd.
