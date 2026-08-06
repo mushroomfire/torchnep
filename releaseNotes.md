@@ -1,5 +1,14 @@
 # Release Notes
 
+## Unreleased
+
+- **`use_gpumd_qscaler` now defaults to `False`**: torch's default init
+  with the self-consistent q_scaler converges to clearly better minima
+  than the GPUMD-style start (600-epoch 4-seed PdCuNiP benchmark: ~12%
+  lower E/V RMSE, ~3% lower F, on train and validation alike). `True`
+  (the old default) remains available for GPUMD-comparison runs; the
+  saved nep.txt is GPUMD-compatible either way.
+
 ## 1.0.2a1
 
 - **Streaming-only data path**: the preloaded GPU data store and the

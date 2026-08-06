@@ -142,7 +142,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `recompute_q_scaler` | `False` | only with `finetune_from`: recompute the descriptor scaler on the new data instead of keeping the source model's |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
-| `use_gpumd_qscaler` | `True` | reproduce GPUMD's init (SNES `mu`): re-init every parameter — descriptor coeffs **and** NN weights — uniform(−1,1), and compute `q_scaler` with coeffs `c=1`. Fresh training only |
+| `use_gpumd_qscaler` | `False` | `False`: torch's default init + self-consistent `q_scaler` — converges to better minima (600-epoch 4-seed benchmark: ~12% lower E/V RMSE, ~3% lower F). `True`: reproduce GPUMD's init (SNES `mu`, all parameters uniform(−1,1)) with the `c=1` `q_scaler` — for GPUMD-comparison runs. The saved `nep.txt` is GPUMD-compatible either way. Fresh training only |
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |

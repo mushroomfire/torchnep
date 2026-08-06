@@ -1126,7 +1126,7 @@ def train_nep(
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = True,
+    use_gpumd_qscaler: bool = False,
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
@@ -1180,14 +1180,18 @@ def train_nep(
     energy_key : name of the comment-line tag read as the reference energy
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
-    use_gpumd_qscaler : Default True — reproduce GPUMD's initialization: every
-        parameter is re-initialised uniform(-1, 1) — the descriptor
-        coefficients AND the NN weights (w0/b0/w1), matching SNES's mu init —
-        and the q_scaler is computed with all coefficients = 1.0 (GPUMD's
-        generation-0 ``initial_para``). False leaves torch's default NN init in
-        place and uses the self-consistent q_scaler (computed from the model's
-        actual init coefficients). Only applies to fresh training (ignored
-        under finetune_from).
+    use_gpumd_qscaler : Default False — torch's default init with the
+        self-consistent q_scaler (computed from the model's actual init
+        coefficients). On a 600-epoch 4-seed PdCuNiP benchmark this
+        converges to clearly better minima than the GPUMD-style start
+        (~12% lower E/V RMSE, ~3% lower F, train and validation alike).
+        True reproduces GPUMD's initialization instead: every parameter
+        re-initialised uniform(-1, 1) (SNES mu init) and the q_scaler
+        computed with all coefficients = 1.0 (GPUMD's generation-0
+        ``initial_para``) — useful for GPUMD-comparison runs. Either way
+        the saved nep.txt is fully GPUMD-compatible (the scaler is stored
+        in the file). Only applies to fresh training (ignored under
+        finetune_from).
     run_seed : master RNG seed for this run. None (default) -> a fresh random
         seed each run, so repeated runs differ (independent weight init AND
         per-epoch batch shuffle) — the stochastic-testing behaviour. Pass an
