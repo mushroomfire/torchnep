@@ -1,18 +1,27 @@
 # TorchNEP
 
+[![PyPI](https://img.shields.io/pypi/v/torchnep?logo=pypi&logoColor=white)](https://pypi.org/project/torchnep/)
+[![Python](https://img.shields.io/pypi/pyversions/torchnep?logo=python&logoColor=white)](https://pypi.org/project/torchnep/)
+[![Tests](https://github.com/mushroomfire/torchnep/actions/workflows/test.yml/badge.svg)](https://github.com/mushroomfire/torchnep/actions/workflows/test.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](https://www.gnu.org/licenses/gpl-3.0)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.0-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Downloads](https://img.shields.io/pypi/dm/torchnep)](https://pypi.org/project/torchnep/)
+
 A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (Neuroevolution Potential) training framework.
 
-## Features
+## ✨ Features
 
-- **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
-- **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
-- **Multi-GPU training** — distributed data parallel (DDP) across on one node or multiple nodes
-- **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to do fine-tuning; optionally slim the model to only the element types present in the new dataset
-- **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
+- 🔄 **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
+- 🎯 **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
+- 🖥️ **Multi-GPU training** — distributed data parallel (DDP) on one node or multiple nodes
+- ⚡ **Fast on NVIDIA and AMD** — `torch.compile` support with automatic backend selection, tuned on both CUDA and ROCm GPUs
+- 💾 **Memory-friendly** — the dataset stays in host memory and batches are streamed to the GPU, so memory scales with batch size, not dataset size
+- 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
+- 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
 
 ---
 
-## Installation
+## 📦 Installation
 
 TorchNEP needs only `torch >= 2.0` and `numpy`, but neither is installed automatically — install the PyTorch build that matches your CUDA/CPU setup first (see the [official guide](https://pytorch.org/get-started/locally/); numpy comes with it).
 
@@ -38,7 +47,7 @@ pip install .
 
 ---
 
-## Training data (extended-XYZ)
+## 📄 Training data (extended-XYZ)
 
 TorchNEP reads extended-XYZ files. The parser is strict — the rules below are
 enforced, and violations raise on load.
@@ -70,7 +79,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 
 ---
 
-## Training Parameters
+## ⚙️ Training Parameters
 
 ### Model architecture (GPUMD-compatible)
 
@@ -140,7 +149,7 @@ function (`train_nep` / `train_nep_sharded`):
 
 ---
 
-## Output Files
+## 📊 Output Files
 
 | File | Contents |
 |------|----------|
@@ -159,7 +168,7 @@ function (`train_nep` / `train_nep_sharded`):
 
 ---
 
-## Launch training
+## 🚀 Launch training
 
 ### Single GPU / CPU / MPS — `train_nep`
 
@@ -218,7 +227,7 @@ srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
 
 ---
 
-## Restart and Resume
+## 🔁 Restart and Resume
 
 Two ways to resume:
 
@@ -251,7 +260,7 @@ train_nep("nep.in", "train.xyz", output_dir="output",
 
 ---
 
-## Fine-Tuning
+## 🔧 Fine-Tuning
 
 Fine-tuning starts from a pre-trained model's weights instead of random initialisation. The architecture (`nep.in` parameters) must match the source model, but the new dataset's element types may be a subset of the original.
 
@@ -289,7 +298,7 @@ slimmed.save_nep_txt("nep_slim.txt", max_NN_radial, max_NN_angular)
 
 ---
 
-## Prediction
+## 🔮 Prediction
 
 ### Single-structure prediction
 
@@ -352,7 +361,7 @@ predict_dataset(
 
 ---
 
-## Source layout
+## 🗂️ Source layout
 
 The `torchnep/` package is organised as follows:
 
@@ -373,7 +382,7 @@ The `torchnep/` package is organised as follows:
 
 ---
 
-## Citation
+## 📚 Citation
 
 If you use TorchNEP in your research, please cite the following paper:
 
