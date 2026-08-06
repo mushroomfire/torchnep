@@ -462,3 +462,61 @@ def build_neighbor_list_np(positions, cell, cutoff):
     return (np.concatenate(all_i).astype(np.int64),
             np.concatenate(all_j).astype(np.int64),
             np.concatenate(all_rij))
+
+
+def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):
+    """Train/validation split indices — the exact split ``train_nep`` makes.
+
+    ``train_nep(valid_ratio=r, run_seed=s)`` holds out
+    ``max(1, round(r * n))`` frames drawn from a dedicated torch generator
+    seeded with ``run_seed``. This helper is that draw, factored out so the
+    trainers and :func:`export_valid_split` can never disagree.
+
+    Returns ``(train_idx, valid_idx)`` — both sorted in input-file order.
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it "
+                         "(train_nep uses the same seed to reproduce it)")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    perm = torch.randperm(n_frames, generator=g).tolist()
+    n_val = max(1, int(round(valid_ratio * n_frames)))
+    if n_val >= n_frames:
+        raise ValueError(f"valid_ratio={valid_ratio} leaves no training "
+                         f"frames ({n_frames} total)")
+    val_set = set(perm[:n_val])
+    train_idx = [i for i in range(n_frames) if i not in val_set]
+    return train_idx, sorted(val_set)
+
+
+def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
+                       output_dir: str = "split"):
+    """Write GPUMD-ready ``train.xyz`` / ``test.xyz`` with train_nep's split.
+
+    Reproduces exactly the validation split that
+    ``train_nep(data_file, valid_ratio=r, run_seed=s)`` uses internally, so
+    the exported pair can train the SAME data partition in GPUMD (or any
+    other code) and loss curves stay comparable. Frames are copied verbatim
+    (raw text, untouched fields and precision), in input-file order.
+
+    Returns ``(train_path, test_path, n_train, n_valid)``.
+    """
+    import os
+    with open(data_file) as f:
+        blocks = _split_frames(f.readlines())
+    train_idx, val_idx = valid_split_indices(len(blocks), valid_ratio,
+                                             run_seed)
+    os.makedirs(output_dir, exist_ok=True)
+    train_path = os.path.join(output_dir, "train.xyz")
+    test_path = os.path.join(output_dir, "test.xyz")
+    src = os.path.abspath(data_file)
+    for path, idxs in ((train_path, train_idx), (test_path, val_idx)):
+        if os.path.abspath(path) == src:
+            raise ValueError(f"output would overwrite the input: {src}")
+        with open(path, "w") as out:
+            for k in idxs:
+                out.writelines(blocks[k])
+    return train_path, test_path, len(train_idx), len(val_idx)

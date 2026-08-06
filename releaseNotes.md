@@ -8,6 +8,10 @@
   lower E/V RMSE, ~3% lower F, on train and validation alike). `True`
   (the old default) remains available for GPUMD-comparison runs; the
   saved nep.txt is GPUMD-compatible either way.
+- **`export_valid_split`**: write the exact `valid_ratio` split
+  `train_nep` uses as verbatim GPUMD-ready `train.xyz` / `test.xyz`
+  files, so the same data partition can be trained in GPUMD and the loss
+  curves compared directly.
 
 ## 1.0.2a1
 

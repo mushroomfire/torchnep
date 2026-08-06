@@ -41,7 +41,7 @@ from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model, gpumd_init_parameters
-from .data import read_xyz, parse_nep_in, build_neighbor_list_np
+from .data import read_xyz, parse_nep_in, valid_split_indices, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_from_store
@@ -1328,22 +1328,14 @@ def train_nep(
         _log(f"  read {len(valid_frames)} validation structures "
              f"from {valid_file}")
     elif valid_ratio is not None:
-        if not 0.0 < valid_ratio < 1.0:
-            raise ValueError(f"valid_ratio must be in (0, 1), "
-                             f"got {valid_ratio}")
-        g = torch.Generator()
-        g.manual_seed(run_seed)
-        perm = torch.randperm(len(frames), generator=g).tolist()
-        n_val = max(1, int(round(valid_ratio * len(frames))))
-        if n_val >= len(frames):
-            raise ValueError(f"valid_ratio={valid_ratio} leaves no "
-                             f"training frames ({len(frames)} total)")
-        val_idx = sorted(perm[:n_val])
-        val_set = set(val_idx)
+        # The same draw export_valid_split reproduces (see data.py) — the
+        # split can be exported as GPUMD-ready train.xyz/test.xyz files.
+        train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                 run_seed)
         valid_frames = [frames[i] for i in val_idx]
-        frames = [f for i, f in enumerate(frames) if i not in val_set]
-        _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
-             f"validation, {len(frames)} remain for training "
+        frames = [frames[i] for i in train_idx]
+        _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} frames "
+             f"for validation, {len(frames)} remain for training "
              f"(split drawn from run_seed)")
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
