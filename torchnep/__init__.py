@@ -11,7 +11,7 @@
 # You should have received a copy of the GNU General Public License
 # along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
-__version__ = "1.0.1"
+__version__ = "1.0.2a1"
 
 from .predict import predict_dataset
 from .train import train_nep

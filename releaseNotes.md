@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 1.0.2a1
 
 - **Streaming-only data path**: the preloaded GPU data store and the
   `stream_mode` option are removed — the dataset stays in host memory and
