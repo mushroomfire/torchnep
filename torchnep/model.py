@@ -262,14 +262,21 @@ class NEPModel(nn.Module):
 
         return result
 
-    def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
-                                   backend: str = "loop"):
-        """Compute energy, forces, virial using precomputed basis.
+    def _cached_core(self, batch, need_forces=True, need_virial=False,
+                     backend: str = "loop"):
+        """Descriptor + NN + analytical-force part of the cached compute.
 
-        Uses fully analytical force computation — no create_graph=True needed.
-        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
+        Deliberately free of data-dependent Python control flow (the
+        per-type NN dispatch is branchless: every type's net runs on all
+        atoms and ``torch.where`` selects), and ZBL is NOT included — so
+        ``torch.compile`` captures this whole function as ONE graph with no
+        breaks (the eager path's ``mask.any()`` branches and the ZBL block's
+        inner ``autograd.grad`` each split the graph, leaving ~2.7x more
+        kernel launches). ZBL and result assembly live in the
+        ``compute_properties_cached`` wrapper.
 
-        ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
+        Returns ``(Ei, forces, virial)`` — forces/virial are None when not
+        requested.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -316,46 +323,83 @@ class NEPModel(nn.Module):
 
         # NN forward + Fp computation (differentiable through NN weights).
         #
-        # Every per-type fitting net is touched in the graph on every forward
-        # — even types with no atoms in this batch get a zeroed-out dummy pass.
-        # This keeps DDP gradient bookkeeping consistent (no need for
-        # find_unused_parameters=True) and, critically, avoids the implicit
-        # /world_size gradient dilution that DDP applies to unused parameters
-        # (which was biasing rare-type NNs toward lower effective LR).
+        # Branchless per-type dispatch: EVERY type's net runs on all atoms
+        # and torch.where selects per atom. The nets are tiny, so the extra
+        # flops are negligible; in exchange there is no data-dependent
+        # Python branch (torch.compile keeps one graph) and every parameter
+        # is in the autograd graph on every forward — which also keeps DDP
+        # gradient bookkeeping consistent without find_unused_parameters
+        # and avoids the implicit /world_size gradient dilution for types
+        # absent from a batch.
         Ei = torch.zeros(N, dtype=dtype, device=device)
         Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
-        dummy_accum = torch.zeros((), dtype=dtype, device=device)
-        dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
-            1, self.dim, dtype=dtype, device=device)
-
         for t in range(self.num_types):
-            mask = batch["atom_types"] == t
             net = self.fitting_nets[t]
-            if mask.any():
-                qt = q_scaled[mask]
-                z = qt @ net.w0 - net.b0
-                h = torch.tanh(z)
-                Ei[mask] = h @ net.w1
-                tanh_der = 1.0 - h * h
-                Fp[mask] = (net.w1 * tanh_der) @ net.w0.T
-            else:
-                # Dummy forward (the * 0 below nulls the contribution but
-                # keeps the net's parameters in the autograd graph).
-                z_d = dummy_q @ net.w0 - net.b0
-                h_d = torch.tanh(z_d)
-                dummy_accum = dummy_accum + (h_d @ net.w1).sum()
+            z = q_scaled @ net.w0 - net.b0
+            h = torch.tanh(z)
+            e_t = h @ net.w1
+            tanh_der = 1.0 - h * h
+            fp_t = (net.w1 * tanh_der) @ net.w0.T
+            sel = batch["atom_types"] == t
+            Ei = torch.where(sel, e_t, Ei)
+            Fp = torch.where(sel.unsqueeze(-1), fp_t, Fp)
 
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
-        # Nail the unused-type gradient path into Ei without changing its value.
-        Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1  # subtract shared output bias
+
+        forces = None
+        virial = None
+        if need_forces:
+            # Analytical forces: fully differentiable through c2/c3 and NN
+            # weights (Fp). No create_graph=True needed — chain rule is
+            # computed explicitly.
+            forces, virial = ops.compute_analytical_forces(
+                Fp, batch["atom_types"], N,
+                self.c_param_2, self.c_param_3,
+                batch["fkp_rad"], batch["fkp_ang"], batch["blm"],
+                batch["pair_i_rad"], batch["pair_j_rad"],
+                batch["rij_rad"], batch["d12inv_rad"],
+                batch["pair_i_ang"], batch["pair_j_ang"],
+                batch["rij_ang"], batch["d12inv_ang"],
+                s, gn_ang,
+                self.n_max_radial, self.n_max_angular,
+                self.l_max_3b,
+                self.has_q_222, self.has_q_1111, self.has_q_112,
+                self.num_lm, self._c3b, self._c4b, self._c5b,
+                self._c4b2,
+                dtype, device,
+                compute_virial=need_virial,
+                backend=backend,
+                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
+            has_q_134=self.has_q_134,
+            )
+        return Ei, forces, virial
+
+    def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
+                                   backend: str = "loop", core_fn=None):
+        """Compute energy, forces, virial using precomputed basis.
+
+        Uses fully analytical force computation — no create_graph=True needed.
+        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
+
+        ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
+        ``core_fn`` optionally substitutes a ``torch.compile``d version of
+        ``_cached_core`` (the trainer passes one); the ZBL add-on and result
+        assembly below stay eager either way (ZBL's typewise cutoffs and
+        inner autograd.grad cannot be captured in the compiled graph).
+        """
+        dtype = self.q_scaler.dtype
+        device = self.q_scaler.device
+        N = batch["N"]
+
+        core = core_fn if core_fn is not None else self._cached_core
+        Ei, forces, virial = core(batch, need_forces=need_forces,
+                                  need_virial=need_virial, backend=backend)
 
         # ZBL energy + forces (no trainable params; local autograd on rij_ang).
         # enable_grad: end-of-training predict_from_store wraps this call in
         # torch.no_grad(), under which Ei_zbl.requires_grad would be False
         # and the ZBL force contribution would be silently dropped.
-        zbl_forces = None
-        zbl_virial = None
         if self.zbl is not None:
             with torch.enable_grad():
                 rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
@@ -380,43 +424,19 @@ class NEPModel(nn.Module):
                     batch["rij_ang"].detach(), g_zbl.detach(),
                     dtype, device,
                 )
+                if forces is not None:
+                    forces = forces + zbl_forces
+                    if need_virial and virial is not None:
+                        virial = virial + zbl_virial
 
         Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
         Etot.scatter_add_(0, batch["struct_idx"], Ei)
 
         result = {"Ei": Ei, "Etot": Etot}
-
         if need_forces:
-            # Analytical forces: fully differentiable through c2/c3 and NN weights (Fp).
-            # No create_graph=True needed — chain rule is computed explicitly.
-            forces, virial = ops.compute_analytical_forces(
-                Fp, batch["atom_types"], N,
-                self.c_param_2, self.c_param_3,
-                batch["fkp_rad"], batch["fkp_ang"], batch["blm"],
-                batch["pair_i_rad"], batch["pair_j_rad"],
-                batch["rij_rad"], batch["d12inv_rad"],
-                batch["pair_i_ang"], batch["pair_j_ang"],
-                batch["rij_ang"], batch["d12inv_ang"],
-                s, gn_ang,
-                self.n_max_radial, self.n_max_angular,
-                self.l_max_3b,
-                self.has_q_222, self.has_q_1111, self.has_q_112,
-                self.num_lm, self._c3b, self._c4b, self._c5b,
-                self._c4b2,
-                dtype, device,
-                compute_virial=need_virial,
-                backend=backend,
-                has_q_123=self.has_q_123, has_q_233=self.has_q_233,
-            has_q_134=self.has_q_134,
-            )
-            if zbl_forces is not None:
-                forces = forces + zbl_forces
-                if need_virial:
-                    virial = virial + zbl_virial
             result["forces"] = forces
             if need_virial and virial is not None:
                 result["virial"] = virial
-
         return result
 
     def load_weights_from_nep_txt(self, path: str):

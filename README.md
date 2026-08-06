@@ -101,7 +101,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
-| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Per-stage (MACE-style): a stage-1 plateau with `stage2 1` configured jumps straight into Stage 2 instead of ending the run — only a plateau in the final stage terminates it (the advanced stage-2 start is kept across resume). Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
+| `early_stop` | `0` | Stop if the monitored loss (validation loss when a validation set is used, else training loss) hasn't improved for N epochs (`0` = off). Per-stage: a stage-1 plateau jumps into Stage 2 instead of ending the run. Use a value larger than `scheduler_patience` |
 | `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
@@ -121,10 +121,10 @@ function (`train_nep` / `train_nep_sharded`):
 |---|---|---|
 | `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"`; any other stream-based PyTorch accelerator should also work if passed explicitly |
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
-| `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` |
+| `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"`. Auto resolves to `bmm` under `use_compile` (fuses best) and to `loop` in eager mode unless there are ≥20 element types — benchmarks show eager `loop` wins clearly up to ~16 types |
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
-| `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
+| `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). |
 | `print_interval` | `10` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
 | `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
@@ -138,7 +138,6 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `stream_mode` | `False` | keep the dataset in host memory and stream only the current batch to the GPU (basis computed on the fly, CPU batch assembly prefetched one batch ahead). GPU memory scales with `batch` instead of dataset size — use for datasets that don't fit on the card. Numerically identical to the default; costs a modest per-epoch slowdown in eager mode (speed parity under `use_compile`). Works in both `train_nep` and `train_nep_sharded` (each rank streams its own shard) |
 
 ---
 
@@ -367,8 +366,9 @@ The `torchnep/` package is organised as follows:
 | `ops.py` | Core differentiable kernels — Chebyshev/angular basis, descriptors, ANN evaluation, ZBL; pure-PyTorch `loop`/`bmm` backends |
 | `nep.py` | `NEPCalculator` — loads a `nep.txt` and computes energy/forces/virial/descriptors for single structures |
 | `predict.py` | Batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
-| `train.py` | Single-GPU/CPU training (`train_nep`): data store, two-stage loop, schedulers, checkpoint/restart, periodic predict |
+| `train.py` | Single-GPU/CPU training (`train_nep`): host-resident streaming data store (`StreamDataStore` + prefetching `iter_collated`), two-stage loop, schedulers, checkpoint/restart, periodic predict |
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
+| `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 

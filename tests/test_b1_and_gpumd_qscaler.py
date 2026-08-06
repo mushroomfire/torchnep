@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from torchnep.data import read_xyz, parse_nep_in
-from torchnep.train import (preprocess_structures, GPUDataStore,
+from torchnep.train import (preprocess_structures, StreamDataStore,
                             compute_q_scaler, recompute_b1_shift, train_nep)
 from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
@@ -40,7 +40,7 @@ NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
 def _store(cfg, n=20, dtype=torch.float64):
     frames = read_xyz(str(PBTE))[:n]
     structs = preprocess_structures(frames, cfg, np.float64)
-    return GPUDataStore(structs, torch.device("cpu"), dtype, config=cfg)
+    return StreamDataStore(structs, torch.device("cpu"), dtype, config=cfg)
 
 
 def _cfg_from_nepin(tmp_path=None):

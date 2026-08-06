@@ -209,304 +209,25 @@ def format_config_summary(config: dict) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# GPU data store — all data pre-loaded to device
+# Data store — host-resident, batches streamed to the device
 # ---------------------------------------------------------------------------
 
-def _basis_chunk_size(device, dtype, basis_size_angular, num_lm, l_max_3b,
-                      min_chunk=1 << 16, max_chunk=1 << 23):
-    """Pairs-per-chunk for the cached-basis precompute in ``GPUDataStore``.
-
-    The basis is built in chunks so the transient working set is one chunk
-    instead of the whole shard — this lowers the construction-time GPU memory
-    peak (which otherwise sits well above the steady training footprint and
-    needlessly caps how big a shard each rank can hold). Results are unchanged:
-    the Chebyshev/angular bases are per-pair elementwise, so chunking is
-    bit-identical to the one-shot path.
-
-    The chunk is sized so one chunk's transient stays within a small fixed
-    budget (``TARGET`` below, ~512 MB) — the whole point is to keep the peak
-    just above the steady footprint, not to go as fast as possible. On CUDA the
-    budget is additionally clamped to a fraction of the memory still *free*
-    after the persistent basis buffers are allocated (queried via
-    ``mem_get_info``), so a memory-tight card shrinks the chunk further rather
-    than OOM-ing. On CPU only the fixed budget applies. Bigger chunks make
-    ``__init__`` faster; they never affect training speed (training reads the
-    same split-view layout either way).
-    """
-    elem = 8 if dtype == torch.float64 else 4
-    # Generous per-pair transient estimate: Chebyshev scratch (~14 vectors),
-    # angular z/Re/Im powers + the blm list and its torch.stack copy
-    # (~2*num_lm + 4*(l+1)), plus margin. Over-estimating only shrinks the
-    # chunk, which is safe.
-    per_pair = elem * (2 * (basis_size_angular + 1) + 2 * num_lm
-                       + 4 * (l_max_3b + 1) + 40)
-    TARGET = 512 * 1024 * 1024  # ~512 MB transient budget per chunk
-    budget = TARGET
-    if device.type == "cuda":
-        try:
-            free, _ = torch.cuda.mem_get_info(device)
-            # Never let the transient eat more than half of what's free, so a
-            # tight card shrinks the chunk instead of OOM-ing at build time.
-            budget = min(TARGET, int(free * 0.5))
-        except Exception:
-            budget = min(TARGET, 256 * 1024 * 1024)
-    chunk = budget // max(per_pair, 1)
-    return max(min_chunk, min(max_chunk, chunk))
-
-
-class GPUDataStore:
-    """Pre-loads all structure data to GPU for zero-copy batch collation.
-
-    When ``config`` is given, also caches Chebyshev basis functions and
-    angular basis on GPU so training never recomputes them.
-    """
-
-    def __init__(self, structures: List[Dict], device: torch.device,
-                 dtype: torch.dtype, config: dict = None):
-        self.device = device
-        self.dtype = dtype
-        self.n = len(structures)
-        self.has_cached_basis = config is not None
-
-        n_rad = np.array([len(s["pair_i_rad"]) for s in structures], dtype=np.int64)
-        n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
-        self.natoms = [int(s["natoms"]) for s in structures]
-
-        # preprocess_structures already returns arrays with the right dtype
-        # (int64 for indices, float32 for rij). Skip the defensive astype —
-        # it was creating an extra copy of every per-frame array.
-        at_cat   = np.concatenate([s["atom_types"]  for s in structures])
-        pi_r_cat = np.concatenate([s["pair_i_rad"]  for s in structures])
-        pj_r_cat = np.concatenate([s["pair_j_rad"]  for s in structures])
-        rij_r_cat = np.concatenate([s["rij_rad"]    for s in structures])
-        pi_a_cat = np.concatenate([s["pair_i_ang"]  for s in structures])
-        pj_a_cat = np.concatenate([s["pair_j_ang"]  for s in structures])
-        rij_a_cat = np.concatenate([s["rij_ang"]    for s in structures])
-
-        at_all   = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
-
-        pi_r_all = torch.from_numpy(pi_r_cat).to(device=device, non_blocking=True)
-        pj_r_all = torch.from_numpy(pj_r_cat).to(device=device, non_blocking=True)
-        rij_r_all = torch.from_numpy(rij_r_cat).to(device=device, dtype=dtype,
-                                                    non_blocking=True)
-        pi_a_all = torch.from_numpy(pi_a_cat).to(device=device, non_blocking=True)
-        pj_a_all = torch.from_numpy(pj_a_cat).to(device=device, non_blocking=True)
-        rij_a_all = torch.from_numpy(rij_a_cat).to(device=device, dtype=dtype,
-                                                    non_blocking=True)
-
-        self.energy = [float(s["energy"]) if "energy" in s else 0.0
-                       for s in structures]
-        self.has_energy_flag = ["energy" in s for s in structures]
-        self.has_forces_flag = ["forces" in s for s in structures]
-        self.has_virial_flag = ["virial" in s for s in structures]
-
-        f_parts = []
-        for s in structures:
-            if "forces" in s:
-                f_parts.append(np.asarray(s["forces"]).reshape(-1, 3))
-            else:
-                f_parts.append(np.zeros((s["natoms"], 3), dtype=np.float32))
-        f_cat = np.concatenate(f_parts).astype(np.float32 if dtype == torch.float32
-                                               else np.float64, copy=False)
-        f_all = torch.from_numpy(f_cat).to(device=device, dtype=dtype,
-                                            non_blocking=True)
-
-        v_parts = []
-        for s in structures:
-            if "virial" in s:
-                v = np.asarray(s["virial"]).reshape(-1)
-                if v.shape[0] == 6:
-                    v9 = np.array([v[0], v[3], v[5],
-                                   v[3], v[1], v[4],
-                                   v[5], v[4], v[2]])
-                    v_parts.append(v9)
-                else:
-                    v_parts.append(v[:9])
-            else:
-                v_parts.append(np.zeros(9))
-        v_cat = np.stack(v_parts).astype(np.float32 if dtype == torch.float32
-                                         else np.float64, copy=False)
-        v_all = torch.from_numpy(v_cat).to(device=device, dtype=dtype,
-                                            non_blocking=True)
-
-        # Per-frame cell volume (A**3) — needed for stress RMSE. Same order as
-        # frames, so a batch slice follows the same indexing as .energy etc.
-        vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
-                             dtype=np.float32 if dtype == torch.float32
-                             else np.float64)
-        self.volumes = torch.from_numpy(vol_cat).to(device=device, dtype=dtype,
-                                                     non_blocking=True)
-
-        if config is not None:
-            # Build the cached basis in pair-chunks, writing into preallocated
-            # buffers. The transient working set is then one chunk, not the
-            # whole shard — this caps the construction-time GPU memory peak so
-            # it stays close to the steady training footprint. Chebyshev and
-            # angular bases are per-pair elementwise, so this is bit-identical
-            # to computing them in one shot; only __init__ does more work, the
-            # training step (which reads the split views below) is unchanged.
-            rc_r = config["cutoff_radial"]
-            rc_a = config["cutoff_angular"]
-            bs_r = config["basis_size_radial"]
-            bs_a = config["basis_size_angular"]
-            l3 = config["l_max"][0]
-            num_lm = sum(2 * ll + 1 for ll in range(1, l3 + 1)) if l3 >= 1 else 0
-
-            P_r = rij_r_all.shape[0]
-            fk_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
-            fkp_r_all = torch.empty(P_r, bs_r + 1, dtype=dtype, device=device)
-            d12inv_r_all = torch.empty(P_r, dtype=dtype, device=device)
-
-            P_a = rij_a_all.shape[0]
-            fk_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
-            fkp_a_all = torch.empty(P_a, bs_a + 1, dtype=dtype, device=device)
-            d12inv_a_all = torch.empty(P_a, dtype=dtype, device=device)
-            blm_all = torch.empty(P_a, num_lm, dtype=dtype, device=device)
-
-            # Chunk sized against memory still free *after* the buffers above.
-            chunk = _basis_chunk_size(device, dtype, bs_a, num_lm, l3)
-
-            for st in range(0, P_r, chunk):
-                en = min(st + chunk, P_r)
-                dr = torch.norm(rij_r_all[st:en], dim=-1)
-                fk, fkp = ops.chebyshev_basis_and_deriv(dr, rc_r, bs_r)
-                fk_r_all[st:en] = fk
-                fkp_r_all[st:en] = fkp
-                d12inv_r_all[st:en] = 1.0 / dr
-
-            for st in range(0, P_a, chunk):
-                en = min(st + chunk, P_a)
-                rij = rij_a_all[st:en]
-                da = torch.norm(rij, dim=-1)
-                fk, fkp = ops.chebyshev_basis_and_deriv(da, rc_a, bs_a)
-                fk_a_all[st:en] = fk
-                fkp_a_all[st:en] = fkp
-                dinv = 1.0 / da
-                d12inv_a_all[st:en] = dinv
-                if num_lm > 0:
-                    blm_all[st:en] = ops.angular_basis(
-                        rij[:, 0] * dinv, rij[:, 1] * dinv,
-                        rij[:, 2] * dinv, l3)
-
-        nr_list = n_rad.tolist()
-        na_list = n_ang.tolist()
-        nat_list = [int(x) for x in self.natoms]
-
-        self.atom_types = list(torch.split(at_all, nat_list))
-        self.pi_rad = list(torch.split(pi_r_all, nr_list))
-        self.pj_rad = list(torch.split(pj_r_all, nr_list))
-        self.rij_rad = list(torch.split(rij_r_all, nr_list))
-        self.pi_ang = list(torch.split(pi_a_all, na_list))
-        self.pj_ang = list(torch.split(pj_a_all, na_list))
-        self.rij_ang = list(torch.split(rij_a_all, na_list))
-        self.forces = list(torch.split(f_all, nat_list))
-        self.virial = list(torch.unbind(v_all, dim=0))
-
-        if config is not None:
-            self.fk_rad = list(torch.split(fk_r_all, nr_list))
-            self.fkp_rad = list(torch.split(fkp_r_all, nr_list))
-            self.d12inv_rad = list(torch.split(d12inv_r_all, nr_list))
-            self.fk_ang = list(torch.split(fk_a_all, na_list))
-            self.fkp_ang = list(torch.split(fkp_a_all, na_list))
-            self.d12inv_ang = list(torch.split(d12inv_a_all, na_list))
-            self.blm = list(torch.split(blm_all, na_list))
-
-        self.n_energy = sum(self.has_energy_flag)
-        self.n_forces = sum(self.has_forces_flag)
-        self.n_virial = sum(self.has_virial_flag)
-        self.has_forces = self.n_forces > 0
-        self.has_virial = self.n_virial > 0
-
-    def collate(self, indices: List[int]) -> Dict:
-        """Fast GPU-side batch collation. No CPU->GPU transfer."""
-        offsets = [0]
-        for i in indices:
-            offsets.append(offsets[-1] + self.natoms[i])
-        N_total = offsets[-1]
-        B = len(indices)
-
-        at_list = [self.atom_types[i] for i in indices]
-        atom_types = torch.cat(at_list)
-
-        struct_idx = torch.cat([
-            torch.full((self.natoms[i],), k, dtype=torch.long,
-                       device=self.device)
-            for k, i in enumerate(indices)
-        ])
-
-        pi_r = torch.cat([self.pi_rad[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        pj_r = torch.cat([self.pj_rad[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        rij_r = torch.cat([self.rij_rad[i] for i in indices])
-        pi_a = torch.cat([self.pi_ang[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        pj_a = torch.cat([self.pj_ang[i] + offsets[k]
-                          for k, i in enumerate(indices)])
-        rij_a = torch.cat([self.rij_ang[i] for i in indices])
-
-        energy = torch.tensor([self.energy[i] for i in indices],
-                              dtype=self.dtype, device=self.device)
-        natoms = torch.tensor([self.natoms[i] for i in indices],
-                              dtype=self.dtype, device=self.device)
-
-        volumes = self.volumes[torch.as_tensor(indices, device=self.device,
-                                               dtype=torch.long)]
-
-        batch = {
-            "N": N_total, "num_structures": B,
-            "atom_types": atom_types, "struct_idx": struct_idx,
-            "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
-            "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-            "energy": energy, "natoms": natoms, "volumes": volumes,
-        }
-
-        batch["energy_mask"] = torch.tensor(
-            [self.has_energy_flag[i] for i in indices],
-            dtype=torch.bool, device=self.device)
-
-        batch["forces"] = torch.cat([self.forces[i] for i in indices])
-        force_flags = [self.has_forces_flag[i] for i in indices]
-        batch["force_mask"] = torch.cat([
-            torch.full((self.natoms[indices[k]],), force_flags[k],
-                       dtype=torch.bool, device=self.device)
-            for k in range(B)
-        ])
-
-        batch["virial"] = torch.stack([self.virial[i] for i in indices])
-        batch["virial_mask"] = torch.tensor(
-            [self.has_virial_flag[i] for i in indices],
-            dtype=torch.bool, device=self.device)
-
-        if self.has_cached_basis:
-            batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
-            batch["fkp_rad"] = torch.cat([self.fkp_rad[i] for i in indices])
-            batch["d12inv_rad"] = torch.cat([self.d12inv_rad[i] for i in indices])
-            batch["fk_ang"] = torch.cat([self.fk_ang[i] for i in indices])
-            batch["fkp_ang"] = torch.cat([self.fkp_ang[i] for i in indices])
-            batch["d12inv_ang"] = torch.cat([self.d12inv_ang[i] for i in indices])
-            batch["blm"] = torch.cat([self.blm[i] for i in indices])
-
-        return batch
-
-
 class StreamDataStore:
-    """Host-resident data store — GPU memory scales with batch size only.
+    """The training data store: host-resident, GPU memory scales with batch
+    size only.
 
-    Same construction signature and same consumer interface as
-    ``GPUDataStore`` (``collate`` + the metadata attributes), but every
-    per-structure array stays in host memory. ``collate`` assembles the
-    requested frames on the CPU, copies just that batch to the device
-    (via a pinned staging copy so the H2D transfer is async), and computes
-    the Chebyshev/angular basis for the batch on the fly.
+    Every per-structure array stays in host memory. ``collate(indices)``
+    assembles the requested frames on the CPU, copies just that batch to the
+    device (via a pinned staging copy so the H2D transfer is async), and
+    computes the Chebyshev/angular basis for the batch on the fly. The
+    background-prefetch iteration in ``iter_collated`` plus the pinned async
+    copies hide the streaming work behind the device compute — benchmarks
+    across 1-16 element types showed speed parity with a fully preloaded
+    GPU store (which this class replaced) at ~10-15x less GPU memory, so
+    streaming is the only data path.
 
-    The recomputed basis is bit-identical to GPUDataStore's cached one:
-    the basis is per-pair elementwise math, so evaluating it per batch
-    reproduces exactly the values the cached path would have stored.
-
-    Trade-off: each batch pays one small host->device transfer plus the
-    basis recompute; in exchange the GPU never holds the dataset, so the
-    memory footprint is set by the batch size, not the dataset size.
+    The per-batch basis is chunking-invariant per-pair elementwise math, so
+    every batch is bit-identical no matter how the dataset is batched.
     """
 
     def __init__(self, structures: List[Dict], device: torch.device,
@@ -590,12 +311,12 @@ class StreamDataStore:
 
         # Per-frame CPU views — predict_from_store reads
         # ``data_store.forces[i].cpu()`` / ``.virial[i].cpu()`` (no-ops on
-        # these CPU views), so the GPUDataStore interface is preserved.
+        # these CPU views).
         self.forces = list(torch.split(self._f_all, self.natoms))
         self.virial = list(torch.unbind(self._v_all, dim=0))
 
-        # Tiny (n,) tensor; kept on device like GPUDataStore (collate indexes
-        # it with a device tensor and predict calls .cpu() on it).
+        # Tiny (n,) tensor; kept on device (collate indexes it with a
+        # device tensor and predict calls .cpu() on it).
         vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
                              dtype=np_dtype)
         self.volumes = torch.from_numpy(vol_cat).to(device=device, dtype=dtype)
@@ -642,7 +363,7 @@ class StreamDataStore:
         off_t = torch.from_numpy(offsets[:-1])
 
         # Pair indices are frame-local in storage; shift each frame's pairs
-        # by its atom offset within the batch (same as GPUDataStore.collate).
+        # by its atom offset within the batch.
         off_rep_r = torch.repeat_interleave(off_t, nr_t)
         off_rep_a = torch.repeat_interleave(off_t, na_t)
 
@@ -682,11 +403,11 @@ class StreamDataStore:
                     "force_mask", "virial", "virial_mask")
 
     def _basis_impl(self, rij_r, rij_a):
-        """Per-batch basis — the values GPUDataStore would have cached.
+        """Per-batch Chebyshev/angular basis.
 
-        Eager execution of this method is bit-identical to the cached path
-        (per-pair elementwise math, chunking-invariant). ``compile_basis``
-        may swap in a torch.compile'd version of this same method.
+        Per-pair elementwise math — chunking-invariant, so results do not
+        depend on how the dataset is batched. ``compile_basis`` may swap in
+        a torch.compile'd version of this same method.
         """
         dr = torch.norm(rij_r, dim=-1)
         fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, self._rc_r, self._bs_r)
@@ -708,7 +429,7 @@ class StreamDataStore:
         compiled: Inductor's fusion reassociates float ops, so the compiled
         basis deviates from the eager one at the same ~1e-7 level the
         compiled training compute already introduces. Never enabled in
-        eager runs, which keeps the default bit-identical to GPUDataStore.
+        eager runs, which keeps eager training exactly chunking-invariant.
         """
         self._basis_fn = torch.compile(self._basis_impl, dynamic=True)
 
@@ -731,8 +452,7 @@ class StreamDataStore:
 
     def collate(self, indices: List[int]) -> Dict:
         """Assemble one batch on the CPU, ship it to the device, and compute
-        the batch's basis there. Returns the same dict (same values) as
-        ``GPUDataStore.collate``."""
+        the batch's basis there. Returns the collated batch dict."""
         return self._finalize(self._assemble_cpu(indices))
 
 
@@ -1411,7 +1131,6 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    stream_mode: bool = False,
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1488,16 +1207,6 @@ def train_nep(
         run_seed, so it is reproducible for a given seed and is preserved
         exactly on resume (the checkpoint's seed wins). Mutually exclusive
         with valid_file.
-    stream_mode : False (default) -> all structure data and the cached basis
-        are pre-loaded to the device (fastest; GPU memory grows with dataset
-        size). True -> the dataset stays in host memory and only the current
-        batch is shipped to the device, with its basis computed on the fly —
-        GPU memory then scales with ``batch`` instead of dataset size, at a
-        modest per-epoch speed cost. Eager runs are numerically identical
-        to the default (the streamed batches are bit-identical to the
-        preloaded ones); with ``use_compile=True`` the per-batch basis is
-        compiled too, adding only the same ~1e-7-level deviations the
-        compiled compute already introduces.
     """
     _clean_warning_format()
 
@@ -1644,7 +1353,7 @@ def train_nep(
     n_structs = len(frames)
 
     # slim_types: detect which element types actually appear in the data and
-    # narrow config before building neighbor lists / GPUDataStore / model.
+    # narrow config before building neighbor lists / data store / model.
     # This makes the entire training run faster, not just the output file.
     _slim_keep = None  # None = no slimming; list = types to keep
     if slim_types:
@@ -1672,16 +1381,12 @@ def train_nep(
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
 
     t0 = time.time()
-    _StoreCls = StreamDataStore if stream_mode else GPUDataStore
-    data_store = _StoreCls(structures, dev, dtype, config=config)
+    data_store = StreamDataStore(structures, dev, dtype, config=config)
     del structures
     if dev.type == "cuda":
         torch.cuda.synchronize()
-    if stream_mode:
-        _log(f"  stream_mode: dataset kept in host memory, batches "
-             f"streamed to {dev} ({time.time() - t0:.1f}s)")
-    else:
-        _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    _log(f"  data store ready: dataset in host memory, batches streamed "
+         f"to {dev} ({time.time() - t0:.1f}s)")
     _log(f"  coverage: {data_store.n_energy} E / "
          f"{data_store.n_forces} F / {data_store.n_virial} V")
 
@@ -1695,7 +1400,7 @@ def train_nep(
         vNN_rad, vNN_ang = compute_max_neighbors(structures_v)
         max_NN_rad = max(max_NN_rad, vNN_rad)
         max_NN_ang = max(max_NN_ang, vNN_ang)
-        valid_store = _StoreCls(structures_v, dev, dtype, config=config)
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config)
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "
@@ -1798,8 +1503,13 @@ def train_nep(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            # The nested create_graph=True double backward cannot be lowered
+            # directly, but the make_fx route (materialize the first-order
+            # gradient as ordinary FX ops, then compile) can — see
+            # torchnep/compiled_autograd.py.
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (autograd forces via "
+                           "make_fx-materialized gradient)")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
@@ -1833,12 +1543,11 @@ def train_nep(
                  "(recompute_q_scaler=True) — the loaded weights will "
                  "see rescaled descriptors and must re-adapt")
         t0 = time.time()
-        # In stream mode the q-scaler pass uses the training batch size so
-        # its transient GPU footprint stays batch-bound (min/max over the
-        # dataset is chunking-invariant, so the result is unchanged).
-        qscaler_bs = batch_size if stream_mode else 1000
+        # The q-scaler pass uses the training batch size so its transient
+        # GPU footprint stays batch-bound (min/max over the dataset is
+        # chunking-invariant, so the result is unchanged).
         q_min, q_max = compute_q_scaler(model, data_store, backend=backend,
-                                        batch_size=qscaler_bs,
+                                        batch_size=batch_size,
                                         gpumd_init=use_gpumd_qscaler)
         model.set_q_scaler(q_min, q_max)
         if dev.type == "cuda":
@@ -1855,11 +1564,21 @@ def train_nep(
     compute_props_cached = raw_model.compute_properties_cached
     if compile_on:
         _quiet_compile_logs()
-        compute_props_cached = torch.compile(
-            raw_model.compute_properties_cached, dynamic=True)
-        if stream_mode:
+        if use_autograd_forces:
+            from .compiled_autograd import CompiledAutogradForce
+            compute_props = CompiledAutogradForce(raw_model).compute_properties
+        else:
+            # Compile the branch-free core only — ZBL and result assembly
+            # stay eager in the wrapper. Compiling the whole method instead
+            # leaves 3 graph breaks (per-type masks + ZBL autograd.grad) and
+            # ~2.7x the kernel launches.
+            import functools
+            _compiled_core = torch.compile(raw_model._cached_core,
+                                           dynamic=True)
+            compute_props_cached = functools.partial(
+                raw_model.compute_properties_cached, core_fn=_compiled_core)
             # Fuse the per-batch basis kernels too — same numerical status
-            # as the compiled compute (Inductor-level ~1e-7 deviations).
+            # as the compiled compute (~1e-7 Inductor deviations).
             data_store.compile_basis()
             if valid_store is not None:
                 valid_store.compile_basis()
