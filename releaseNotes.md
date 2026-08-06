@@ -5,8 +5,7 @@
 - **Streaming-only data path**: the preloaded GPU data store and the
   `stream_mode` option are removed — the dataset stays in host memory and
   batches are streamed to the device. Same speed, ~10–15x less GPU memory.
-- **`backend="auto"`**: eager mode now uses `loop` below 20 element types
-  (was 8); `bmm` under `use_compile`.
+- **Automatic backend, `backend` option removed**: auto selected is best.
 - **Compiled autograd forces**: `use_autograd_forces=True` +
   `use_compile=True` now works (first-order gradient materialized via
   `make_fx`) — ~4x faster than eager autograd.

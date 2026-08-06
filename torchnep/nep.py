@@ -617,7 +617,7 @@ class NEPCalculator:
         if compile:
             # bmm backend is compile-friendly (no per-type Python loop). Compile
             # once and cache on the instance so MD steps reuse the dynamic graph.
-            backend = "bmm"
+            backend = "mulsum"
             if not hasattr(self, "_desc_compiled"):
                 self._desc_compiled = torch.compile(
                     ops.compute_descriptors_cached, dynamic=True)
@@ -625,7 +625,8 @@ class NEPCalculator:
                     ops.compute_analytical_forces, dynamic=True)
             desc_fn, force_fn = self._desc_compiled, self._force_compiled
         else:
-            backend = ops.resolve_backend(backend, num_types=self.num_types)
+            backend = ops.resolve_backend(backend, num_types=self.num_types,
+                                          device_type=self.device.type)
             desc_fn, force_fn = (ops.compute_descriptors_cached,
                                  ops.compute_analytical_forces)
         c2 = self.c2

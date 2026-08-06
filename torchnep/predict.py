@@ -92,7 +92,6 @@ def predict_dataset(
     device: str = None,
     batch_size: int = 1000,
     verbose: bool = True,
-    backend: str = "auto",
     energy_key: str = "energy",
     output_descriptor: int = 0,
 ):
@@ -117,8 +116,8 @@ def predict_dataset(
         1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
         2 — write per-atom ``q * q_scaler`` to descriptor.out.
 
-    ``backend`` in {"auto", "loop", "bmm"} — see
-    ``torchnep.ops.resolve_backend``.
+    The contraction backend is chosen automatically (see
+    ``torchnep.ops.resolve_backend``).
     """
     if device is None:
         # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
@@ -145,9 +144,9 @@ def predict_dataset(
     l_max_3b = calc.l_max_3b
     num_lm = calc.num_lm
 
-    # Resolve "auto" now that num_types is known (>=8 -> "bmm", else "loop").
-    backend = ops.resolve_backend(backend, num_types=calc.num_types)
-    _log(f"  backend: {backend}")
+    # Resolve the backend now that num_types and the device are known.
+    backend = ops.resolve_backend("auto", num_types=calc.num_types,
+                                  device_type=torch.device(device).type)
 
     # 1) Read xyz
     t0 = time.time()
@@ -399,8 +398,7 @@ def predict_dataset(
 
 def predict_from_store(model, data_store, output_dir: str,
                        batch_size: int = 1000,
-                       backend: str = "auto",
-                       verbose: bool = True,
+                                          verbose: bool = True,
                        suffix: str = "train"):
     """Run prediction using an already-loaded NEPModel + StreamDataStore.
 
@@ -424,7 +422,8 @@ def predict_from_store(model, data_store, output_dir: str,
     dev   = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     n_struct = data_store.n
-    backend = ops.resolve_backend(backend, num_types=model.num_types)
+    backend = ops.resolve_backend("auto", num_types=model.num_types,
+                                  device_type=dev.type)
 
     nat_arr = np.asarray(data_store.natoms, dtype=np.int64)
     nat_cum = np.concatenate([[0], np.cumsum(nat_arr)])
@@ -522,7 +521,7 @@ def predict_from_store(model, data_store, output_dir: str,
 # No xyz re-read, no temp nep.txt, no second neighbor-list build.
 # ---------------------------------------------------------------------------
 
-def _compute_local_predictions(model, data_store, batch_size, backend):
+def _compute_local_predictions(model, data_store, batch_size):
     """Run prediction on one rank's local data_store -> numpy arrays.
 
     Returns a dict of per-frame / per-atom arrays (pred and ref) plus the
@@ -531,7 +530,8 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     dev   = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     n_struct = data_store.n
-    backend = ops.resolve_backend(backend, num_types=model.num_types)
+    backend = ops.resolve_backend("auto", num_types=model.num_types,
+                                  device_type=dev.type)
 
     nat_arr = np.asarray(data_store.natoms, dtype=np.int64)
     nat_cum = np.concatenate([[0], np.cumsum(nat_arr)])
@@ -626,8 +626,7 @@ def _write_predictions(output_dir: str, n_total_frames: int,
 def predict_from_store_sharded(model, data_store, local_global_idx,
                                 n_total_frames: int, output_dir: str,
                                 batch_size: int = 1000,
-                                backend: str = "auto",
-                                verbose: bool = True,
+                                                            verbose: bool = True,
                                 suffix: str = "train"):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
     data-store shard, arrays are gathered to rank 0, rank 0 writes the four
@@ -654,7 +653,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
             print(msg, flush=True)
 
     t_compute = time.time()
-    local = _compute_local_predictions(model, data_store, batch_size, backend)
+    local = _compute_local_predictions(model, data_store, batch_size)
     local["global_idx"] = np.asarray(local_global_idx, dtype=np.int64)
     _log(f"  compute:  {time.time() - t_compute:5.1f}s")
 

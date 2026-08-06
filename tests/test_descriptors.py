@@ -584,3 +584,76 @@ def test_descriptor_rotational_invariance(name, tmp_path):
     d1 = calc.get_descriptor(species, pos_rot, cell)
     worst = float(np.abs(d0 - d1).max())
     assert worst < 1e-9, f"{name}: descriptor not rotation-invariant ({worst:.2e})"
+
+
+# ---------------------------------------------------------------------------
+# Backend auto-resolution
+# ---------------------------------------------------------------------------
+
+def test_resolve_backend_auto():
+    """GPU auto: mulsum under compile and for <=32 types eager, bmm above
+    (eager mulsum's one-hot memory); CPU auto keeps loop/bmm. Explicit
+    choices always win. Policy from the MI250X/V100/A2000 sweep — see the
+    resolve_backend docstring."""
+    for gpu in ("cuda", None):
+        assert ops.resolve_backend("auto", use_compile=True,
+                                   device_type=gpu) == "mulsum"
+        assert ops.resolve_backend("auto", num_types=32,
+                                   device_type=gpu) == "mulsum"
+        assert ops.resolve_backend("auto", num_types=33,
+                                   device_type=gpu) == "bmm"
+        assert ops.resolve_backend("auto", num_types=87, use_compile=True,
+                                   device_type=gpu) == "mulsum"
+    assert ops.resolve_backend("auto", num_types=4, device_type="cpu") == "loop"
+    assert ops.resolve_backend("auto", num_types=20, device_type="cpu") == "bmm"
+    assert ops.resolve_backend("loop", use_compile=True) == "loop"
+    assert ops.resolve_backend("bmm", device_type="cuda") == "bmm"
+
+
+def test_backend_equivalence(tmp_path):
+    """loop / bmm / mulsum are the same contraction in different kernel
+    shapes — energies, forces and virials must agree to float64 roundoff."""
+    from _common import DATA_DIR
+    from torchnep.data import read_xyz, parse_nep_in
+    from torchnep.train import preprocess_structures, StreamDataStore
+
+    nep = tmp_path / "nep.in"
+    nep.write_text("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+                   "basis_size 6 6\nl_max 4 2 1\nneuron 20\n")
+    cfg = parse_nep_in(str(nep))
+    pbte = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
+    structs = preprocess_structures(read_xyz(str(pbte))[:6], cfg, np.float64)
+    store = StreamDataStore(structs, torch.device("cpu"), torch.float64,
+                            config=cfg)
+    batch = store.collate(list(range(6)))
+
+    torch.manual_seed(0)
+    m = NEPModel(cfg).to(torch.float64)
+    m.eval()
+    outs = {}
+    for be in ("loop", "bmm", "mulsum"):
+        outs[be] = m.compute_properties_cached(
+            batch, need_forces=True, need_virial=True, backend=be)
+    for be in ("bmm", "mulsum"):
+        for key in ("Ei", "forces", "virial"):
+            torch.testing.assert_close(outs[be][key], outs["loop"][key],
+                                       rtol=1e-10, atol=1e-12)
+
+
+def test_mulsum_impls_match_bmm():
+    """Both mulsum implementations (one-hot at <=32 types, plain gather
+    above) must reproduce the bmm contraction exactly."""
+    torch.manual_seed(3)
+    for T in (4, 40):  # 4 -> one-hot path, 40 -> gather path (CUDA builds)
+        P, n_atoms, n_out, K = 300, 50, 9, 9
+        basis = torch.randn(P, K, dtype=torch.float64)
+        at = torch.randint(0, T, (n_atoms,))
+        pi = torch.randint(0, n_atoms, (P,))
+        pj = torch.randint(0, n_atoms, (P,))
+        c = torch.randn(T, T, n_out, K, dtype=torch.float64)
+        got = ops._type_contraction_mulsum(basis, pi, pj, at, c)
+        ref = ops._type_contraction_bmm(basis, pi, pj, at, c)
+        torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-14)
+        got_q = ops._scatter_contraction_mulsum(basis, pi, pj, at, c, n_atoms)
+        ref_q = ops._scatter_contraction_bmm(basis, pi, pj, at, c, n_atoms)
+        torch.testing.assert_close(got_q, ref_q, rtol=1e-12, atol=1e-14)

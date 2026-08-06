@@ -33,11 +33,13 @@ used by DeepMD-kit's compiled models):
 
 The traced energy re-implements the per-type NN dispatch with
 ``torch.where`` over all types (NEPModel.forward's ``mask.any()`` branches
-are data-dependent and cannot be traced symbolically), and uses the "bmm"
-contraction backend (the "loop" backend's per-type-pair ``.any()`` masks are
-data-dependent too). ZBL stays OUTSIDE the compiled graph (its typewise
-cutoffs use ``.item()``) and is added eagerly, exactly like the cached
-analytical path does.
+are data-dependent and cannot be traced symbolically), and uses the
+"mulsum" contraction backend — vectorised like "bmm" so it traces (the
+"loop" backend's per-type-pair ``.any()`` masks are data-dependent), but
+with the contraction written as multiply+sum so Inductor fuses it instead
+of calling BLAS (see ops.resolve_backend). ZBL stays OUTSIDE the compiled
+graph (its typewise cutoffs use ``.item()``) and is added eagerly, exactly
+like the cached analytical path does.
 """
 
 import os
@@ -62,6 +64,9 @@ def apply_compile_patches():
     if _PATCHED:
         return
     os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    # The submodule is not auto-imported on every torch version (e.g.
+    # 2.7.x under ROCm) — import it before assigning.
+    import torch.backends.opt_einsum
     torch.backends.opt_einsum.enabled = False
     try:
         torch._dynamo.config.recompile_limit = 64
@@ -177,7 +182,7 @@ class CompiledAutogradForce:
             m.num_lm, pd["_c3b"], pd["_c4b"], pd["_c5b"],
             pd["_c4b2"],
             rij_rad.dtype, rij_rad.device,
-            backend="bmm",
+            backend="mulsum",
             has_q_123=m.has_q_123, has_q_233=m.has_q_233,
             has_q_134=m.has_q_134,
         )
