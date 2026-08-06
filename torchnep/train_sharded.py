@@ -215,7 +215,7 @@ def train_nep_sharded(
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = True,
+    use_gpumd_qscaler: bool = False,
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,

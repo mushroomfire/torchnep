@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`use_gpumd_qscaler` now defaults to `False`**: torch's default init
+  with the self-consistent q_scaler converges to clearly better minima
+  than the GPUMD-style start (600-epoch 4-seed PdCuNiP benchmark: ~12%
+  lower E/V RMSE, ~3% lower F, on train and validation alike). `True`
+  (the old default) remains available for GPUMD-comparison runs; the
+  saved nep.txt is GPUMD-compatible either way.
 - **`export_valid_split`**: write the exact `valid_ratio` split
   `train_nep` uses as verbatim GPUMD-ready `train.xyz` / `test.xyz`
   files, so the same data partition can be trained in GPUMD and the loss
