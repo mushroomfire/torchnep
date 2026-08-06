@@ -121,7 +121,6 @@ function (`train_nep` / `train_nep_sharded`):
 |---|---|---|
 | `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"`; any other stream-based PyTorch accelerator should also work if passed explicitly |
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
-| `backend` | `"auto"` | `"loop"`, `"bmm"`, `"mulsum"`, or `"auto"`. Auto resolves to `mulsum` under `use_compile` — a one-hot-matmul contraction that compiles to a single fused graph with an atomic-free backward, fastest on both NVIDIA and AMD. Eager auto picks `loop` unless there are ≥20 element types (`bmm`); on AMD (ROCm) eager auto always picks `loop` |
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
 | `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). |

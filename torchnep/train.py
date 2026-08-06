@@ -1114,7 +1114,6 @@ def train_nep(
     output_dir: str = ".",
     device: str = None,
     precision: str = "float32",
-    backend: str = "auto",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
     use_compile: bool = False,
@@ -1144,17 +1143,16 @@ def train_nep(
     config_file, data_file, output_dir : paths.
     device : "cuda" | "cpu" | "mps" — auto-detected if omitted.
     precision : "float32" (default) or "float64".
-    backend : "auto" | "loop" | "bmm" — see torchnep.ops.resolve_backend.
     use_autograd_forces : True -> autograd-through-rij forces (slower, gold
-        standard); False (default) -> analytical chain rule.
+        standard); False (default) -> analytical chain rule. The type-pair
+        contraction backend is chosen automatically (see
+        torchnep.ops.resolve_backend).
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` at the end.
     use_compile : torch.compile the analytical compute method (~1.3x faster per
         epoch after a one-time first-epoch compilation cost; needs Triton, which
-        ships with the CUDA PyTorch build). Ignored on the autograd force path
-        (incompatible with its double-backward). For an extra ~1.3x when memory
-        allows, also pass backend="bmm" (faster under compile but higher peak
-        memory — see docs/torch_compile.md).
+        ships with the CUDA PyTorch build). With autograd forces the
+        first-order gradient is materialized via make_fx and compiled too.
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
@@ -1514,23 +1512,18 @@ def train_nep(
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
 
-    # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
-    # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
-    # ``train_backend`` is what the per-batch compute uses — mulsum whenever
-    # compiling (single fused graph, atomic-free backward — see
-    # ops.resolve_backend). An explicit backend= wins for both; the backends
-    # are numerically identical.
+    # Backends are chosen automatically: ``backend`` is the eager choice
+    # (q_scaler / eval passes), ``train_backend`` adds the use_compile rule
+    # (mulsum under compile). See ops.resolve_backend for the policy and the
+    # MI250X/V100/A2000 benchmarks behind it.
     from .ops import resolve_backend as _resolve_backend
-    orig_backend = backend
-    backend = _resolve_backend(orig_backend, num_types=model.num_types)
-    train_backend = _resolve_backend(
-        orig_backend, num_types=model.num_types, use_compile=compile_on)
+    backend = _resolve_backend("auto", num_types=model.num_types,
+                               device_type=dev.type)
+    train_backend = _resolve_backend("auto", num_types=model.num_types,
+                                     use_compile=compile_on,
+                                     device_type=dev.type)
     force_str = "autograd" if use_autograd_forces else "analytical"
-    if train_backend != backend:
-        _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
-             f"forces: {force_str}")
-    else:
-        _log(f"  backend: {backend}, forces: {force_str}")
+    _log(f"  forces: {force_str}")
 
     if finetune_from is not None and not recompute_q_scaler:
         # The q_scaler is part of the potential definition: the loaded NN
@@ -2117,13 +2110,11 @@ def train_nep(
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
                 predict_from_store(raw_model, data_store, output_dir,
-                                   batch_size=batch_size, backend=backend,
-                                   verbose=False)
+                                   batch_size=batch_size, verbose=False)
                 if valid_store is not None:
                     predict_from_store(raw_model, valid_store, output_dir,
                                        batch_size=batch_size,
-                                       backend=backend, verbose=False,
-                                       suffix="test")
+                                       verbose=False, suffix="test")
 
             if stop_now:
                 _log(f"Early stop: {monitored} did not improve for "
@@ -2170,11 +2161,10 @@ def train_nep(
     _log("\nRunning prediction on training set (final-epoch model)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, backend=backend,
-                       verbose=False)
+                       batch_size=batch_size, verbose=False)
     if valid_store is not None:
         predict_from_store(raw_model, valid_store, output_dir,
-                           batch_size=batch_size, backend=backend,
+                           batch_size=batch_size,
                            verbose=False, suffix="test")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 

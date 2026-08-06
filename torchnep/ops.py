@@ -48,35 +48,36 @@ Backend = Literal["auto", "loop", "bmm", "mulsum"]
 
 def resolve_backend(backend: str = "auto",
                     num_types: Optional[int] = None,
-                    use_compile: bool = False) -> str:
+                    use_compile: bool = False,
+                    device_type: Optional[str] = None) -> str:
     """Resolve "auto" into a concrete backend.
 
-    under torch.compile -> "mulsum" (single fused graph, no BLAS calls;
-                                     fastest compiled backend on NVIDIA and
-                                     AMD alike — A2000 4 types: 5.5 ms/step
-                                     vs 8.4 bmm / 21 loop)
-    ROCm (AMD GPUs)     -> "loop"   eager — rocBLAS is slow on the tiny
-                                    batched GEMMs the bmm path issues
-                                    (MI250X, 4 types: eager bmm 33.7 vs
-                                    loop 18.0 s/epoch)
-    ntypes >= 20        -> "bmm"    (the O(ntypes^2) loop launches finally
-                                    lose to one batched GEMM)
-    otherwise           -> "loop"   (eager; inline Python loop fastest)
-
-    The eager threshold comes from a 6000-frame benchmark sweep (16-element
-    alloy set, A2000): loop beat bmm clearly up to 8 types (8.8 vs 14.1
-    s/epoch) and only reached parity at 16 (15.6 vs 15.1), so the crossover
-    sits near ~20 types. On ROCm the bmm penalty shifts that crossover far
-    beyond any realistic type count, so "auto" never picks bmm there.
+    GPU (CUDA / ROCm):
+        under torch.compile -> "mulsum"  (single fused graph, atomic-free
+                                          backward; fastest at every type
+                                          count on MI250X, V100 and A2000)
+        eager, ntypes <= 32 -> "mulsum"  (fastest eager path on every GPU
+                                          tested; loop and bmm lose by
+                                          2-30x depending on ntypes)
+        eager, ntypes >  32 -> "bmm"     (eager mulsum stores the one-hot
+                                          matrix (pairs x ntypes^2) for the
+                                          backward — ~8 GiB at 64+ types —
+                                          while bmm stays flat and is the
+                                          fastest non-mulsum eager path)
+    CPU / MPS (unbenchmarked on the 89-element sweep — GPU rules are from
+    an 8-variant x {1..87}-type sweep on MI250X + V100 + A2000):
+        ntypes >= 20 -> "bmm", else "loop".
 
     Any non-"auto" string is returned unchanged (explicit override wins).
     """
     if backend != "auto":
         return backend
-    if use_compile:
+    if device_type in ("cuda", None):
+        if use_compile:
+            return "mulsum"
+        if num_types is not None and num_types > 32:
+            return "bmm"
         return "mulsum"
-    if torch.version.hip is not None:
-        return "loop"
     if num_types is not None and num_types >= 20:
         return "bmm"
     return "loop"
@@ -678,9 +679,22 @@ def _gather_c_onehot(basis, pair_i, pair_j, atom_types, c):
     Inductor fuses into a single Triton kernel with no BLAS call. Meant
     for torch.compile; eager it launches the same unfused kernels as bmm.
 
+    Above 32 types on NVIDIA the plain fancy-index gather is used instead:
+    the one-hot matrix is (pairs, ntypes²) — ~2.5 GiB at 87 types — while
+    the atomic contention the one-hot form exists to avoid becomes
+    negligible once the gradient spreads over a large c tensor (V100,
+    87 types: gather 42.6 vs one-hot 58.2 ms/step). On ROCm the one-hot
+    form wins at every type count (MI250X same-address atomics are slow:
+    gather 53-303 ms vs one-hot 8-41), so it is always used there. The
+    two forms produce bit-identical values — the one-hot GEMM has exactly
+    one nonzero term per row.
+
     Returns gn : (P, N_out).
     """
     T = c.shape[0]
+    if T > 32 and torch.version.hip is None:
+        return (c[atom_types[pair_i], atom_types[pair_j]]
+                * basis.unsqueeze(1)).sum(-1)                   # (P, N_out)
     pt = atom_types[pair_i] * T + atom_types[pair_j]            # (P,)
     w = torch.nn.functional.one_hot(pt, T * T).to(basis.dtype)  # (P, T*T)
     c_p = (w @ c.reshape(T * T, -1)).view(-1, c.shape[2], c.shape[3])

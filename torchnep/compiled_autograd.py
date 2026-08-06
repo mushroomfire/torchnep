@@ -64,6 +64,9 @@ def apply_compile_patches():
     if _PATCHED:
         return
     os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    # The submodule is not auto-imported on every torch version (e.g.
+    # 2.7.x under ROCm) — import it before assigning.
+    import torch.backends.opt_einsum
     torch.backends.opt_einsum.enabled = False
     try:
         torch._dynamo.config.recompile_limit = 64

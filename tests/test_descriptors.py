@@ -590,22 +590,24 @@ def test_descriptor_rotational_invariance(name, tmp_path):
 # Backend auto-resolution
 # ---------------------------------------------------------------------------
 
-def test_resolve_backend_auto(monkeypatch):
-    """auto -> mulsum under compile (all platforms); eager -> bmm at >=20
-    types on CUDA builds but always loop on ROCm (rocBLAS small batched
-    GEMMs are slow — MI250X benchmark in the resolve_backend docstring).
-    Explicit choices always win."""
-    monkeypatch.setattr(torch.version, "hip", None, raising=False)
-    assert ops.resolve_backend("auto", use_compile=True) == "mulsum"
-    assert ops.resolve_backend("auto", num_types=20) == "bmm"
-    assert ops.resolve_backend("auto", num_types=4) == "loop"
+def test_resolve_backend_auto():
+    """GPU auto: mulsum under compile and for <=32 types eager, bmm above
+    (eager mulsum's one-hot memory); CPU auto keeps loop/bmm. Explicit
+    choices always win. Policy from the MI250X/V100/A2000 sweep — see the
+    resolve_backend docstring."""
+    for gpu in ("cuda", None):
+        assert ops.resolve_backend("auto", use_compile=True,
+                                   device_type=gpu) == "mulsum"
+        assert ops.resolve_backend("auto", num_types=32,
+                                   device_type=gpu) == "mulsum"
+        assert ops.resolve_backend("auto", num_types=33,
+                                   device_type=gpu) == "bmm"
+        assert ops.resolve_backend("auto", num_types=87, use_compile=True,
+                                   device_type=gpu) == "mulsum"
+    assert ops.resolve_backend("auto", num_types=4, device_type="cpu") == "loop"
+    assert ops.resolve_backend("auto", num_types=20, device_type="cpu") == "bmm"
     assert ops.resolve_backend("loop", use_compile=True) == "loop"
-
-    monkeypatch.setattr(torch.version, "hip", "6.2.4", raising=False)
-    assert ops.resolve_backend("auto", use_compile=True) == "mulsum"
-    assert ops.resolve_backend("auto", num_types=20) == "loop"
-    assert ops.resolve_backend("auto", num_types=4) == "loop"
-    assert ops.resolve_backend("bmm", use_compile=True) == "bmm"
+    assert ops.resolve_backend("bmm", device_type="cuda") == "bmm"
 
 
 def test_backend_equivalence(tmp_path):
@@ -636,3 +638,22 @@ def test_backend_equivalence(tmp_path):
         for key in ("Ei", "forces", "virial"):
             torch.testing.assert_close(outs[be][key], outs["loop"][key],
                                        rtol=1e-10, atol=1e-12)
+
+
+def test_mulsum_impls_match_bmm():
+    """Both mulsum implementations (one-hot at <=32 types, plain gather
+    above) must reproduce the bmm contraction exactly."""
+    torch.manual_seed(3)
+    for T in (4, 40):  # 4 -> one-hot path, 40 -> gather path (CUDA builds)
+        P, n_atoms, n_out, K = 300, 50, 9, 9
+        basis = torch.randn(P, K, dtype=torch.float64)
+        at = torch.randint(0, T, (n_atoms,))
+        pi = torch.randint(0, n_atoms, (P,))
+        pj = torch.randint(0, n_atoms, (P,))
+        c = torch.randn(T, T, n_out, K, dtype=torch.float64)
+        got = ops._type_contraction_mulsum(basis, pi, pj, at, c)
+        ref = ops._type_contraction_bmm(basis, pi, pj, at, c)
+        torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-14)
+        got_q = ops._scatter_contraction_mulsum(basis, pi, pj, at, c, n_atoms)
+        ref_q = ops._scatter_contraction_bmm(basis, pi, pj, at, c, n_atoms)
+        torch.testing.assert_close(got_q, ref_q, rtol=1e-12, atol=1e-14)

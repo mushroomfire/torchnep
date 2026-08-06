@@ -203,7 +203,6 @@ def train_nep_sharded(
     data_file: str,
     output_dir: str = ".",
     precision: str = "float32",
-    backend: str = "auto",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
     use_compile: bool = False,
@@ -670,14 +669,15 @@ def train_nep_sharded(
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
 
-    # ``backend`` is the eager backend for the one-shot q_scaler pass
-    # (num_types-based); ``train_backend`` is what the per-batch compute uses —
-    # mulsum whenever compiling. Explicit backend= wins for both.
+    # Backends are chosen automatically (see ops.resolve_backend):
+    # ``backend`` is the eager choice (q_scaler / eval), ``train_backend``
+    # adds the use_compile rule.
     from .ops import resolve_backend as _resolve_backend
-    orig_backend = backend
-    backend = _resolve_backend(orig_backend, num_types=model.num_types)
-    train_backend = _resolve_backend(
-        orig_backend, num_types=model.num_types, use_compile=compile_on)
+    backend = _resolve_backend("auto", num_types=model.num_types,
+                               device_type=dev.type)
+    train_backend = _resolve_backend("auto", num_types=model.num_types,
+                                     use_compile=compile_on,
+                                     device_type=dev.type)
     force_str = "autograd" if use_autograd_forces else "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
@@ -1333,14 +1333,13 @@ def train_nep_sharded(
                     raw_model, data_store, local_global_idx,
                     n_total_frames=n_total,
                     output_dir=output_dir,
-                    batch_size=batch_size, backend=backend,
-                    verbose=False)
+                    batch_size=batch_size, verbose=False)
                 if valid_store is not None:
                     predict_from_store_sharded(
                         raw_model, valid_store, valid_local_global_idx,
                         n_total_frames=n_valid_total,
                         output_dir=output_dir,
-                        batch_size=batch_size, backend=backend,
+                        batch_size=batch_size,
                         verbose=False, suffix="test")
 
             if stop_now:
@@ -1389,15 +1388,14 @@ def train_nep_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
-        batch_size=batch_size, backend=backend,
-        verbose=is_main)
+        batch_size=batch_size, verbose=is_main)
     if valid_store is not None:
         predict_from_store_sharded(
             raw_model, valid_store, valid_local_global_idx,
             n_total_frames=n_valid_total,
             output_dir=output_dir,
-            batch_size=batch_size, backend=backend,
-            verbose=False, suffix="test")
+            batch_size=batch_size, verbose=False,
+            suffix="test")
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
