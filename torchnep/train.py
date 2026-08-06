@@ -1516,9 +1516,10 @@ def train_nep(
 
     # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
     # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
-    # ``train_backend`` is what the per-batch compute uses — bmm whenever
-    # compiling (it fuses best under Inductor). An explicit backend= wins for
-    # both; the two backends are numerically identical.
+    # ``train_backend`` is what the per-batch compute uses — mulsum whenever
+    # compiling (single fused graph, atomic-free backward — see
+    # ops.resolve_backend). An explicit backend= wins for both; the backends
+    # are numerically identical.
     from .ops import resolve_backend as _resolve_backend
     orig_backend = backend
     backend = _resolve_backend(orig_backend, num_types=model.num_types)

@@ -6,7 +6,13 @@
   `stream_mode` option are removed — the dataset stays in host memory and
   batches are streamed to the device. Same speed, ~10–15x less GPU memory.
 - **`backend="auto"`**: eager mode now uses `loop` below 20 element types
-  (was 8); `bmm` under `use_compile`.
+  (was 8), and always `loop` on ROCm (AMD GPUs).
+- **New `mulsum` backend** (default under `use_compile`): the type-pair
+  contraction as a one-hot matmul + fused multiply/sum — no BLAS calls, and
+  the backward is a clean GEMM instead of atomic `index_put` accumulation.
+  On an AMD MI250X this makes compiled training ~9x faster than before
+  (44 → 5 ms/step, 4-type system) and also beats the old `bmm` compile
+  path on NVIDIA. The compiled-autograd force path uses it too.
 - **Compiled autograd forces**: `use_autograd_forces=True` +
   `use_compile=True` now works (first-order gradient materialized via
   `make_fx`) — ~4x faster than eager autograd.

@@ -584,3 +584,55 @@ def test_descriptor_rotational_invariance(name, tmp_path):
     d1 = calc.get_descriptor(species, pos_rot, cell)
     worst = float(np.abs(d0 - d1).max())
     assert worst < 1e-9, f"{name}: descriptor not rotation-invariant ({worst:.2e})"
+
+
+# ---------------------------------------------------------------------------
+# Backend auto-resolution
+# ---------------------------------------------------------------------------
+
+def test_resolve_backend_auto(monkeypatch):
+    """auto -> mulsum under compile (all platforms); eager -> bmm at >=20
+    types on CUDA builds but always loop on ROCm (rocBLAS small batched
+    GEMMs are slow — MI250X benchmark in the resolve_backend docstring).
+    Explicit choices always win."""
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    assert ops.resolve_backend("auto", use_compile=True) == "mulsum"
+    assert ops.resolve_backend("auto", num_types=20) == "bmm"
+    assert ops.resolve_backend("auto", num_types=4) == "loop"
+    assert ops.resolve_backend("loop", use_compile=True) == "loop"
+
+    monkeypatch.setattr(torch.version, "hip", "6.2.4", raising=False)
+    assert ops.resolve_backend("auto", use_compile=True) == "mulsum"
+    assert ops.resolve_backend("auto", num_types=20) == "loop"
+    assert ops.resolve_backend("auto", num_types=4) == "loop"
+    assert ops.resolve_backend("bmm", use_compile=True) == "bmm"
+
+
+def test_backend_equivalence(tmp_path):
+    """loop / bmm / mulsum are the same contraction in different kernel
+    shapes — energies, forces and virials must agree to float64 roundoff."""
+    from _common import DATA_DIR
+    from torchnep.data import read_xyz, parse_nep_in
+    from torchnep.train import preprocess_structures, StreamDataStore
+
+    nep = tmp_path / "nep.in"
+    nep.write_text("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+                   "basis_size 6 6\nl_max 4 2 1\nneuron 20\n")
+    cfg = parse_nep_in(str(nep))
+    pbte = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
+    structs = preprocess_structures(read_xyz(str(pbte))[:6], cfg, np.float64)
+    store = StreamDataStore(structs, torch.device("cpu"), torch.float64,
+                            config=cfg)
+    batch = store.collate(list(range(6)))
+
+    torch.manual_seed(0)
+    m = NEPModel(cfg).to(torch.float64)
+    m.eval()
+    outs = {}
+    for be in ("loop", "bmm", "mulsum"):
+        outs[be] = m.compute_properties_cached(
+            batch, need_forces=True, need_virial=True, backend=be)
+    for be in ("bmm", "mulsum"):
+        for key in ("Ei", "forces", "virial"):
+            torch.testing.assert_close(outs[be][key], outs["loop"][key],
+                                       rtol=1e-10, atol=1e-12)

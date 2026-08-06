@@ -672,7 +672,7 @@ def train_nep_sharded(
 
     # ``backend`` is the eager backend for the one-shot q_scaler pass
     # (num_types-based); ``train_backend`` is what the per-batch compute uses —
-    # bmm whenever compiling. Explicit backend= wins for both.
+    # mulsum whenever compiling. Explicit backend= wins for both.
     from .ops import resolve_backend as _resolve_backend
     orig_backend = backend
     backend = _resolve_backend(orig_backend, num_types=model.num_types)
