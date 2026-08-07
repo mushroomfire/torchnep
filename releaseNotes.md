@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 1.0.2a2
 
 - **`use_gpumd_qscaler` now defaults to `False`**: torch's default init
   with the self-consistent q_scaler converges to clearly better minima
