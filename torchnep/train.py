@@ -2137,10 +2137,17 @@ def train_nep(
         # final weights, not SWA-averaged ones.
         final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
         raw_model.load_state_dict(swa_state)
+        # b1 is solved analytically each epoch (not gradient-trained), so
+        # its trajectory average is NOT the optimal offset for the averaged
+        # weights — on a 16-element benchmark the stale offset cost the SWA
+        # model ~10 meV/atom of pure energy-shift error. Re-solve it for
+        # the averaged weights before saving.
+        recompute_b1_shift(raw_model, data_store, batch_size, backend)
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                max_NN_rad, max_NN_ang)
         raw_model.load_state_dict(final_state)
-        _log("SWA model saved to nep_average.txt")
+        _log("SWA model saved to nep_average.txt (b1 re-solved for the "
+             "averaged weights)")
 
     train_time = time.time() - train_t0
     h, rem = divmod(train_time, 3600)

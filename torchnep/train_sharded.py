@@ -1349,14 +1349,31 @@ def train_nep_sharded(
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                                max_NN_rad, max_NN_ang)
-        if swa_model is not None:
-            swa_state = swa_model.module.state_dict()
-            final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
-            raw_model.load_state_dict(swa_state)
+    if swa_model is not None:
+        # All ranks: load the averaged weights and re-solve b1 from the
+        # GLOBAL energy residual (b1's per-epoch analytic values were
+        # averaged along the trajectory — a stale offset for the averaged
+        # weights; see train_nep). Energy-only pass over each shard,
+        # all-reduced.
+        swa_state = swa_model.module.state_dict()
+        final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
+        raw_model.load_state_dict(swa_state)
+        b1_sums = _accumulate_true_loss_sums(
+            data_store, batch_size, raw_model,
+            raw_model.compute_properties, _shim._compute_cached,
+            use_autograd_forces, train_backend, False, False, dtype, dev)
+        b1_t = torch.tensor([b1_sums[7], float(b1_sums[4])], device=dev,
+                            dtype=torch.float64)
+        dist.all_reduce(b1_t)
+        delta = (b1_t[0] / b1_t[1]).item() if b1_t[1] > 0 else 0.0
+        with torch.no_grad():
+            raw_model.b1.add_(delta)
+        if is_main:
             raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                    max_NN_rad, max_NN_ang)
-            raw_model.load_state_dict(final_state)
-            _log("SWA model saved to nep_average.txt")
+            _log("SWA model saved to nep_average.txt (b1 re-solved for the "
+                 "averaged weights)")
+        raw_model.load_state_dict(final_state)
 
         train_time = time.time() - train_t0
         h, rem = divmod(train_time, 3600)

@@ -269,3 +269,28 @@ def test_train_nep_use_gpumd_qscaler(tmp_path):
 
     assert torch.allclose(mg.q_scaler, qs_c1, rtol=1e-5, atol=1e-8)
     assert not torch.allclose(mg.q_scaler, ms.q_scaler)
+
+
+def test_swa_model_b1_is_optimal(tmp_path):
+    """nep_average.txt must carry a b1 re-solved for the AVERAGED weights:
+    the mean per-atom energy residual of the saved SWA model over the
+    training set is ~0 (b1's per-epoch analytic values averaged along the
+    trajectory are a stale offset otherwise)."""
+    nepin, xyz = _write_run_files(tmp_path)
+    with open(nepin, "a") as f:
+        f.write("stage2 1\nstart_stage2 2\nepoch 6\n")
+    out = tmp_path / "out_swa"
+    train_nep(config_file=nepin, data_file=xyz, output_dir=str(out),
+              device="cpu", precision="float64", print_interval=100,
+              restart=False, checkpoint_interval=1000,
+              prediction_interval=1000, run_seed=3, use_swa=True)
+    assert (out / "nep_average.txt").exists()
+
+    cfg = parse_nep_in(nepin)
+    ds = _store(cfg)
+    m = NEPModel(cfg).to(torch.float64)
+    m.load_weights_from_nep_txt(str(out / "nep_average.txt"))
+    b1_before = float(m.b1.item())
+    recompute_b1_shift(m, ds, batch_size=8, backend="loop")
+    # If the saved b1 was already optimal, re-solving changes it by ~0.
+    assert abs(float(m.b1.item()) - b1_before) < 1e-8
