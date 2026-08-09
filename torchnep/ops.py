@@ -692,7 +692,16 @@ def _gather_c_onehot(basis, pair_i, pair_j, atom_types, c):
     Returns gn : (P, N_out).
     """
     T = c.shape[0]
-    if T > 32 and torch.version.hip is None:
+    # The one-hot matmul exists ONLY for the backward (atomic-free grad_c).
+    # Without grad — prediction, q_scaler, frozen-weight eval — the plain
+    # gather is bit-identical, launches less work, and avoids the (P, T²)
+    # one-hot matrix, which at prediction batch sizes reaches GiB already
+    # at 16 types. Same for CUDA above 32 types even with grad (the c
+    # tensor is large enough there that backward atomic contention is
+    # negligible — V100 benchmark in the docstring).
+    need_grad = torch.is_grad_enabled() and (c.requires_grad
+                                             or basis.requires_grad)
+    if not need_grad or (T > 32 and torch.version.hip is None):
         return (c[atom_types[pair_i], atom_types[pair_j]]
                 * basis.unsqueeze(1)).sum(-1)                   # (P, N_out)
     pt = atom_types[pair_i] * T + atom_types[pair_j]            # (P,)
