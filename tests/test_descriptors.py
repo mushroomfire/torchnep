@@ -641,8 +641,9 @@ def test_backend_equivalence(tmp_path):
 
 
 def test_mulsum_impls_match_bmm():
-    """Both mulsum implementations (one-hot at <=32 types, plain gather
-    above) must reproduce the bmm contraction exactly."""
+    """All mulsum implementations (one-hot with grad at <=32 types, plain
+    gather above 32 types and always under no_grad) must reproduce the bmm
+    contraction exactly."""
     torch.manual_seed(3)
     for T in (4, 40):  # 4 -> one-hot path, 40 -> gather path (CUDA builds)
         P, n_atoms, n_out, K = 300, 50, 9, 9
@@ -657,3 +658,9 @@ def test_mulsum_impls_match_bmm():
         got_q = ops._scatter_contraction_mulsum(basis, pi, pj, at, c, n_atoms)
         ref_q = ops._scatter_contraction_bmm(basis, pi, pj, at, c, n_atoms)
         torch.testing.assert_close(got_q, ref_q, rtol=1e-12, atol=1e-14)
+        cg = c.clone().requires_grad_(True)
+        got_g = ops._type_contraction_mulsum(basis, pi, pj, at, cg)
+        torch.testing.assert_close(got_g, ref, rtol=1e-12, atol=1e-14)
+        with torch.no_grad():
+            got_ng = ops._type_contraction_mulsum(basis, pi, pj, at, cg)
+        torch.testing.assert_close(got_ng, ref, rtol=1e-12, atol=1e-14)

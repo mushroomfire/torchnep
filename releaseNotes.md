@@ -1,5 +1,14 @@
 # Release Notes
 
+## Unreleased
+
+- **Fix `predict_dataset` GPU OOM on multi-element models**: the mulsum
+  contraction's one-hot matrix exists only for the backward pass; it is
+  now skipped whenever gradients are off (prediction, q_scaler,
+  frozen-weight eval) — the plain gather is bit-identical and avoids the
+  (pairs × ntypes²) allocation that reached GiB at prediction batch
+  sizes.
+
 ## 1.0.2a2
 
 - **`use_gpumd_qscaler` now defaults to `False`**: torch's default init
