@@ -493,22 +493,37 @@ def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):
 
 
 def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
-                       output_dir: str = "split"):
+                       output_dir: str = "split", strategy: str = "random",
+                       min_stratum: int = 20):
     """Write GPUMD-ready ``train.xyz`` / ``test.xyz`` with train_nep's split.
 
     Reproduces exactly the validation split that
-    ``train_nep(data_file, valid_ratio=r, run_seed=s)`` uses internally, so
-    the exported pair can train the SAME data partition in GPUMD (or any
-    other code) and loss curves stay comparable. Frames are copied verbatim
-    (raw text, untouched fields and precision), in input-file order.
+    ``train_nep(data_file, valid_ratio=r, run_seed=s, valid_strategy=...)``
+    uses internally, so the exported pair can train the SAME data partition
+    in GPUMD (or any other code) and loss curves stay comparable. Frames
+    are copied verbatim (raw text, untouched fields and precision), in
+    input-file order.
+
+    ``strategy``: "random" (default) or "stratified" — see
+    :func:`stratified_split_indices`.
 
     Returns ``(train_path, test_path, n_train, n_valid)``.
     """
     import os
     with open(data_file) as f:
         blocks = _split_frames(f.readlines())
-    train_idx, val_idx = valid_split_indices(len(blocks), valid_ratio,
-                                             run_seed)
+    if strategy == "stratified":
+        metas = []
+        for b in blocks:
+            na = int(b[0].split()[0])
+            metas.append((na, {line.split()[0] for line in b[2:2 + na]}))
+        train_idx, val_idx, _ = stratified_split_indices(
+            metas, valid_ratio, run_seed, min_stratum=min_stratum)
+    elif strategy == "random":
+        train_idx, val_idx = valid_split_indices(len(blocks), valid_ratio,
+                                                 run_seed)
+    else:
+        raise ValueError(f"unknown split strategy: {strategy!r}")
     os.makedirs(output_dir, exist_ok=True)
     train_path = os.path.join(output_dir, "train.xyz")
     test_path = os.path.join(output_dir, "test.xyz")
@@ -520,3 +535,73 @@ def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
             for k in idxs:
                 out.writelines(blocks[k])
     return train_path, test_path, len(train_idx), len(val_idx)
+
+
+def _size_class(natoms: int) -> int:
+    """Size class for stratified splitting: 0 = tiny cells (<=4 atoms,
+    dimers/trimers — the pair-specific short-range information), 1 = small
+    (5-15), 2 = bulk (>=16)."""
+    if natoms <= 4:
+        return 0
+    if natoms <= 15:
+        return 1
+    return 2
+
+
+def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
+                             min_stratum: int = 20):
+    """Coverage-aware train/validation split.
+
+    Frames are grouped into strata keyed by (element combination, size
+    class — see :func:`_size_class`). Within each stratum ``valid_ratio``
+    of the frames is held out for validation; strata with fewer than
+    ``min_stratum`` frames go ENTIRELY to training. Rationale: with many
+    element types a random split inevitably drops some rare stratum — e.g.
+    the only few Mo-Pd dimer curves — fully into validation, so the model
+    never sees that pair's short-range physics and can only fail on it.
+    Stratifying guarantees every represented (composition, size) group is
+    learned, and rare groups are never wasted on validation. The held-out
+    fraction is therefore slightly below ``valid_ratio`` (rare strata
+    contribute nothing); the validation set measures within-stratum
+    generalization only.
+
+    ``metas``: sequence of (natoms, iterable_of_species) per frame, in file
+    order. Deterministic for a given ``run_seed``; the trainers and
+    :func:`export_valid_split` share this implementation.
+
+    Returns ``(train_idx, valid_idx, stats)`` — index lists sorted in input
+    order plus a stats dict (n_strata, n_rare_strata, n_rare_frames).
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    strata = {}
+    for i, (na, sp) in enumerate(metas):
+        key = ("-".join(sorted(set(sp))), _size_class(na))
+        strata.setdefault(key, []).append(i)
+
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    val, n_rare, n_rare_frames = [], 0, 0
+    for key in sorted(strata):
+        idxs = strata[key]
+        if len(idxs) < min_stratum:
+            n_rare += 1
+            n_rare_frames += len(idxs)
+            continue
+        perm = torch.randperm(len(idxs), generator=g).tolist()
+        n_val = min(max(1, int(round(valid_ratio * len(idxs)))),
+                    len(idxs) - 1)
+        val.extend(idxs[p] for p in perm[:n_val])
+    if not val:
+        raise ValueError(
+            "stratified split held out no frames — every stratum has fewer "
+            f"than min_stratum={min_stratum} frames; lower min_stratum or "
+            "use the random strategy")
+    val_set = set(val)
+    train_idx = [i for i in range(len(metas)) if i not in val_set]
+    stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+             "n_rare_frames": n_rare_frames}
+    return train_idx, sorted(val_set), stats

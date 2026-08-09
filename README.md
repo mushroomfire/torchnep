@@ -146,6 +146,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
+| `valid_strategy` | `"random"` | `"random"` or `"stratified"`. Stratified groups frames by (element combination × cell-size class) and splits within each group; groups with < 20 frames go entirely to training — guarantees rare compositions/small cells (pair-specific short-range data) are always learned, never wasted on validation |
 
 ---
 
@@ -186,6 +187,9 @@ train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
 from torchnep import export_valid_split
 export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
                    output_dir="split")   # writes split/train.xyz + split/test.xyz
+# coverage-aware split (same strategy as valid_strategy="stratified"):
+export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
+                   output_dir="split", strategy="stratified")
 ```
 
 ```bash

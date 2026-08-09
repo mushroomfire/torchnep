@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Stratified validation split** (`valid_strategy="stratified"`, also in
+  `export_valid_split`): frames are grouped by (element combination ×
+  cell-size class) and split within each group; groups with fewer than 20
+  frames go entirely to training. Guarantees rare compositions and tiny
+  cells — the pair-specific short-range information — are always in the
+  training set instead of being silently lost to a random validation
+  draw.
+
 - **Fix `predict_dataset` GPU OOM on multi-element models**: the mulsum
   contraction's one-hot matrix exists only for the backward pass; it is
   now skipped whenever gradients are off (prediction, q_scaler,
