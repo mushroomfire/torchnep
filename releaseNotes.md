@@ -1,5 +1,14 @@
 # Release Notes
 
+## Unreleased
+
+- **Fix `nep_average.txt` energy offset**: ``b1`` is solved analytically
+  each epoch (not gradient-trained), so averaging it along the SWA
+  trajectory left the saved SWA model with a stale global energy shift
+  (~10 meV/atom on a 16-element benchmark). Both trainers now re-solve
+  ``b1`` for the averaged weights before saving (sharded: from the
+  all-reduced global residual).
+
 ## 1.0.2a2
 
 - **`use_gpumd_qscaler` now defaults to `False`**: torch's default init
