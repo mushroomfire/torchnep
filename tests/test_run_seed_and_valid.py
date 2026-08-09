@@ -423,18 +423,27 @@ def test_stratified_split_and_export(tmp_path):
              + [(2, {"Mo", "Pd"})] * 5)
     tr, va, st = stratified_split_indices(metas, 0.25, run_seed=9,
                                           min_stratum=20)
-    assert st["n_strata"] == 3 and st["n_rare_strata"] == 1
-    assert st["n_rare_frames"] == 5
-    # rare Mo-Pd tiny frames (indices 100..104) all in training
-    assert all(i in tr for i in range(100, 105))
-    # populous strata hold out ~25% each
+    # default tiny_to_train=True consumes BOTH tiny strata (the rare
+    # Mo-Pd one included) before the rare-stratum rule sees them
+    assert st["n_strata"] == 3 and st["n_rare_strata"] == 0
+    assert st["n_tiny_frames"] == 45
+    assert all(i in tr for i in range(60, 105))
+    # the populous bulk stratum still holds out ~25%
     va_bulk = [i for i in va if i < 60]
-    va_tiny = [i for i in va if 60 <= i < 100]
-    assert len(va_bulk) == 15 and len(va_tiny) == 10
+    assert len(va_bulk) == 15 and len(va) == 15
     assert sorted(tr + va) == list(range(105))
     tr2, va2, _ = stratified_split_indices(metas, 0.25, run_seed=9,
                                            min_stratum=20)
     assert tr == tr2 and va == va2
+
+    # tiny_to_train=False: populous tiny stratum is split, rare one still
+    # goes fully to training
+    trf, vaf, stf = stratified_split_indices(metas, 0.25, run_seed=9,
+                                             min_stratum=20,
+                                             tiny_to_train=False)
+    assert stf["n_tiny_frames"] == 0 and stf["n_rare_frames"] == 5
+    assert len([i for i in vaf if 60 <= i < 100]) == 10
+    assert all(i in trf for i in range(100, 105))
 
     # export parity on a real file: strategy="stratified" writes a
     # partition consistent with the same helper on parsed frames

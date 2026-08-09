@@ -549,7 +549,8 @@ def _size_class(natoms: int) -> int:
 
 
 def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
-                             min_stratum: int = 20):
+                             min_stratum: int = 20,
+                             tiny_to_train: bool = True):
     """Coverage-aware train/validation split.
 
     Frames are grouped into strata keyed by (element combination, size
@@ -565,12 +566,20 @@ def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
     contribute nothing); the validation set measures within-stratum
     generalization only.
 
+    ``tiny_to_train`` (default True): tiny cells (size class 0, <= 4
+    atoms — dimer/trimer short-range scans) go ENTIRELY to training
+    regardless of stratum size. Their per-pair curves are sparse in
+    configuration space even when the stratum is populous, and their job
+    is to teach the short-range physics — holding some out both starves
+    the model and produces the dominant validation-error tail.
+
     ``metas``: sequence of (natoms, iterable_of_species) per frame, in file
     order. Deterministic for a given ``run_seed``; the trainers and
     :func:`export_valid_split` share this implementation.
 
     Returns ``(train_idx, valid_idx, stats)`` — index lists sorted in input
-    order plus a stats dict (n_strata, n_rare_strata, n_rare_frames).
+    order plus a stats dict (n_strata, n_rare_strata, n_rare_frames,
+    n_tiny_frames).
     """
     import torch
     if run_seed is None:
@@ -584,9 +593,12 @@ def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
 
     g = torch.Generator()
     g.manual_seed(run_seed)
-    val, n_rare, n_rare_frames = [], 0, 0
+    val, n_rare, n_rare_frames, n_tiny = [], 0, 0, 0
     for key in sorted(strata):
         idxs = strata[key]
+        if tiny_to_train and key[1] == 0:
+            n_tiny += len(idxs)
+            continue
         if len(idxs) < min_stratum:
             n_rare += 1
             n_rare_frames += len(idxs)
@@ -603,5 +615,5 @@ def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
     val_set = set(val)
     train_idx = [i for i in range(len(metas)) if i not in val_set]
     stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
-             "n_rare_frames": n_rare_frames}
+             "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny}
     return train_idx, sorted(val_set), stats

@@ -1337,8 +1337,9 @@ def train_nep(
             train_idx, val_idx, st = stratified_split_indices(
                 metas, valid_ratio, run_seed)
             _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
-                 f"cell size): {st['n_strata']} strata; {st['n_rare_strata']} "
-                 f"rare strata ({st['n_rare_frames']} frames) kept fully in "
+                 f"cell size): {st['n_strata']} strata; "
+                 f"{st['n_tiny_frames']} tiny-cell (<=4 atoms) frames and "
+                 f"{st['n_rare_frames']} rare-stratum frames kept fully in "
                  f"training; held out {len(val_idx)} frames, "
                  f"{len(train_idx)} remain (split drawn from run_seed)")
         elif valid_strategy == "random":
