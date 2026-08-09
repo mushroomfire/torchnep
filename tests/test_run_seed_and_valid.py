@@ -406,3 +406,49 @@ def test_export_valid_split_matches_train_nep(tmp_path):
         output_dir=str(tmp_path / "split2"))
     assert open(tp).read() == open(tp2).read()
     assert open(vp).read() == open(vp2).read()
+
+
+def test_stratified_split_and_export(tmp_path):
+    """Stratified split: rare strata (< min_stratum frames) go entirely to
+    training, populous strata are split ~valid_ratio, trainer and export
+    agree, and the draw is deterministic."""
+    import numpy as np
+    from torchnep.data import stratified_split_indices
+    from torchnep import export_valid_split
+
+    # synthetic metas: one populous bulk stratum (60 frames), one populous
+    # tiny stratum (40), one rare tiny stratum (5)
+    metas = ([(32, {"Pd", "Cu"})] * 60
+             + [(2, {"Pd", "Cu"})] * 40
+             + [(2, {"Mo", "Pd"})] * 5)
+    tr, va, st = stratified_split_indices(metas, 0.25, run_seed=9,
+                                          min_stratum=20)
+    assert st["n_strata"] == 3 and st["n_rare_strata"] == 1
+    assert st["n_rare_frames"] == 5
+    # rare Mo-Pd tiny frames (indices 100..104) all in training
+    assert all(i in tr for i in range(100, 105))
+    # populous strata hold out ~25% each
+    va_bulk = [i for i in va if i < 60]
+    va_tiny = [i for i in va if 60 <= i < 100]
+    assert len(va_bulk) == 15 and len(va_tiny) == 10
+    assert sorted(tr + va) == list(range(105))
+    tr2, va2, _ = stratified_split_indices(metas, 0.25, run_seed=9,
+                                           min_stratum=20)
+    assert tr == tr2 and va == va2
+
+    # export parity on a real file: strategy="stratified" writes a
+    # partition consistent with the same helper on parsed frames
+    nepin, xyz = _write_run_files(tmp_path)
+    frames = read_xyz(xyz)
+    metas_f = [(f["natoms"], set(f["species"])) for f in frames]
+    trf, vaf, _ = stratified_split_indices(metas_f, 0.3, run_seed=5,
+                                           min_stratum=2)
+    tp, vp, n_tr, n_va = export_valid_split(
+        xyz, valid_ratio=0.3, run_seed=5,
+        output_dir=str(tmp_path / "strat"), strategy="stratified",
+        min_stratum=2)
+    assert (n_tr, n_va) == (len(trf), len(vaf))
+    got_va = read_xyz(vp)
+    assert [f["natoms"] for f in got_va] == [frames[i]["natoms"] for i in vaf]
+    assert np.allclose([f["energy"] for f in got_va],
+                       [frames[i]["energy"] for i in vaf])

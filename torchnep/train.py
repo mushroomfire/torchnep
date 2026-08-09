@@ -41,7 +41,8 @@ from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model, gpumd_init_parameters
-from .data import read_xyz, parse_nep_in, valid_split_indices, build_neighbor_list_np
+from .data import (read_xyz, parse_nep_in, valid_split_indices,
+                   stratified_split_indices, build_neighbor_list_np)
 from . import ops
 from . import __version__
 from .predict import predict_from_store
@@ -1130,6 +1131,7 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    valid_strategy: str = "random",
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1330,13 +1332,25 @@ def train_nep(
     elif valid_ratio is not None:
         # The same draw export_valid_split reproduces (see data.py) — the
         # split can be exported as GPUMD-ready train.xyz/test.xyz files.
-        train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
-                                                 run_seed)
+        if valid_strategy == "stratified":
+            metas = [(f["natoms"], f["species"]) for f in frames]
+            train_idx, val_idx, st = stratified_split_indices(
+                metas, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
+                 f"cell size): {st['n_strata']} strata; {st['n_rare_strata']} "
+                 f"rare strata ({st['n_rare_frames']} frames) kept fully in "
+                 f"training; held out {len(val_idx)} frames, "
+                 f"{len(train_idx)} remain (split drawn from run_seed)")
+        elif valid_strategy == "random":
+            train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                     run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames for validation, {len(train_idx)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
         valid_frames = [frames[i] for i in val_idx]
         frames = [frames[i] for i in train_idx]
-        _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} frames "
-             f"for validation, {len(frames)} remain for training "
-             f"(split drawn from run_seed)")
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -1616,6 +1630,8 @@ def train_nep(
     best_true_loss = float("inf")
     best_valid_loss = float("inf")
     cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
+    if valid_strategy != "random":
+        cur_valid_info["valid_strategy"] = valid_strategy
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if resume_ckpt is not None:
         info = _load_checkpoint(resume_ckpt, model, optimizer,

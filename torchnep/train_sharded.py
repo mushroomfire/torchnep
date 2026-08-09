@@ -42,7 +42,8 @@ from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
 from .model import NEPModel, gpumd_init_parameters
-from .data import read_xyz, parse_nep_in, valid_split_indices
+from .data import (read_xyz, parse_nep_in, valid_split_indices,
+                   stratified_split_indices)
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
@@ -219,6 +220,7 @@ def train_nep_sharded(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    valid_strategy: str = "random",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -424,13 +426,25 @@ def train_nep_sharded(
              f"from {valid_file}")
     elif valid_ratio is not None:
         # Same draw as export_valid_split / train_nep (see data.py).
-        train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
-                                                 run_seed)
+        if valid_strategy == "stratified":
+            metas = [(f["natoms"], f["species"]) for f in frames]
+            train_idx, val_idx, st = stratified_split_indices(
+                metas, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
+                 f"cell size): {st['n_strata']} strata; {st['n_rare_strata']} "
+                 f"rare strata ({st['n_rare_frames']} frames) kept fully in "
+                 f"training; held out {len(val_idx)} frames, "
+                 f"{len(train_idx)} remain (split drawn from run_seed)")
+        elif valid_strategy == "random":
+            train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
+                                                     run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames for validation, {len(train_idx)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
         valid_frames = [frames[i] for i in val_idx]
         frames = [frames[i] for i in train_idx]
-        _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} frames "
-             f"for validation, {len(frames)} remain for training "
-             f"(split drawn from run_seed)")
     n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
@@ -785,6 +799,8 @@ def train_nep_sharded(
     best_true_loss = float("inf")
     best_valid_loss = float("inf")
     cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
+    if valid_strategy != "random":
+        cur_valid_info["valid_strategy"] = valid_strategy
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     if resume_ckpt is not None:
         # Every rank loads the same file; model weights go into raw_model
