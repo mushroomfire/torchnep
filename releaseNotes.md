@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## 1.0.2b1
 
 - **Stratified validation split** (`valid_strategy="stratified"`, also in
   `export_valid_split`): frames are grouped by (element combination ×
