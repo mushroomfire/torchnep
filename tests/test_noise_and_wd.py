@@ -156,3 +156,57 @@ def test_gathered_nn_equivalence(tmp_path):
     with torch.no_grad():
         ei_nograd, _, _ = m._cached_core(batch, need_forces=False)
     assert torch.equal(ei_grad.detach(), ei_nograd)
+
+
+def test_zbl_static_equivalence(tmp_path):
+    """The compiled branch-free ZBL (table gather + analytic pair gradient,
+    ops.compute_zbl_pair inside _cached_core) must reproduce the eager
+    reference (ops.compute_zbl + autograd through rij) — energies, forces,
+    virial — in float64, for both plain and typewise cutoffs, with and
+    without torch.no_grad()."""
+    from torchnep.model import NEPModel
+    store, cfg = _store(tmp_path, n=8)
+    batch = store.collate([0, 2, 4, 6])
+
+    for extra in ({"zbl": 3.5},
+                  {"zbl": 3.5, "typewise_cutoff_zbl_factor": 1.2}):
+        c = dict(cfg)
+        c.update(extra)
+        torch.manual_seed(3)
+        m = NEPModel(c).to(torch.float64)
+        m.train()
+
+        ref = m.compute_properties(
+            batch["rij_rad"], batch["rij_ang"],
+            batch["pair_i_rad"], batch["pair_j_rad"],
+            batch["pair_i_ang"], batch["pair_j_ang"],
+            batch["atom_types"], batch["N"],
+            batch["struct_idx"], batch["num_structures"],
+            need_forces=True, need_virial=True, backend="loop")
+
+        got = m.compute_properties_cached(batch, need_forces=True,
+                                          need_virial=True, backend="loop")
+        torch.testing.assert_close(got["Ei"], ref["Ei"],
+                                   rtol=1e-10, atol=1e-12)
+        torch.testing.assert_close(got["forces"], ref["forces"],
+                                   rtol=1e-8, atol=1e-10)
+        torch.testing.assert_close(got["virial"], ref["virial"],
+                                   rtol=1e-8, atol=1e-10)
+
+        # ZBL actually contributes on this geometry (identical seed ->
+        # identical NN weights; the difference is pure ZBL)
+        torch.manual_seed(3)
+        m0 = NEPModel(dict(cfg)).to(torch.float64)
+        got0 = m0.compute_properties_cached(batch, need_forces=False,
+                                            backend="loop")
+        assert (got["Ei"] - got0["Ei"]).abs().max() > 1e-6
+
+        # prediction path: no_grad must still carry full ZBL forces
+        # (the old eager block needed an enable_grad escape for this)
+        with torch.no_grad():
+            gp = m.compute_properties_cached(batch, need_forces=True,
+                                             need_virial=True, backend="loop")
+        torch.testing.assert_close(gp["forces"], ref["forces"],
+                                   rtol=1e-8, atol=1e-10)
+        torch.testing.assert_close(gp["virial"], ref["virial"],
+                                   rtol=1e-8, atol=1e-10)

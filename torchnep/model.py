@@ -119,6 +119,37 @@ class NEPModel(nn.Module):
                 self.zbl_rc_outer = self.zbl
                 self.zbl_typewise_factor = None
 
+            # (T, T) per-type-pair tables for the compiled ZBL term
+            # (ops.compute_zbl_pair): gathering from these keeps the whole
+            # ZBL evaluation branch-free and traceable. Built in float64;
+            # the module-level .to(dtype) casts them with the other buffers.
+            an_f = torch.tensor(atomic_numbers, dtype=torch.float64)
+            zi, zj = an_f.view(-1, 1), an_f.view(1, -1)
+            self.register_buffer("zbl_zizj_pair", ops.K_C_SP * zi * zj,
+                                 persistent=False)
+            self.register_buffer("zbl_a_inv_pair",
+                                 (zi ** 0.23 + zj ** 0.23) * 2.134563,
+                                 persistent=False)
+            if tw is not None:
+                # NEP_CPU typewise convention: rc_outer per pair is
+                # min((cov_i + cov_j) * factor, global rc_outer), rc_inner 0.
+                # Built FROM the registered per-type buffer (float32-rounded)
+                # so the table matches the eager compute_zbl path bit-for-bit.
+                rt = self.zbl_rc_outer_per_type.to(torch.float64)
+                rc_o_pair = torch.clamp(0.5 * (rt.view(-1, 1) + rt.view(1, -1)),
+                                        max=self.zbl_rc_outer)
+                rc_i_pair = torch.zeros_like(rc_o_pair)
+            else:
+                shape = (len(atomic_numbers), len(atomic_numbers))
+                rc_o_pair = torch.full(shape, self.zbl_rc_outer,
+                                       dtype=torch.float64)
+                rc_i_pair = torch.full(shape, self.zbl_rc_inner,
+                                       dtype=torch.float64)
+            self.register_buffer("zbl_rc_inner_pair", rc_i_pair,
+                                 persistent=False)
+            self.register_buffer("zbl_rc_outer_pair", rc_o_pair,
+                                 persistent=False)
+
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
         self.dim_angular_3b = n_ap1 * self.l_max_3b
@@ -266,14 +297,13 @@ class NEPModel(nn.Module):
                      backend: str = "loop"):
         """Descriptor + NN + analytical-force part of the cached compute.
 
-        Deliberately free of data-dependent Python control flow (the
-        per-type NN dispatch is branchless: every type's net runs on all
-        atoms and ``torch.where`` selects), and ZBL is NOT included — so
-        ``torch.compile`` captures this whole function as ONE graph with no
-        breaks (the eager path's ``mask.any()`` branches and the ZBL block's
-        inner ``autograd.grad`` each split the graph, leaving ~2.7x more
-        kernel launches). ZBL and result assembly live in the
-        ``compute_properties_cached`` wrapper.
+        Deliberately free of data-dependent Python control flow — the NN
+        dispatch is a branchless weight gather, and ZBL is the branch-free
+        table variant (``ops.compute_zbl_pair``) with analytic pair
+        gradients — so ``torch.compile`` captures this whole function as
+        ONE graph with no breaks (the eager reference path's ``mask.any()``
+        branches and inner ``autograd.grad`` each split the graph). Only
+        result assembly lives in the ``compute_properties_cached`` wrapper.
 
         Returns ``(Ei, forces, virial)`` — forces/virial are None when not
         requested.
@@ -357,6 +387,21 @@ class NEPModel(nn.Module):
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
         Ei = Ei - self.b1  # subtract shared output bias
 
+        # ZBL — branch-free table variant, fully inside the compiled graph
+        # (energy over all angular pairs; fc is exactly zero beyond the
+        # per-pair cutoff, so no boolean compaction is needed). The pair
+        # gradient g_zbl rides into compute_analytical_forces where it is
+        # folded into the angular scatter for free.
+        g_zbl = None
+        if self.zbl is not None:
+            e_zbl, g_zbl = ops.compute_zbl_pair(
+                batch["atom_types"], batch["pair_i_ang"],
+                batch["pair_j_ang"], batch["rij_ang"],
+                self.zbl_zizj_pair, self.zbl_a_inv_pair,
+                self.zbl_rc_inner_pair, self.zbl_rc_outer_pair,
+                need_grad=need_forces)
+            Ei = Ei.scatter_add(0, batch["pair_i_ang"], e_zbl)
+
         forces = None
         virial = None
         if need_forces:
@@ -382,6 +427,7 @@ class NEPModel(nn.Module):
                 backend=backend,
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             has_q_134=self.has_q_134,
+                g_extra_ang=g_zbl,
             )
         return Ei, forces, virial
 
@@ -394,9 +440,9 @@ class NEPModel(nn.Module):
 
         ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
         ``core_fn`` optionally substitutes a ``torch.compile``d version of
-        ``_cached_core`` (the trainer passes one); the ZBL add-on and result
-        assembly below stay eager either way (ZBL's typewise cutoffs and
-        inner autograd.grad cannot be captured in the compiled graph).
+        ``_cached_core`` (the trainer passes one); the core includes ZBL
+        (branch-free table variant), only the per-structure energy
+        reduction below stays eager.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
@@ -405,39 +451,6 @@ class NEPModel(nn.Module):
         core = core_fn if core_fn is not None else self._cached_core
         Ei, forces, virial = core(batch, need_forces=need_forces,
                                   need_virial=need_virial, backend=backend)
-
-        # ZBL energy + forces (no trainable params; local autograd on rij_ang).
-        # enable_grad: end-of-training predict_from_store wraps this call in
-        # torch.no_grad(), under which Ei_zbl.requires_grad would be False
-        # and the ZBL force contribution would be silently dropped.
-        if self.zbl is not None:
-            with torch.enable_grad():
-                rij_zbl = batch["rij_ang"].detach().requires_grad_(True)
-                Ei_zbl = ops.compute_zbl(
-                    batch["atom_types"], batch["pair_i_ang"], batch["pair_j_ang"],
-                    rij_zbl, N, self.atomic_numbers.tolist(),
-                    self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
-                    getattr(self, "zbl_rc_inner_per_type", None),
-                    getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
-                if need_forces and Ei_zbl.requires_grad:
-                    g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
-                                                allow_unused=True)[0]
-                else:
-                    g_zbl = None
-            Ei = Ei + Ei_zbl.detach()
-            if g_zbl is not None:
-                empty_i = torch.zeros(0, dtype=torch.long, device=device)
-                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
-                zbl_forces, zbl_virial = ops.accumulate_forces_virial(
-                    N, empty_i, empty_i, empty_r, empty_r,
-                    batch["pair_i_ang"], batch["pair_j_ang"],
-                    batch["rij_ang"].detach(), g_zbl.detach(),
-                    dtype, device,
-                )
-                if forces is not None:
-                    forces = forces + zbl_forces
-                    if need_virial and virial is not None:
-                        virial = virial + zbl_virial
 
         Etot = torch.zeros(batch["num_structures"], dtype=dtype, device=device)
         Etot.scatter_add_(0, batch["struct_idx"], Ei)

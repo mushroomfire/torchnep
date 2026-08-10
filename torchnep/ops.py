@@ -584,6 +584,76 @@ def compute_zbl(
     return e_atom
 
 
+def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
+                     zizj_tab, a_inv_tab, rc_inner_tab, rc_outer_tab,
+                     need_grad: bool):
+    """Branch-free ZBL over ALL pairs — static shapes, analytic derivative.
+
+    Table variant of :func:`compute_zbl` for the compiled cached core: the
+    per-type-pair constants (Z_i*Z_j, screening-length inverse, switching
+    window) come from (T, T) tables gathered with one flat index, and no
+    boolean compaction is done — the smooth cutoff fc and its derivative
+    are exactly zero at/beyond the per-pair rc_outer, so out-of-range
+    pairs contribute exact zeros instead of being dropped. The derivative
+    is analytic (no inner autograd.grad), which is what lets the whole
+    term live inside the torch.compile graph with no breaks.
+
+    Parameters
+    ----------
+    atom_types : (N,) int64
+    pair_i, pair_j : (P,) int64      angular-list pairs (ZBL reuses them).
+    rij : (P, 3) float               displacement vectors (A).
+    zizj_tab : (T, T) float          K_C_SP * Z_i * Z_j.
+    a_inv_tab : (T, T) float         (Z_i^0.23 + Z_j^0.23) * 2.134563.
+    rc_inner_tab, rc_outer_tab : (T, T) float
+        Per-type-pair switching window; typewise mode bakes
+        min((cov_i+cov_j)*factor, rc_outer_default) into rc_outer_tab
+        with rc_inner_tab = 0, plain mode fills both with the globals.
+    need_grad : bool                 also return the pair gradient.
+
+    Returns
+    -------
+    e_half : (P,) float      0.5 * pair energy (scatter to pair_i for Ei;
+             the directed list holds each physical pair twice).
+    g : (P, 3) float or None d(e_half)/d(rij) — same per-pair dE/drij
+        convention as the gradients fed to accumulate_forces_virial.
+    """
+    T = zizj_tab.shape[0]
+    idx = atom_types[pair_i] * T + atom_types[pair_j]
+    zizj = zizj_tab.reshape(-1)[idx]
+    a_inv = a_inv_tab.reshape(-1)[idx]
+    rc_i = rc_inner_tab.reshape(-1)[idx]
+    rc_o = rc_outer_tab.reshape(-1)[idx]
+
+    d = torch.norm(rij, dim=-1)
+    x = d * a_inv
+    e1 = torch.exp(-ZBL_PARA[1] * x)
+    e2 = torch.exp(-ZBL_PARA[3] * x)
+    e3 = torch.exp(-ZBL_PARA[5] * x)
+    e4 = torch.exp(-ZBL_PARA[7] * x)
+    phi = (ZBL_PARA[0] * e1 + ZBL_PARA[2] * e2
+           + ZBL_PARA[4] * e3 + ZBL_PARA[6] * e4)
+
+    inv_w = 1.0 / (rc_o - rc_i)
+    t = torch.clamp((d - rc_i) * inv_w, 0.0, 1.0)
+    fc = 0.5 * torch.cos(PI * t) + 0.5
+
+    e_half = 0.5 * (zizj * phi / d * fc)
+    if not need_grad:
+        return e_half, None
+
+    # d(phi)/dd = d(phi)/dx * a_inv;  d(fc)/dd via the clamped t: sin(pi*t)
+    # vanishes at both clamp boundaries, so the formula is exact everywhere.
+    dphi = -(ZBL_PARA[0] * ZBL_PARA[1] * e1 + ZBL_PARA[2] * ZBL_PARA[3] * e2
+             + ZBL_PARA[4] * ZBL_PARA[5] * e3
+             + ZBL_PARA[6] * ZBL_PARA[7] * e4) * a_inv
+    dfc = -0.5 * PI * torch.sin(PI * t) * inv_w
+    # e_pair = zizj * phi * fc / d
+    de = zizj * (dphi * fc + phi * dfc - phi * fc / d) / d
+    g = (0.5 * de / d).unsqueeze(-1) * rij
+    return e_half, g
+
+
 def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
     r"""Type-pair loop: \Sigma_k c[t1, t2, n, k]*basis[p, k] then scatter_add into q.
 
@@ -1070,6 +1140,7 @@ def compute_analytical_forces(
     compute_virial: bool = True,
     backend: str = "loop",
     has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
+    g_extra_ang=None,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -1100,6 +1171,11 @@ def compute_analytical_forces(
     dtype, device : torch dtype / device for outputs.
     compute_virial : bool  if False, ``virial`` output is ``None``.
     backend : "loop" | "bmm" | "mulsum" — see ``compute_descriptors_cached``.
+    g_extra_ang : (P_ang, 3) float or None
+        Extra per-pair dE/drij on the angular pair list (the compiled ZBL
+        term) — folded into the angular scatter so it costs no additional
+        scatter kernels; accumulated separately if the angular block is
+        inactive (l_max_3b = 0).
 
     Returns
     -------
@@ -1178,11 +1254,20 @@ def compute_analytical_forces(
         hat_dot_dblm = (hat.unsqueeze(1) * dblm_dhat).sum(-1)  # (P, num_lm)
         t2_sc = (w_gn * hat_dot_dblm).sum(1) * d12inv_ang
         f12_ang = f12_gnp + term1 - t2_sc.unsqueeze(-1) * hat
+        if g_extra_ang is not None:
+            f12_ang = f12_ang + g_extra_ang
 
         forces.scatter_add_(0, _exp(pi_ang, f12_ang), f12_ang)
         forces.scatter_add_(0, _exp(pj_ang, f12_ang), -f12_ang)
         if compute_virial:
             v9_a = -(rij_ang.unsqueeze(-1) * f12_ang.unsqueeze(-2)).reshape(-1, 9)
+            virial.scatter_add_(0, pj_ang.unsqueeze(-1).expand_as(v9_a), v9_a)
+    elif g_extra_ang is not None and pi_ang.shape[0] > 0:
+        forces.scatter_add_(0, _exp(pi_ang, g_extra_ang), g_extra_ang)
+        forces.scatter_add_(0, _exp(pj_ang, g_extra_ang), -g_extra_ang)
+        if compute_virial:
+            v9_a = -(rij_ang.unsqueeze(-1)
+                     * g_extra_ang.unsqueeze(-2)).reshape(-1, 9)
             virial.scatter_add_(0, pj_ang.unsqueeze(-1).expand_as(v9_a), v9_a)
 
     return forces, virial
