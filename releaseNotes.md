@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **`stage2_lambda_v` default 0.1 → 0.05** (same as `stage2_lambda_f`):
+  the old value measurably overfits the virial in stage 2 on
+  multi-element sets — lowering it improved validation E and V together
+  in the unep16 sweeps.
+- **Noisy-train labeling**: with `pos_noise` on, the per-epoch train
+  RMSEs (screen and loss.out) are measured on the noise-augmented
+  batches and sit above the true training error by the injected jitter;
+  they are now marked `(noisy)` and loss.out carries an explanatory
+  header line. Clean train error: the periodic `*_train.out`
+  predictions.
+
 - **`predict_dataset` streams from host memory**: the whole-dataset GPU
   upload is gone — only each batch's slice is shipped to the device, so
   prediction memory scales with `batch_size` like training does (a

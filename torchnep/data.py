@@ -392,7 +392,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)
-    params.setdefault("stage2_pref_v", 0.1)
+    params.setdefault("stage2_pref_v", 0.05)
     # start_stage2 defaults to 0.5 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and
