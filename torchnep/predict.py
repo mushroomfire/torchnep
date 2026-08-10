@@ -239,18 +239,19 @@ def predict_dataset(
 
     del structures  # free CPU memory
 
-    at_gpu    = torch.from_numpy(all_at).to(device=device)
-    pi_r_gpu  = torch.from_numpy(all_pi_r).to(device=device)
-    pj_r_gpu  = torch.from_numpy(all_pj_r).to(device=device)
-    rij_r_gpu = torch.from_numpy(all_rij_r).to(device=device, dtype=dt)
-    pi_a_gpu  = torch.from_numpy(all_pi_a).to(device=device)
-    pj_a_gpu  = torch.from_numpy(all_pj_a).to(device=device)
-    rij_a_gpu = torch.from_numpy(all_rij_a).to(device=device, dtype=dt)
+    # Host-resident staging: the concatenated arrays stay on the CPU and
+    # only each batch's slice is shipped to the device inside the loop —
+    # GPU memory scales with batch_size, not dataset size (a 105k-frame
+    # set is ~15 GB as whole-dataset uploads, far beyond a 16 GB card).
+    at_cpu    = torch.from_numpy(all_at)
+    pi_r_cpu  = torch.from_numpy(all_pi_r)
+    pj_r_cpu  = torch.from_numpy(all_pj_r)
+    rij_r_cpu = torch.from_numpy(all_rij_r)
+    pi_a_cpu  = torch.from_numpy(all_pi_a)
+    pj_a_cpu  = torch.from_numpy(all_pj_a)
+    rij_a_cpu = torch.from_numpy(all_rij_a)
     natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    _log(f"  upload:      {time.time() - t0:5.1f}s")
-    del all_at, all_pi_r, all_pj_r, all_rij_r, all_pi_a, all_pj_a, all_rij_a
+    _log(f"  staging:     {time.time() - t0:5.1f}s")
 
     # 4) Batched compute loop ------------------------------------------------
     e_pred_arr = np.empty(n_struct, dtype=np.float64)
@@ -277,13 +278,13 @@ def predict_dataset(
             g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
             N = a_hi - a_lo
 
-            atom_types = at_gpu[a_lo:a_hi]
-            pi_r = pi_r_gpu[r_lo:r_hi] - a_lo
-            pj_r = pj_r_gpu[r_lo:r_hi] - a_lo
-            rij_r = rij_r_gpu[r_lo:r_hi]
-            pi_a = pi_a_gpu[g_lo:g_hi] - a_lo
-            pj_a = pj_a_gpu[g_lo:g_hi] - a_lo
-            rij_a = rij_a_gpu[g_lo:g_hi]
+            atom_types = at_cpu[a_lo:a_hi].to(device)
+            pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
+            pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
+            rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
+            pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
+            pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
+            rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
 
             struct_idx = torch.repeat_interleave(
                 torch.arange(B, device=device, dtype=torch.long),

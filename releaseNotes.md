@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`predict_dataset` streams from host memory**: the whole-dataset GPU
+  upload is gone — only each batch's slice is shipped to the device, so
+  prediction memory scales with `batch_size` like training does (a
+  105k-frame set needed ~15 GB resident before; it now runs on any card).
+
 - **`pos_noise`**: training-time coordinate jitter — per-atom Gaussian
   displacements (σ in Å) applied to each training batch's pair vectors;
   labels untouched, validation/eval passes stay clean, and the noise
