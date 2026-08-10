@@ -1751,6 +1751,16 @@ def train_nep(
     if write_header:
         hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                "rmse_v(eV/atom)  rmse_stress(GPa)")
+        if pos_noise > 0:
+            # The in-loop train RMSEs are measured on the noise-augmented
+            # batches (predictions on jittered geometry vs clean labels),
+            # so they sit ABOVE the model's true training error by the
+            # injected perturbation. Clean train error: the periodic
+            # *_train.out predictions. Validation columns are always clean.
+            hdr += ("\n# NOTE: pos_noise=%g — train RMSE columns are "
+                    "measured on noise-augmented batches (inflated by the "
+                    "jitter itself); clean train error is in the periodic "
+                    "*_train.out predictions" % pos_noise)
         if valid_store is not None:
             # GPUMD loss.out convention: train RMSEs, then test RMSEs.
             # (The loss column is then the VALIDATION loss — it is what
@@ -2109,8 +2119,10 @@ def train_nep(
                 valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                              + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                 if has_virial else ""))
+            noisy_tag = "(noisy)" if pos_noise > 0 else ""
             line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
-                    f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
+                    f"E{noisy_tag} {rmse_e:.5f} eV/atom | "
+                    f"F{noisy_tag} {rmse_f:.5f} eV/A"
                     f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:

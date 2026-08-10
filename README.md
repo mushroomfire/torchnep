@@ -119,8 +119,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_scheduler_factor` | `scheduler_factor` | Stage 2 LR decay factor (overrides Stage 1's)|
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
-| `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
-| `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, validation/eval clean, reproducible from `run_seed`) |
+| `stage2_lambda_v` | `0.05` | Stage 2 virial weight (matches `stage2_lambda_f`; the old 0.1 default measurably overfits the virial on multi-element sets) |
+| `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, validation/eval clean, reproducible from `run_seed`). Note: the displayed/logged train RMSEs are then measured on the noisy batches (marked `(noisy)`); the clean train error is in the periodic `*_train.out` predictions |
 | `weight_decay` | `0` | > 0 switches the optimizer to AdamW with this decoupled weight decay (the MACE-style regularizer). Use instead of `lambda_1`/`lambda_2`, not together |
 
 ### Runtime arguments
