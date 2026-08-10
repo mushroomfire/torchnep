@@ -62,6 +62,15 @@ def test_pos_noise_collate_contract(tmp_path):
                           torch.norm(exp_r, dim=-1))
     assert not torch.equal(noisy["fk_rad"], clean["fk_rad"])
 
+    # the "_clean" view riding along the noisy batch is bit-identical to
+    # a plain clean collate — it is what the logged train metrics and the
+    # analytic b1 update are computed from
+    cv = noisy["_clean"]
+    for k in ("rij_rad", "rij_ang", "fk_rad", "fkp_rad", "d12inv_rad",
+              "fk_ang", "fkp_ang", "d12inv_ang", "blm"):
+        assert torch.equal(cv[k], clean[k]), k
+    assert "_clean" not in clean
+
     # sigma 0 (default) is bit-identical to clean
     again = store.collate(idx)
     assert torch.equal(again["rij_rad"], clean["rij_rad"])

@@ -120,7 +120,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.05` | Stage 2 virial weight (matches `stage2_lambda_f`; the old 0.1 default measurably overfits the virial on multi-element sets) |
-| `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, validation/eval clean, reproducible from `run_seed`). Note: the displayed/logged train RMSEs are then measured on the noisy batches (marked `(noisy)`); the clean train error is in the periodic `*_train.out` predictions |
+| `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, reproducible from `run_seed`). The loss trains on the noisy geometry; the logged/displayed train RMSEs come from an extra clean forward on the same batches (~+30% epoch time), so loss.out stays the TRUE training error. Pick σ ≈ (force RMSE)/(typical stiffness), e.g. 0.15 eV/Å ÷ 20 eV/Å² ≈ 0.005–0.008 |
 | `weight_decay` | `0` | > 0 switches the optimizer to AdamW with this decoupled weight decay (the MACE-style regularizer). Use instead of `lambda_1`/`lambda_2`, not together |
 
 ### Runtime arguments

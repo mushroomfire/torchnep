@@ -881,11 +881,6 @@ def train_nep_sharded(
         if write_header:
             hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                    "rmse_v(eV/atom)  rmse_stress(GPa)")
-            if pos_noise > 0:
-                hdr += ("\n# NOTE: pos_noise=%g — train RMSE columns are "
-                        "measured on noise-augmented batches (inflated by "
-                        "the jitter itself); clean train error is in the "
-                        "periodic *_train.out predictions" % pos_noise)
             if valid_store is not None:
                 # GPUMD loss.out convention: train RMSEs, then test RMSEs.
                 # (The loss column is then the VALIDATION loss — it is what
@@ -1035,6 +1030,31 @@ def train_nep_sharded(
                 result = model(batch, use_autograd_forces,
                                has_forces, has_virial, train_backend)
 
+                # pos_noise: loss from the noisy geometry, metrics + b1
+                # residual from one no-grad forward on the clean view (see
+                # train_nep). The clean forward bypasses the DDP wrapper —
+                # no gradients, nothing to all-reduce.
+                result_m = result
+                if pos_noise > 0 and "_clean" in batch:
+                    with torch.no_grad():
+                        result_m = _shim._compute_cached(
+                            batch["_clean"], need_forces=has_forces,
+                            need_virial=has_virial, backend=train_backend) \
+                            if not use_autograd_forces else \
+                            raw_model.compute_properties(
+                                batch["_clean"]["rij_rad"],
+                                batch["_clean"]["rij_ang"],
+                                batch["_clean"]["pair_i_rad"],
+                                batch["_clean"]["pair_j_rad"],
+                                batch["_clean"]["pair_i_ang"],
+                                batch["_clean"]["pair_j_ang"],
+                                batch["_clean"]["atom_types"],
+                                batch["_clean"]["N"],
+                                batch["_clean"]["struct_idx"],
+                                batch["_clean"]["num_structures"],
+                                need_forces=has_forces,
+                                need_virial=has_virial, backend=backend)
+
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
@@ -1067,39 +1087,48 @@ def train_nep_sharded(
 
                 if e_mask.any():
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    sum_sq_e = (diff_e ** 2).sum()
-                    loss = loss + cur_pref_e * sum_sq_e * ws / n_e_g
-                    sum_le += sum_sq_e.item()  # global sum-of-squared-errors
+                    loss = loss + cur_pref_e * (diff_e ** 2).sum() * ws / n_e_g
+                    e_pa_pred_m = result_m["Etot"] / batch["natoms"]
+                    diff_e_m = e_pa_pred_m[e_mask] - e_pa_ref[e_mask]
+                    sum_le += (diff_e_m ** 2).sum().item()  # global SSE
                     # Signed residual for the analytical b1 update (folded into
                     # this pass; all-reduced below with the other metrics).
-                    sum_e_resid += diff_e.sum().item()
+                    sum_e_resid += diff_e_m.sum().item()
 
                 if f_mask is not None and f_mask.any():
-                    f_pred = result["forces"][f_mask]
                     f_ref = batch["forces"][f_mask]
-                    sum_sq_f = ((f_pred - f_ref) ** 2).sum()
+                    sum_sq_f = ((result["forces"][f_mask] - f_ref) ** 2).sum()
                     # 3 components per atom -> divide by (3 * n_f_g)
                     loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
-                    sum_lf += (sum_sq_f.item() / 3.0)
+                    sum_lf += ((((result_m["forces"][f_mask] - f_ref) ** 2)
+                                .sum().item() / 3.0)
+                               if result_m is not result
+                               else (sum_sq_f.item() / 3.0))
 
                 if v_mask is not None and v_mask.any() and "virial" in result:
-                    v_atom = result["virial"]
-                    v_sys = torch.zeros(batch["num_structures"], 9,
-                                        dtype=dtype, device=dev)
-                    si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                    v_sys.scatter_add_(0, si, v_atom)
+                    def _v_pred_pa(res):
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                            res["virial"])
+                        v_sys.scatter_add_(0, si, res["virial"])
+                        na = batch["natoms"][v_mask].unsqueeze(-1)
+                        return v_sys[:, _VIRIAL_6][v_mask] / na
                     v_ref = batch["virial"]
                     if v_ref.shape[1] == 9:
                         na = batch["natoms"][v_mask].unsqueeze(-1)
                         # 6 unique components only (see _VIRIAL_6); all 9 would
                         # weight the symmetric off-diagonals twice.
-                        v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
+                        v_pred_pa = _v_pred_pa(result)
                         v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                        v_diff = v_pred_pa - v_ref_pa
-                        sum_sq_v = (v_diff ** 2).sum()
                         # 6 components per frame -> divide by (6 * n_v_g)
-                        loss = loss + cur_pref_v * sum_sq_v * ws / (6.0 * n_v_g)
-                        sum_lv += (sum_sq_v.item() / 6.0)
+                        loss = (loss + cur_pref_v
+                                * ((v_pred_pa - v_ref_pa) ** 2).sum()
+                                * ws / (6.0 * n_v_g))
+                        v_diff = (_v_pred_pa(result_m)
+                                  if result_m is not result
+                                  else v_pred_pa) - v_ref_pa
+                        sum_lv += ((v_diff ** 2).sum().item() / 6.0)
                         # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
                         scale = (batch["natoms"][v_mask]
                                  / batch["volumes"][v_mask]).unsqueeze(-1)
@@ -1271,11 +1300,9 @@ def train_nep_sharded(
                     valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                                  + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                     if has_virial else ""))
-                noisy_tag = "(noisy)" if pos_noise > 0 else ""
                 line = (f"{stage_str}Epoch {epoch:4d} | "
                         f"loss {sched_loss:.4e} | "
-                        f"E{noisy_tag} {rmse_e:.5f} eV/atom | "
-                        f"F{noisy_tag} {rmse_f:.5f} eV/A"
+                        f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                         f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                         f"lr {cur_lr:.2e} | {dt:.1f}s")
                 if epoch % print_interval == 0 or epoch == 1:

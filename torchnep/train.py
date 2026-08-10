@@ -466,15 +466,34 @@ class StreamDataStore:
         if "pos_noise" in staged:
             # rij for pair (i, j) is r_j - r_i, so a per-atom displacement d
             # perturbs it by d_j - d_i — the same d for the radial and
-            # angular lists keeps the noisy geometry self-consistent.
+            # angular lists keeps the noisy geometry self-consistent. The
+            # training loss consumes the noisy geometry (standard keys); a
+            # clean view (same labels/indices, clean rij + basis) rides
+            # along under "_clean" so the logged train metrics and the
+            # analytic b1 update stay TRUE errors, not jitter-inflated ones.
+            rij_r_clean = batch["rij_rad"]
+            rij_a_clean = batch["rij_ang"]
             d = staged["pos_noise"]
             d = d.to(dev, non_blocking=True) if self._pin else d.to(dev)
-            batch["rij_rad"] = (batch["rij_rad"]
+            batch["rij_rad"] = (rij_r_clean
                                 + d[batch["pair_j_rad"]]
                                 - d[batch["pair_i_rad"]])
-            batch["rij_ang"] = (batch["rij_ang"]
+            batch["rij_ang"] = (rij_a_clean
                                 + d[batch["pair_j_ang"]]
                                 - d[batch["pair_i_ang"]])
+            (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
+             batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
+             batch["blm"]) = self._basis_fn(batch["rij_rad"],
+                                            batch["rij_ang"])
+            clean = dict(batch)
+            clean.pop("_clean", None)
+            clean["rij_rad"] = rij_r_clean
+            clean["rij_ang"] = rij_a_clean
+            (clean["fk_rad"], clean["fkp_rad"], clean["d12inv_rad"],
+             clean["fk_ang"], clean["fkp_ang"], clean["d12inv_ang"],
+             clean["blm"]) = self._basis_fn(rij_r_clean, rij_a_clean)
+            batch["_clean"] = clean
+            return batch
 
         (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
          batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
@@ -1751,16 +1770,6 @@ def train_nep(
     if write_header:
         hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                "rmse_v(eV/atom)  rmse_stress(GPa)")
-        if pos_noise > 0:
-            # The in-loop train RMSEs are measured on the noise-augmented
-            # batches (predictions on jittered geometry vs clean labels),
-            # so they sit ABOVE the model's true training error by the
-            # injected perturbation. Clean train error: the periodic
-            # *_train.out predictions. Validation columns are always clean.
-            hdr += ("\n# NOTE: pos_noise=%g — train RMSE columns are "
-                    "measured on noise-augmented batches (inflated by the "
-                    "jitter itself); clean train error is in the periodic "
-                    "*_train.out predictions" % pos_noise)
         if valid_store is not None:
             # GPUMD loss.out convention: train RMSEs, then test RMSEs.
             # (The loss column is then the VALIDATION loss — it is what
@@ -1920,6 +1929,30 @@ def train_nep(
                         batch, need_forces=has_forces, need_virial=has_virial,
                         backend=train_backend)
 
+                # With pos_noise the LOSS comes from the noisy geometry (that
+                # is the regularization), but everything reported or used
+                # analytically — the rmse_* columns and the b1 residual —
+                # comes from one extra no-grad forward on the SAME batch's
+                # clean geometry, so logged train metrics are true errors.
+                result_m = result
+                if pos_noise > 0 and "_clean" in batch:
+                    with torch.no_grad():
+                        if use_autograd_forces:
+                            cb = batch["_clean"]
+                            result_m = compute_props(
+                                cb["rij_rad"], cb["rij_ang"],
+                                cb["pair_i_rad"], cb["pair_j_rad"],
+                                cb["pair_i_ang"], cb["pair_j_ang"],
+                                cb["atom_types"], cb["N"],
+                                cb["struct_idx"], cb["num_structures"],
+                                need_forces=has_forces,
+                                need_virial=has_virial, backend=backend)
+                        else:
+                            result_m = compute_props_cached(
+                                batch["_clean"], need_forces=has_forces,
+                                need_virial=has_virial,
+                                backend=train_backend)
+
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
@@ -1927,9 +1960,10 @@ def train_nep(
                 # sum_l* accumulates per-batch MSE so the rmse_* columns in
                 # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
                 if e_mask.any():
-                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
                     loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
                     loss = loss + cur_pref_e * loss_e
+                    e_pa_pred_m = result_m["Etot"] / batch["natoms"]
+                    diff_e = e_pa_pred_m[e_mask] - e_pa_ref[e_mask]
                     sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
                     # Accumulate the signed residual for the analytical b1
                     # update (folded into this pass — no extra forward).
@@ -1938,29 +1972,35 @@ def train_nep(
                 if has_forces:
                     f_mask = batch["force_mask"]
                     if f_mask.any():
-                        f_pred = result["forces"][f_mask]
-                        f_ref = batch["forces"][f_mask]
-                        loss_f = _loss_fn(f_pred, f_ref)
+                        loss_f = _loss_fn(result["forces"][f_mask],
+                                          batch["forces"][f_mask])
                         loss = loss + cur_pref_f * loss_f
+                        f_pred = result_m["forces"][f_mask]
+                        f_ref = batch["forces"][f_mask]
                         sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
 
                 if has_virial and "virial" in result:
                     v_mask = batch["virial_mask"]
                     if v_mask.any():
-                        v_atom = result["virial"]
-                        v_sys = torch.zeros(batch["num_structures"], 9,
-                                            dtype=dtype, device=dev)
-                        si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                        v_sys.scatter_add_(0, si, v_atom)
+                        def _v_pred_pa(res):
+                            v_sys = torch.zeros(batch["num_structures"], 9,
+                                                dtype=dtype, device=dev)
+                            si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                                res["virial"])
+                            v_sys.scatter_add_(0, si, res["virial"])
+                            na = batch["natoms"][v_mask].unsqueeze(-1)
+                            return v_sys[:, _VIRIAL_6][v_mask] / na
                         v_ref = batch["virial"]
                         if v_ref.shape[1] == 9:
                             na = batch["natoms"][v_mask].unsqueeze(-1)
                             # 6 unique components only (see _VIRIAL_6).
-                            v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
                             v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
+                            v_pred_pa = _v_pred_pa(result)
                             loss_v = _loss_fn(v_pred_pa, v_ref_pa)
                             loss = loss + cur_pref_v * loss_v
-                            v_diff = v_pred_pa - v_ref_pa
+                            v_diff = (_v_pred_pa(result_m)
+                                      if result_m is not result
+                                      else v_pred_pa) - v_ref_pa
                             sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
                             # Stress RMSE (eV/A**3): convert the same diff using
                             # per-frame (natoms/volume). Sign cancels under MSE.
@@ -2119,10 +2159,8 @@ def train_nep(
                 valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                              + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                 if has_virial else ""))
-            noisy_tag = "(noisy)" if pos_noise > 0 else ""
             line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
-                    f"E{noisy_tag} {rmse_e:.5f} eV/atom | "
-                    f"F{noisy_tag} {rmse_f:.5f} eV/A"
+                    f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                     f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:

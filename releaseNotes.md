@@ -6,12 +6,12 @@
   the old value measurably overfits the virial in stage 2 on
   multi-element sets — lowering it improved validation E and V together
   in the unep16 sweeps.
-- **Noisy-train labeling**: with `pos_noise` on, the per-epoch train
-  RMSEs (screen and loss.out) are measured on the noise-augmented
-  batches and sit above the true training error by the injected jitter;
-  they are now marked `(noisy)` and loss.out carries an explanatory
-  header line. Clean train error: the periodic `*_train.out`
-  predictions.
+- **True train metrics under `pos_noise`**: the loss still trains on the
+  noise-augmented geometry (that is the regularization), but the logged
+  train RMSEs and the analytic `b1` residual now come from one extra
+  no-grad forward on each batch's clean geometry (~+30% epoch time when
+  noise is on). loss.out keeps its exact format and shows real errors —
+  loss curves stay directly plottable and comparable.
 
 - **`predict_dataset` streams from host memory**: the whole-dataset GPU
   upload is gone — only each batch's slice is shipped to the device, so
