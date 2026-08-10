@@ -186,10 +186,6 @@ def format_config_summary(config: dict) -> List[str]:
     if config.get("weight_decay", 0.0):
         lines.append(f"  {tag('weight_decay'):10}  weight_decay "
                      f"{config['weight_decay']}")
-    if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
-        lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
-        lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
-
     if config.get("stage2"):
         lines.append("")
         lines.append("Training schedule (Stage 2)")
@@ -1328,9 +1324,6 @@ def train_nep(
         _log(line)
     _log("")
     config = orig_config
-    # Model regularisation coefficients
-    lambda_1 = config["lambda_1"]
-    lambda_2 = config["lambda_2"]
     pos_noise = config["pos_noise"]
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
@@ -1542,15 +1535,6 @@ def train_nep(
     # loop). GPUMD's number_of_variables also counts the single global energy
     # shift (our b1), which we train analytically; the 1-param difference is
     # negligible against the thousands of weights here.
-    n_par = sum(p.numel() for p in trainable_params)
-    # L1 gradient coefficient is constant (λ₁/N_par); precompute it once. The
-    # L2 coefficient depends on RMS(w) and is refreshed once per epoch below.
-    # Both regularizers are applied as fused, in-place gradient updates AFTER
-    # backward() (see the epoch loop), never inside the autograd graph — so
-    # with λ=0 they cost nothing and with λ>0 they add ~2 kernel launches per
-    # step instead of a per-parameter Python reduction.
-    l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
-
     if finetune_from is not None:
         # Load pre-trained weights; skip random b1 init from mean_epa.
         # The stored q_scaler is part of the loaded model and is KEPT (see
@@ -1846,17 +1830,6 @@ def train_nep(
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
 
-            # L2 gradient coefficient λ₂/(N_par·RMS(w)). RMS(w) drifts slowly,
-            # so it is refreshed once per epoch (mirroring GPUMD, which
-            # recomputes the regularization each generation) rather than every
-            # batch — this keeps the per-step reg cost sync-free.
-            l2_coeff = 0.0
-            if lambda_2 > 0:
-                with torch.no_grad():
-                    sq = sum(p.pow(2).sum() for p in trainable_params)
-                    rms = float(torch.sqrt(sq / n_par).item())
-                l2_coeff = lambda_2 / (n_par * max(rms, 1e-12))
-
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
                 cur_pref_e, cur_pref_f, cur_pref_v = (
@@ -2024,28 +1997,6 @@ def train_nep(
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-
-                # GPUMD-style regularization (snes.cu:524-525): the gradient of
-                # λ₁·mean(|w|) + λ₂·RMS(w) is added straight into .grad, fused
-                # across all parameters with torch._foreach_* (no autograd
-                # graph, no per-parameter Python loop, no per-step sync). This
-                # is equivalent to putting the terms in the loss but keeps the
-                # data forward/backward untouched, so reg never costs throughput
-                # when off and is near-free when on. Applied before grad-norm
-                # clipping so the clip sees the regularized gradient.
-                # NOTE: our data loss is MSE while GPUMD's is RMSE, so the
-                # reg-vs-data *balance* still differs even though the reg form
-                # matches (MSE ≈ RMSE²).
-                if l1_coeff or l2_coeff:
-                    with torch.no_grad():
-                        grads = [p.grad for p in trainable_params]
-                        if l2_coeff:
-                            torch._foreach_add_(grads, trainable_params,
-                                                alpha=l2_coeff)
-                        if l1_coeff:
-                            torch._foreach_add_(
-                                grads, torch._foreach_sign(trainable_params),
-                                alpha=l1_coeff)
 
                 if max_grad_norm > 0:
                     gn = torch.nn.utils.clip_grad_norm_(

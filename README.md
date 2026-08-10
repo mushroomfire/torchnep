@@ -105,8 +105,6 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `lambda_e` | `0.01` | Energy loss weight |
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
-| `lambda_1` | `0.0` | L1 regularisation weight |
-| `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
@@ -121,7 +119,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.05` | Stage 2 virial weight (matches `stage2_lambda_f`; the old 0.1 default measurably overfits the virial on multi-element sets) |
 | `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, reproducible from `run_seed`). The loss trains on the noisy geometry; the logged/displayed train RMSEs come from an extra clean forward on the same batches (~+30% epoch time), so loss.out stays the TRUE training error. Pick σ ≈ (force RMSE)/(typical stiffness), e.g. 0.15 eV/Å ÷ 20 eV/Å² ≈ 0.005–0.008 |
-| `weight_decay` | `0` | > 0 switches the optimizer to AdamW with this decoupled weight decay (the MACE-style regularizer). Use instead of `lambda_1`/`lambda_2`, not together |
+| `weight_decay` | `0` | > 0 switches the optimizer to AdamW with this decoupled weight decay (the MACE-style regularizer). `lambda_1`/`lambda_2` were removed (SNES-form L1/L2 does not transfer to Adam training) — files that still carry them get a warning and the keys are ignored |
 
 ### Runtime arguments
 

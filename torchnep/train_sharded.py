@@ -385,8 +385,6 @@ def train_nep_sharded(
             _log(line)
         _log("")
     config = orig_config
-    lambda_1 = config["lambda_1"]
-    lambda_2 = config["lambda_2"]
     pos_noise = config["pos_noise"]
     # pos_noise generator — per-rank offset so each shard draws its own
     # noise stream; reproducible from run_seed (see train_nep).
@@ -753,17 +751,6 @@ def train_nep_sharded(
     # the optimizer (and L1), matching the single-GPU path.
     trainable_params = [p for n, p in raw_model.named_parameters()
                         if n != "b1"]
-    # Divisor for GPUMD's mean(|w|) / RMS(w) regularization (see reg block in
-    # the epoch loop). Identical on every rank (DDP replicates the model), so
-    # the reg term needs no all-reduce — each rank adds the same value and DDP's
-    # gradient averaging leaves the reg gradient at full strength.
-    n_par = sum(p.numel() for p in trainable_params)
-    # Constant L1 gradient coefficient (λ₁/N_par); the L2 coefficient depends
-    # on RMS(w) and is refreshed once per epoch below. Both are applied as
-    # fused in-place grad updates after backward (see the loop) — reg is added
-    # locally on each rank (identical params → identical value, so no all-reduce
-    # needed; DDP already averaged the data gradient).
-    l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
     # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
     weight_decay = config["weight_decay"]
     optimizer = _make_optimizer(trainable_params, lr, weight_decay)
@@ -936,17 +923,6 @@ def train_nep_sharded(
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
-
-            # L2 coefficient λ₂/(N_par·RMS(w)), refreshed once per epoch (RMS
-            # drifts slowly; matches GPUMD's per-generation recompute). Params
-            # are replicated across ranks, so RMS is identical everywhere — no
-            # all-reduce needed.
-            l2_coeff = 0.0
-            if lambda_2 > 0:
-                with torch.no_grad():
-                    sq = sum(p.pow(2).sum() for p in trainable_params)
-                    rms = float(torch.sqrt(sq / n_par).item())
-                l2_coeff = lambda_2 / (n_par * max(rms, 1e-12))
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1131,23 +1107,6 @@ def train_nep_sharded(
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-
-                # GPUMD-style regularization (snes.cu:524-525): gradient of
-                # λ₁·mean(|w|) + λ₂·RMS(w) added into .grad, fused across params
-                # (no autograd graph, no per-step sync). Applied after DDP has
-                # averaged the data gradient — reg is identical on every rank,
-                # so adding it locally is exactly right (must NOT be averaged).
-                # See the single-GPU path for the MSE-vs-RMSE balance caveat.
-                if l1_coeff or l2_coeff:
-                    with torch.no_grad():
-                        grads = [p.grad for p in trainable_params]
-                        if l2_coeff:
-                            torch._foreach_add_(grads, trainable_params,
-                                                alpha=l2_coeff)
-                        if l1_coeff:
-                            torch._foreach_add_(
-                                grads, torch._foreach_sign(trainable_params),
-                                alpha=l1_coeff)
 
                 if max_grad_norm > 0:
                     gn = torch.nn.utils.clip_grad_norm_(

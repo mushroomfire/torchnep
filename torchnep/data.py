@@ -17,6 +17,8 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import warnings
+
 import numpy as np
 from typing import Dict, List
 
@@ -292,16 +294,22 @@ def parse_nep_in(filename: str) -> Dict:
                 params["l_max"] = [int(x) for x in parts[1:]]
             elif key == "neuron":
                 params["neuron"] = int(parts[1])
-            elif key == "lambda_1":
-                params["lambda_1"] = float(parts[1])
+            elif key in ("lambda_1", "lambda_2"):
+                # Removed: GPUMD's SNES-form L1/L2 do not transfer to Adam
+                # training (the in-gradient L2 gets rescaled per-parameter by
+                # the second-moment normalization). Ignored for GPUMD nep.in
+                # compatibility; use weight_decay (AdamW) / pos_noise instead.
+                if float(parts[1]) != 0.0:
+                    warnings.warn(
+                        f"nep.in key '{key}' is no longer supported and is "
+                        "ignored — use weight_decay (AdamW) or pos_noise "
+                        "for regularization.", stacklevel=2)
             elif key == "lambda_e":
                 params["lambda_e"] = float(parts[1])
             elif key == "lambda_f":
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
-            elif key == "lambda_2":
-                params["lambda_2"] = float(parts[1])
             elif key == "pos_noise":
                 params["pos_noise"] = float(parts[1])
             elif key == "weight_decay":
@@ -382,10 +390,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
-    params.setdefault("lambda_1", 0.0)
     params.setdefault("pos_noise", 0.0)
     params.setdefault("weight_decay", 0.0)
-    params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
 
     # Defaults for optional stage-2 parameters (only used if stage2=1).

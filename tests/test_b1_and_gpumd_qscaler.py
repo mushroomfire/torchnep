@@ -151,15 +151,17 @@ def _weight_rms(cfg, nep_txt):
     return (sq / n) ** 0.5
 
 
-def test_l2_regularization_shrinks_weights(tmp_path):
-    """With the same seed/init/data order, a positive lambda_2 (GPUMD-form L2)
-    drives the NN weights to a smaller RMS than an unregularized run — the only
-    difference between the two runs is the reg gradient, which points to 0."""
+def test_weight_decay_shrinks_weights(tmp_path):
+    """With the same seed/init/data order, a positive weight_decay (AdamW
+    decoupled decay) drives the NN weights to a smaller RMS than an
+    unregularized run — the only difference is the decay term, which points
+    every weight toward 0. (lambda_1/lambda_2 were removed; nep.in files
+    that still carry them get a warning and the keys are ignored.)"""
     _, xyz = _write_run_files(tmp_path)
     base = tmp_path / "nep0.in"
     base.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0\n")
     reg = tmp_path / "nepR.in"
-    reg.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0.2\n")
+    reg.write_text(NEP_IN + "epoch 15\nbatch 8\nweight_decay 0.3\n")
 
     kw = dict(data_file=xyz, device="cpu", precision="float64",
               print_interval=100, restart=False, checkpoint_interval=10000,
@@ -170,7 +172,8 @@ def test_l2_regularization_shrinks_weights(tmp_path):
     cfg = parse_nep_in(str(base))
     rms0 = _weight_rms(cfg, str(tmp_path / "o0" / "nep_final.txt"))
     rmsR = _weight_rms(cfg, str(tmp_path / "oR" / "nep_final.txt"))
-    assert rmsR < rms0, f"L2 did not shrink weights: reg={rmsR} vs none={rms0}"
+    assert rmsR < rms0, (
+        f"weight_decay did not shrink weights: reg={rmsR} vs none={rms0}")
 
 
 def _write_run_files(tmp_path, n_frames=20):
