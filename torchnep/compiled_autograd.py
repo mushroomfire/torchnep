@@ -37,9 +37,9 @@ are data-dependent and cannot be traced symbolically), and uses the
 "mulsum" contraction backend — vectorised like "bmm" so it traces (the
 "loop" backend's per-type-pair ``.any()`` masks are data-dependent), but
 with the contraction written as multiply+sum so Inductor fuses it instead
-of calling BLAS (see ops.resolve_backend). ZBL stays OUTSIDE the compiled
-graph (its typewise cutoffs use ``.item()``) and is added eagerly, exactly
-like the cached analytical path does.
+of calling BLAS (see ops.resolve_backend). ZBL is traced INTO the graph as
+the branch-free table variant with analytic pair gradients
+(``ops.compute_zbl_pair``), exactly like the cached analytical path.
 """
 
 import os
@@ -216,6 +216,19 @@ class CompiledAutogradForce:
             gr = torch.zeros_like(rr)
         if ga is None:
             ga = torch.zeros_like(ra)
+        # ZBL — branch-free table variant with ANALYTIC pair gradient
+        # (ops.compute_zbl_pair), traced into the same graph. Computed from
+        # the undetached rij_ang input (no autograd needed; no trainable
+        # params) and folded into the angular pair gradient before the
+        # accumulate, mirroring the cached analytical path (g_extra_ang).
+        if self.model.zbl is not None:
+            e_zbl, g_zbl = ops.compute_zbl_pair(
+                atom_types, pi_ang, pj_ang, rij_ang,
+                pd["zbl_zizj_pair"], pd["zbl_a_inv_pair"],
+                pd["zbl_rc_inner_pair"], pd["zbl_rc_outer_pair"],
+                need_grad=True)
+            Ei = Ei.scatter_add(0, pi_ang, e_zbl)
+            ga = ga + g_zbl
         forces, virial = ops.accumulate_forces_virial(
             N, pi_rad, pj_rad, rr, gr, pi_ang, pj_ang, ra, ga,
             rr.dtype, rr.device)
@@ -286,36 +299,7 @@ class CompiledAutogradForce:
         self._ensure_compiled(args)
         Ei, forces, virial = self._compiled(*args)
 
-        m = self.model
         dtype, device = rij_rad.dtype, rij_rad.device
-        if m.zbl is not None:
-            # ZBL outside the compiled graph (typewise cutoffs use .item()).
-            # No trainable parameters — energies/forces detach, same as the
-            # cached analytical path.
-            with torch.enable_grad():
-                rz = rij_ang.detach().requires_grad_(True)
-                Ei_zbl = ops.compute_zbl(
-                    atom_types, pi_ang, pj_ang, rz, N,
-                    m.atomic_numbers.tolist(),
-                    m.zbl_rc_inner, m.zbl_rc_outer, m.zbl_typewise_factor,
-                    getattr(m, "zbl_rc_inner_per_type", None),
-                    getattr(m, "zbl_rc_outer_per_type", None), dtype, device)
-                if Ei_zbl.requires_grad:
-                    g_zbl = torch.autograd.grad(Ei_zbl.sum(), rz,
-                                                allow_unused=True)[0]
-                else:
-                    g_zbl = None
-            Ei = Ei + Ei_zbl.detach()
-            if g_zbl is not None:
-                empty_i = torch.zeros(0, dtype=torch.long, device=device)
-                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
-                zf, zv = ops.accumulate_forces_virial(
-                    N, empty_i, empty_i, empty_r, empty_r,
-                    pi_ang, pj_ang, rij_ang.detach(), g_zbl.detach(),
-                    dtype, device)
-                forces = forces + zf
-                virial = virial + zv
-
         Etot = torch.zeros(num_structures, dtype=dtype, device=device)
         Etot.scatter_add_(0, struct_idx, Ei)
         result = {"Ei": Ei, "Etot": Etot, "forces": forces}

@@ -86,7 +86,8 @@ class _NEPDDPShim(nn.Module):
     this shim's ``forward`` puts it on the DDP path.
     """
 
-    def __init__(self, model: NEPModel, use_compile: bool = False):
+    def __init__(self, model: NEPModel, use_compile: bool = False,
+                 use_autograd_forces: bool = False):
         super().__init__()
         self.model = model
         # torch.compile is applied to the bound analytical compute method, not
@@ -94,24 +95,35 @@ class _NEPDDPShim(nn.Module):
         # NOT in NEPModel.forward(), so compiling the module would be a no-op.
         # The compiled call stays INSIDE this shim's forward, so it remains on
         # DDP's forward path and the reducer still arms backward all-reduce; the
-        # compiled region does not span the DDP boundary. The autograd path is
-        # left eager (its create_graph=True double backward is incompatible with
-        # torch.compile's donated-buffer optimisation). See train.py for the
-        # single-device counterpart.
+        # compiled region does not span the DDP boundary.
+        self._ag_compute = None
         if use_compile and hasattr(torch, "compile"):
-            # Compile the branch-free core; ZBL + assembly stay eager in the
-            # wrapper (see NEPModel._cached_core).
-            import functools
-            self._compute_cached = functools.partial(
-                model.compute_properties_cached,
-                core_fn=torch.compile(model._cached_core, dynamic=True))
-        else:
+            if use_autograd_forces:
+                # make_fx-traced autograd forces (see compiled_autograd):
+                # parameters enter the traced graph as function inputs, so
+                # loss.backward() still fills the same nn.Parameter .grads
+                # that DDP's reducer hooks watch — every parameter appears
+                # in the graph (weight stacks touch all types), so no
+                # find_unused_parameters needed.
+                from .compiled_autograd import CompiledAutogradForce
+                self._ag_compute = CompiledAutogradForce(model)
+            else:
+                # Compile the branch-free core; result assembly stays eager
+                # in the wrapper (see NEPModel._cached_core).
+                import functools
+                self._compute_cached = functools.partial(
+                    model.compute_properties_cached,
+                    core_fn=torch.compile(model._cached_core, dynamic=True))
+        if not hasattr(self, "_compute_cached"):
             self._compute_cached = model.compute_properties_cached
 
     def forward(self, batch, use_autograd_forces: bool,
                 need_forces: bool, need_virial: bool, backend: str):
         if use_autograd_forces:
-            return self.model.compute_properties(
+            fn = (self._ag_compute.compute_properties
+                  if self._ag_compute is not None
+                  else self.model.compute_properties)
+            return fn(
                 batch["rij_rad"], batch["rij_ang"],
                 batch["pair_i_rad"], batch["pair_j_rad"],
                 batch["pair_i_ang"], batch["pair_j_ang"],
@@ -674,8 +686,9 @@ def train_nep_sharded(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (make_fx autograd "
+                           "force graph)")
         else:
             compile_on = True
             compile_msg = "  torch.compile: enabled (analytical compute method)"
@@ -734,7 +747,8 @@ def train_nep_sharded(
         data_store.compile_basis()
         if valid_store is not None:
             valid_store.compile_basis()
-    shim = _NEPDDPShim(model, use_compile=compile_on)
+    shim = _NEPDDPShim(model, use_compile=compile_on,
+                       use_autograd_forces=use_autograd_forces)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
     # every step — no need for find_unused_parameters, and no implicit grad
