@@ -321,28 +321,38 @@ class NEPModel(nn.Module):
 
         q_scaled = q * self.q_scaler
 
-        # NN forward + Fp computation (differentiable through NN weights).
+        # NN forward + Fp via per-atom GATHERED weights — one batched matmul
+        # for all atoms instead of the old per-type loop (which ran every
+        # type's net on all atoms and torch.where-selected: T x the flops
+        # and ~3T tiny GEMM launches; profiled at 118 aten::mm per training
+        # step for 16 types — the single largest GPU cost).
         #
-        # Branchless per-type dispatch: EVERY type's net runs on all atoms
-        # and torch.where selects per atom. The nets are tiny, so the extra
-        # flops are negligible; in exchange there is no data-dependent
-        # Python branch (torch.compile keeps one graph) and every parameter
-        # is in the autograd graph on every forward — which also keeps DDP
-        # gradient bookkeeping consistent without find_unused_parameters
-        # and avoids the implicit /world_size gradient dilution for types
-        # absent from a batch.
-        Ei = torch.zeros(N, dtype=dtype, device=device)
-        Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
-        for t in range(self.num_types):
-            net = self.fitting_nets[t]
-            z = q_scaled @ net.w0 - net.b0
-            h = torch.tanh(z)
-            e_t = h @ net.w1
-            tanh_der = 1.0 - h * h
-            fp_t = (net.w1 * tanh_der) @ net.w0.T
-            sel = batch["atom_types"] == t
-            Ei = torch.where(sel, e_t, Ei)
-            Fp = torch.where(sel.unsqueeze(-1), fp_t, Fp)
+        # Still branch-free (gather / one-hot matmul, fully traceable) and
+        # still DDP-safe: the weight stacks are built from EVERY type's
+        # parameters, so all parameters join the autograd graph on every
+        # forward (absent types just receive zero gradient slices).
+        # With gradients enabled the per-atom weights come from a one-hot
+        # matmul so the backward into the stacks is one clean GEMM instead
+        # of index_put atomics (same trick and thresholds as the mulsum
+        # contraction — see ops._gather_c_onehot).
+        w0s = torch.stack([n.w0 for n in self.fitting_nets])   # (T, dim, H)
+        b0s = torch.stack([n.b0 for n in self.fitting_nets])   # (T, H)
+        w1s = torch.stack([n.w1 for n in self.fitting_nets])   # (T, H)
+        T = self.num_types
+        at = batch["atom_types"]
+        need_grad = torch.is_grad_enabled() and w0s.requires_grad
+        if need_grad and (T <= 32 or torch.version.hip is not None):
+            oh = torch.nn.functional.one_hot(at, T).to(dtype)  # (N, T)
+            W0 = (oh @ w0s.reshape(T, -1)).view(N, self.dim, -1)
+            B0 = oh @ b0s
+            W1 = oh @ w1s
+        else:
+            W0 = w0s[at]
+            B0 = b0s[at]
+            W1 = w1s[at]
+        h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1) - B0)
+        Ei = (h * W1).sum(-1)
+        Fp = torch.bmm(W0, (W1 * (1.0 - h * h)).unsqueeze(-1)).squeeze(-1)
 
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
         Ei = Ei - self.b1  # subtract shared output bias

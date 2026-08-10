@@ -187,15 +187,19 @@ class CompiledAutogradForce:
             has_q_134=m.has_q_134,
         )
         q_scaled = q * pd["q_scaler"]
-        Ei = torch.zeros(N, dtype=q.dtype, device=q.device)
-        for t in range(m.num_types):
-            w0 = pd[f"fitting_nets.{t}.w0"]
-            b0 = pd[f"fitting_nets.{t}.b0"]
-            w1 = pd[f"fitting_nets.{t}.w1"]
-            e_t = torch.tanh(q_scaled @ w0 - b0) @ w1
-            Ei = Ei + torch.where(atom_types == t, e_t,
-                                  torch.zeros((), dtype=q.dtype,
-                                              device=q.device))
+        # Gathered-weight NN (see NEPModel._cached_core): one bmm for all
+        # atoms; one-hot matmul keeps every parameter in the traced graph
+        # and the backward atomic-free.
+        T = m.num_types
+        w0s = torch.stack([pd[f"fitting_nets.{t}.w0"] for t in range(T)])
+        b0s = torch.stack([pd[f"fitting_nets.{t}.b0"] for t in range(T)])
+        w1s = torch.stack([pd[f"fitting_nets.{t}.w1"] for t in range(T)])
+        oh = torch.nn.functional.one_hot(atom_types, T).to(q.dtype)
+        W0 = (oh @ w0s.reshape(T, -1)).view(N, q_scaled.shape[1], -1)
+        B0 = oh @ b0s
+        W1 = oh @ w1s
+        h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1) - B0)
+        Ei = (h * W1).sum(-1)
         return Ei - pd["b1"]
 
     def _raw(self, pvals, rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,

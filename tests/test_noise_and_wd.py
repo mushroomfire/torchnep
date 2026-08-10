@@ -109,3 +109,50 @@ def test_weight_decay_adamw_active(tmp_path):
     c = _run(tmp_path, "w0", "")
     assert a == b
     assert a != c
+
+
+def test_gathered_nn_equivalence(tmp_path):
+    """The gathered-weight NN (one bmm) must reproduce the autograd
+    reference path (mask-based per-type nets) exactly: energies, forces,
+    AND gradients w.r.t. every parameter — float64, tight tolerance.
+    Also: the one-hot (grad) and plain-gather (no_grad) weight paths must
+    agree bit-for-bit."""
+    from torchnep.model import NEPModel
+    store, cfg = _store(tmp_path, n=8)
+    batch = store.collate([0, 2, 4, 6])
+
+    torch.manual_seed(1)
+    m = NEPModel(cfg).to(torch.float64)
+    m.train()
+
+    # reference: autograd path (unchanged mask-based per-type nets)
+    ref = m.compute_properties(
+        batch["rij_rad"].requires_grad_(True), batch["rij_ang"].requires_grad_(True),
+        batch["pair_i_rad"], batch["pair_j_rad"],
+        batch["pair_i_ang"], batch["pair_j_ang"],
+        batch["atom_types"], batch["N"],
+        batch["struct_idx"], batch["num_structures"],
+        need_forces=True, need_virial=True, backend="loop")
+    loss_ref = (ref["Ei"] ** 2).sum() + (ref["forces"] ** 2).sum()
+    g_ref = torch.autograd.grad(loss_ref, list(m.parameters()),
+                                allow_unused=True)
+
+    got = m.compute_properties_cached(batch, need_forces=True,
+                                      need_virial=True, backend="loop")
+    torch.testing.assert_close(got["Ei"], ref["Ei"], rtol=1e-10, atol=1e-12)
+    torch.testing.assert_close(got["forces"], ref["forces"],
+                               rtol=1e-8, atol=1e-10)
+    loss_got = (got["Ei"] ** 2).sum() + (got["forces"] ** 2).sum()
+    g_got = torch.autograd.grad(loss_got, list(m.parameters()),
+                                allow_unused=True)
+    for p, a, b in zip(m.parameters(), g_got, g_ref):
+        if a is None or b is None:
+            assert (a is None) == (b is None)
+            continue
+        torch.testing.assert_close(a, b, rtol=1e-7, atol=1e-9)
+
+    # one-hot (grad path) vs plain gather (no_grad path): bit identical
+    ei_grad, _, _ = m._cached_core(batch, need_forces=False)
+    with torch.no_grad():
+        ei_nograd, _, _ = m._cached_core(batch, need_forces=False)
+    assert torch.equal(ei_grad.detach(), ei_nograd)
