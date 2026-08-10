@@ -774,6 +774,30 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
+def _make_optimizer(trainable_params, lr, weight_decay):
+    """Adam (weight_decay=0) or AdamW (>0), fused on CUDA when available.
+
+    weight_decay > 0 switches to AdamW (decoupled decay, the MACE-style
+    regularizer): plain-Adam L2-in-the-gradient gets rescaled by the
+    second-moment normalization, so decay strength would vary per
+    parameter — AdamW applies it directly to the weights. With
+    weight_decay = 0 both optimizers are identical.
+
+    ``fused=True`` runs the whole update as one kernel per device/dtype
+    group instead of several ``foreach`` launches per state tensor — same
+    algorithm, only the arithmetic grouping differs. The try/except keeps
+    older builds or exotic device combos on the default path.
+    """
+    cls = torch.optim.AdamW if weight_decay > 0 else torch.optim.Adam
+    kwargs = dict(lr=lr, weight_decay=weight_decay, amsgrad=True)
+    if trainable_params and trainable_params[0].device.type == "cuda":
+        try:
+            return cls(trainable_params, fused=True, **kwargs)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return cls(trainable_params, **kwargs)
+
+
 def _make_lr_scheduler(optimizer, mode, factor, patience, min_lr):
     """Build the LR scheduler — "plateau" (default) or "step".
 
@@ -1655,19 +1679,8 @@ def train_nep(
     if compile_msg is not None:
         _log(compile_msg)
 
-    # weight_decay > 0 switches to AdamW (decoupled decay, the MACE-style
-    # regularizer): plain-Adam L2-in-the-gradient gets rescaled by the
-    # second-moment normalization, so decay strength would vary per
-    # parameter — AdamW applies it directly to the weights. With
-    # weight_decay = 0 both optimizers are identical.
     weight_decay = config["weight_decay"]
-    if weight_decay > 0:
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr,
-                                      weight_decay=weight_decay,
-                                      amsgrad=True)
-    else:
-        optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                     weight_decay=0.0, amsgrad=True)
+    optimizer = _make_optimizer(trainable_params, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))

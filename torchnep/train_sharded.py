@@ -130,7 +130,7 @@ from .train import (
     preprocess_structures,
     _save_checkpoint, _load_checkpoint,
     _trim_loss_log, _accumulate_true_loss_sums,
-    _make_lr_scheduler, _scheduler_step,
+    _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
     _clean_warning_format, _VIRIAL_6,
 )
@@ -766,13 +766,7 @@ def train_nep_sharded(
     l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
     # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
     weight_decay = config["weight_decay"]
-    if weight_decay > 0:
-        optimizer = torch.optim.AdamW(trainable_params, lr=lr,
-                                      weight_decay=weight_decay,
-                                      amsgrad=True)
-    else:
-        optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                     weight_decay=0.0, amsgrad=True)
+    optimizer = _make_optimizer(trainable_params, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
