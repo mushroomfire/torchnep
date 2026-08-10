@@ -120,6 +120,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
+| `pos_noise` | `0` | training-time data augmentation: per-atom Gaussian displacement σ (Å) applied to each training batch's pair vectors (labels untouched, validation/eval clean, reproducible from `run_seed`) |
+| `weight_decay` | `0` | > 0 switches the optimizer to AdamW with this decoupled weight decay (the MACE-style regularizer). Use instead of `lambda_1`/`lambda_2`, not together |
 
 ### Runtime arguments
 

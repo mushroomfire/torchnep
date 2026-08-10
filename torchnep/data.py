@@ -302,6 +302,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_v"] = float(parts[1])
             elif key == "lambda_2":
                 params["lambda_2"] = float(parts[1])
+            elif key == "pos_noise":
+                params["pos_noise"] = float(parts[1])
+            elif key == "weight_decay":
+                params["weight_decay"] = float(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
             elif key == "save_potential":
@@ -379,6 +383,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
     params.setdefault("lambda_1", 0.0)
+    params.setdefault("pos_noise", 0.0)
+    params.setdefault("weight_decay", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
 
