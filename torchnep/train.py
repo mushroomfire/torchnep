@@ -180,6 +180,12 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
+    if config.get("pos_noise", 0.0):
+        lines.append(f"  {tag('pos_noise'):10}  pos_noise    "
+                     f"{config['pos_noise']}")
+    if config.get("weight_decay", 0.0):
+        lines.append(f"  {tag('weight_decay'):10}  weight_decay "
+                     f"{config['weight_decay']}")
     if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
         lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
         lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
@@ -346,11 +352,18 @@ class StreamDataStore:
             return t.pin_memory().to(self.device, non_blocking=True)
         return t.to(self.device)
 
-    def _assemble_cpu(self, indices: List[int]) -> Dict:
+    def _assemble_cpu(self, indices: List[int],
+                      noise_gen=None, noise_sigma: float = 0.0) -> Dict:
         """CPU half of collate: gather the frames' arrays into contiguous
         (pinned) host tensors. Runs entirely on the CPU, so a background
         thread can execute it while the device chews the previous batch
-        (see ``iter_collated``)."""
+        (see ``iter_collated``).
+
+        ``noise_sigma`` > 0 draws one Gaussian displacement per atom (Å)
+        from ``noise_gen`` — a dedicated generator so the batch shuffle and
+        weight init are untouched — and stages it; ``_finalize`` applies it
+        to the pair vectors (training-time data augmentation; labels are
+        left untouched, eval passes never set it)."""
         idx = np.asarray(indices, dtype=np.int64)
         nat = self._nat[idx]
         nr = self._nrad[idx]
@@ -372,7 +385,7 @@ class StreamDataStore:
         def _stage(t):
             return t.pin_memory() if pin else t
 
-        return {
+        out = {
             "N": int(offsets[-1]), "num_structures": len(indices),
             "idx_t": idx_t,
             "atom_types": _stage(self._cat(self._at_all, idx, self._nat_cum)),
@@ -397,6 +410,11 @@ class StreamDataStore:
             "virial": _stage(self._v_all[idx_t].to(self.dtype)),
             "virial_mask": _stage(self._v_flag_t[idx_t]),
         }
+        if noise_sigma > 0.0:
+            out["pos_noise"] = _stage(
+                torch.randn(int(offsets[-1]), 3, generator=noise_gen,
+                            dtype=self.dtype) * noise_sigma)
+        return out
 
     _DEVICE_KEYS = ("atom_types", "struct_idx", "pair_i_rad", "pair_j_rad",
                     "rij_rad", "pair_i_ang", "pair_j_ang", "rij_ang",
@@ -445,19 +463,35 @@ class StreamDataStore:
                           else t.to(dev))
         batch["volumes"] = self.volumes[staged["idx_t"].to(dev)]
 
+        if "pos_noise" in staged:
+            # rij for pair (i, j) is r_j - r_i, so a per-atom displacement d
+            # perturbs it by d_j - d_i — the same d for the radial and
+            # angular lists keeps the noisy geometry self-consistent.
+            d = staged["pos_noise"]
+            d = d.to(dev, non_blocking=True) if self._pin else d.to(dev)
+            batch["rij_rad"] = (batch["rij_rad"]
+                                + d[batch["pair_j_rad"]]
+                                - d[batch["pair_i_rad"]])
+            batch["rij_ang"] = (batch["rij_ang"]
+                                + d[batch["pair_j_ang"]]
+                                - d[batch["pair_i_ang"]])
+
         (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
          batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
          batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"])
 
         return batch
 
-    def collate(self, indices: List[int]) -> Dict:
+    def collate(self, indices: List[int], noise_gen=None,
+                noise_sigma: float = 0.0) -> Dict:
         """Assemble one batch on the CPU, ship it to the device, and compute
         the batch's basis there. Returns the collated batch dict."""
-        return self._finalize(self._assemble_cpu(indices))
+        return self._finalize(self._assemble_cpu(indices, noise_gen,
+                                                 noise_sigma))
 
 
-def iter_collated(data_store, index_lists):
+def iter_collated(data_store, index_lists, noise_gen=None,
+                  noise_sigma: float = 0.0):
     """Yield collated device batches for ``index_lists``, in order.
 
     For a ``StreamDataStore`` the CPU half of each collate (gather + pinning)
@@ -471,7 +505,7 @@ def iter_collated(data_store, index_lists):
     """
     if not isinstance(data_store, StreamDataStore) or len(index_lists) <= 1:
         for idx in index_lists:
-            yield data_store.collate(idx)
+            yield data_store.collate(idx, noise_gen, noise_sigma)
         return
 
     import queue
@@ -485,7 +519,8 @@ def iter_collated(data_store, index_lists):
             for idx in index_lists:
                 if stop.is_set():
                     return
-                q.put(("ok", data_store._assemble_cpu(idx)))
+                q.put(("ok", data_store._assemble_cpu(
+                    idx, noise_gen, noise_sigma)))
         except BaseException as e:          # surface in the consumer
             q.put(("err", e))
             return
@@ -1253,6 +1288,7 @@ def train_nep(
     # Model regularisation coefficients
     lambda_1 = config["lambda_1"]
     lambda_2 = config["lambda_2"]
+    pos_noise = config["pos_noise"]
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
@@ -1425,6 +1461,16 @@ def train_nep(
     # resume, user int, or a fresh random draw) — see the resume/seed block.
     torch.manual_seed(run_seed)
 
+    # pos_noise: dedicated generator for the per-batch atomic displacements
+    # (training-time augmentation) — separate from the global RNG so weight
+    # init and batch shuffling are identical with or without noise, and the
+    # noise stream itself is reproducible from run_seed. Advances across
+    # epochs (fresh noise every epoch).
+    noise_gen = None
+    if pos_noise > 0:
+        noise_gen = torch.Generator()
+        noise_gen.manual_seed(run_seed + 104729)
+
     # ---- Model -----------------------------------------------------------
     _log("Model")
     _log("-----")
@@ -1590,11 +1636,19 @@ def train_nep(
     if compile_msg is not None:
         _log(compile_msg)
 
-    # weight_decay stays 0: L2 is applied explicitly in the loss as GPUMD's
-    # λ₂·RMS(w) (see the reg block below), NOT as Adam's decoupled decay —
-    # the two are different functional forms and would not be comparable.
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=0.0, amsgrad=True)
+    # weight_decay > 0 switches to AdamW (decoupled decay, the MACE-style
+    # regularizer): plain-Adam L2-in-the-gradient gets rescaled by the
+    # second-moment normalization, so decay strength would vary per
+    # parameter — AdamW applies it directly to the weights. With
+    # weight_decay = 0 both optimizers are identical.
+    weight_decay = config["weight_decay"]
+    if weight_decay > 0:
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr,
+                                      weight_decay=weight_decay,
+                                      amsgrad=True)
+    else:
+        optimizer = torch.optim.Adam(trainable_params, lr=lr,
+                                     weight_decay=0.0, amsgrad=True)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -1638,6 +1692,11 @@ def train_nep(
         info = _load_checkpoint(resume_ckpt, model, optimizer,
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
+        # load_state_dict restores the checkpoint's param_groups, which
+        # would silently zero a newly requested weight_decay — reapply it.
+        if weight_decay > 0:
+            for _g in optimizer.param_groups:
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
@@ -1834,7 +1893,8 @@ def train_nep(
 
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_structs, batch_size)]
-            for batch in iter_collated(data_store, batch_indices):
+            for batch in iter_collated(data_store, batch_indices,
+                                       noise_gen, pos_noise):
 
                 if use_autograd_forces:
                     result = compute_props(

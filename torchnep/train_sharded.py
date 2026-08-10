@@ -387,6 +387,13 @@ def train_nep_sharded(
     config = orig_config
     lambda_1 = config["lambda_1"]
     lambda_2 = config["lambda_2"]
+    pos_noise = config["pos_noise"]
+    # pos_noise generator — per-rank offset so each shard draws its own
+    # noise stream; reproducible from run_seed (see train_nep).
+    noise_gen = None
+    if pos_noise > 0:
+        noise_gen = torch.Generator()
+        noise_gen.manual_seed(run_seed + 104729 + rank)
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
     lr                 = config["lr"]
@@ -757,10 +764,15 @@ def train_nep_sharded(
     # locally on each rank (identical params → identical value, so no all-reduce
     # needed; DDP already averaged the data gradient).
     l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
-    # weight_decay stays 0: L2 is applied explicitly as GPUMD's λ₂·RMS(w),
-    # not as Adam's decoupled decay (different form, not comparable).
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=0.0, amsgrad=True)
+    # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
+    weight_decay = config["weight_decay"]
+    if weight_decay > 0:
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr,
+                                      weight_decay=weight_decay,
+                                      amsgrad=True)
+    else:
+        optimizer = torch.optim.Adam(trainable_params, lr=lr,
+                                     weight_decay=0.0, amsgrad=True)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -812,6 +824,9 @@ def train_nep_sharded(
         info = _load_checkpoint(resume_ckpt, raw_model, optimizer,
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
+        if weight_decay > 0:  # see train_nep: reapply after state load
+            for _g in optimizer.param_groups:
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
@@ -1007,7 +1022,8 @@ def train_nep_sharded(
 
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_local, batch_size)]
-            for batch in iter_collated(data_store, batch_indices):
+            for batch in iter_collated(data_store, batch_indices,
+                                       noise_gen, pos_noise):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.

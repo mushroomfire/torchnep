@@ -1,5 +1,16 @@
 # Release Notes
 
+## Unreleased
+
+- **`pos_noise`**: training-time coordinate jitter — per-atom Gaussian
+  displacements (σ in Å) applied to each training batch's pair vectors;
+  labels untouched, validation/eval passes stay clean, and the noise
+  stream is reproducible from `run_seed` via a dedicated generator.
+- **`weight_decay`**: > 0 switches the optimizer to AdamW (decoupled
+  weight decay). Preferred over the GPUMD-form `lambda_1`/`lambda_2`
+  when regularizing torchnep runs — Adam rescales in-loss L2 gradients
+  per-parameter, AdamW does not.
+
 ## 1.0.2b1
 
 - **Stratified validation split** (`valid_strategy="stratified"`, also in
