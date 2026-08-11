@@ -4,18 +4,17 @@
 
 Defaults changed:
 
-- **`weight_decay` default `1e-4`** (AdamW), applied to all trainable
-  parameters (a bias-exempt variant fit the training set identically but
-  lost 30-40% on independent-test energies — rejected). `b1` is solved
-  analytically and never decays. Set `0` for plain Adam.
+- **`weight_decay` default `1e-4`** (AdamW), on all trainable parameters
+  (`b1` is solved analytically and never decays). Set `0` for plain Adam.
 - **`stage2_lambda_v` back to `0.1`** — independent-test benchmarks rank
   0.1 > 0.05 > 0.02 on both energy and virial; the 1.0.2b2 default of
   0.05 is reverted.
 - **`valid_strategy` default `"stratified"`**; falls back to `"random"`
   automatically (with a log note) when stratification would starve the
   validation set (e.g. an all-tiny-cell dataset).
-- **SWA averages only the run tail**: new `swa_start` key, default = the
-  last 100 epochs (averaging all of stage 2 degraded energies).
+- **SWA averages only the run tail**: new `swa_start` function argument,
+  default = the last 100 epochs (averaging all of stage 2 degraded
+  energies).
 
 New:
 

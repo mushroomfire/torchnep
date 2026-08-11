@@ -117,8 +117,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_scheduler_factor` | `scheduler_factor` | Stage 2 LR decay factor (overrides Stage 1's)|
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
-| `stage2_lambda_v` | `0.1` | Stage 2 virial weight. Independent-test benchmarks on multi-element data rank 0.1 > 0.05 > 0.02 on both energy and virial — the apparent virial "overfit" on the validation curve does not cost generalization |
-| `weight_decay` | `1e-4` | AdamW decoupled weight decay (the only regularizer that improved independent-test errors — 4-seed benchmark: F better on 4/4 seeds, E on 3/4). All trainable parameters decay (a bias-exempt variant tested clearly worse); `b1` is solved analytically and never decays. `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
+| `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
+| `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
 
 ### Runtime arguments
 
@@ -130,7 +130,8 @@ function (`train_nep` / `train_nep_sharded`):
 | `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"`; any other stream-based PyTorch accelerator should also work if passed explicitly |
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
 | `use_autograd_forces` | `False` | autograd-through-rij |
-| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt`. Averaging runs from `swa_start` (nep.in key; default = the last 100 epochs) — averaging all of stage 2 drags the still-converging energy backwards |
+| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
+| `swa_start` | last 100 epochs | first epoch included in the SWA average |
 | `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). |
 | `print_interval` | `10` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
@@ -141,11 +142,11 @@ function (`train_nep` / `train_nep_sharded`):
 | `recompute_q_scaler` | `False` | only with `finetune_from`: recompute the descriptor scaler on the new data instead of keeping the source model's |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
-| `use_gpumd_qscaler` | `False` | `False`: torch's default init + self-consistent `q_scaler` — converges to better minima (600-epoch 4-seed benchmark: ~12% lower E/V RMSE, ~3% lower F). `True`: reproduce GPUMD's init (SNES `mu`, all parameters uniform(−1,1)) with the `c=1` `q_scaler` — for GPUMD-comparison runs. The saved `nep.txt` is GPUMD-compatible either way. Fresh training only |
+| `use_gpumd_qscaler` | `False` | `True`: GPUMD-style init (uniform(−1,1), `c=1` `q_scaler`) for comparison runs. The saved `nep.txt` is GPUMD-compatible either way. Fresh training only |
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
-| `valid_strategy` | `"stratified"` | `"random"` or `"stratified"`. Stratified groups frames by (element combination × cell-size class) and splits within each group; tiny cells (≤4 atoms — the pair-specific short-range scans) and groups with < 20 frames go entirely to training, so short-range physics is always learned instead of being lost to a random validation draw. Falls back to `"random"` automatically (with a log note) when stratification would starve the validation set (e.g. an all-tiny-cell dataset) |
+| `valid_strategy` | `"stratified"` | `"random"` or `"stratified"` (split within (element combination × cell-size) groups; tiny cells ≤4 atoms and groups < 20 frames stay in training; auto-falls back to `"random"` if the validation set would be starved) |
 
 ---
 

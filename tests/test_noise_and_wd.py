@@ -186,8 +186,7 @@ def test_swa_start_window(tmp_path):
     """swa_start gates the averaging window; a window past the end of the
     run must produce no nep_average.txt (with the run otherwise fine)."""
     nepin = tmp_path / "nep_swa.in"
-    nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n"
-                     "swa_start 99\n")
+    nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n")
     frames = read_xyz(str(PBTE))[:8]
     raw = PBTE.read_text().splitlines()
     keep, i, k = [], 0, 0
@@ -200,19 +199,18 @@ def test_swa_start_window(tmp_path):
               output_dir=str(tmp_path / "o"), device="cpu",
               precision="float64", print_interval=100, restart=False,
               checkpoint_interval=1000, prediction_interval=1000,
-              run_seed=5, use_swa=True)
+              run_seed=5, use_swa=True, swa_start=99)
     assert (tmp_path / "o" / "nep_final.txt").exists()
     assert not (tmp_path / "o" / "nep_average.txt").exists()
 
     # window inside the run -> average IS written
     nepin2 = tmp_path / "nep_swa2.in"
-    nepin2.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n"
-                      "swa_start 3\n")
+    nepin2.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n")
     train_nep(config_file=str(nepin2), data_file=str(xyz),
               output_dir=str(tmp_path / "o2"), device="cpu",
               precision="float64", print_interval=100, restart=False,
               checkpoint_interval=1000, prediction_interval=1000,
-              run_seed=5, use_swa=True)
+              run_seed=5, use_swa=True, swa_start=3)
     assert (tmp_path / "o2" / "nep_average.txt").exists()
 
 

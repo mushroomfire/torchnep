@@ -1219,6 +1219,7 @@ def train_nep(
     precision: str = "float32",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
+    swa_start: int = None,
     use_compile: bool = False,
     print_interval: int = 10,
     restart: bool = True,
@@ -1253,6 +1254,8 @@ def train_nep(
         torchnep.ops.resolve_backend).
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` at the end.
+    swa_start : first epoch included in the SWA average (default: the
+        last 100 epochs). Averaging all of stage 2 degrades energies.
     use_compile : torch.compile the analytical compute method (~1.3x faster per
         epoch after a one-time first-epoch compilation cost; needs Triton, which
         ships with the CUDA PyTorch build). With autograd forces the
@@ -1697,7 +1700,6 @@ def train_nep(
     # epochs). Averaging the whole of stage 2 drags the energy back toward
     # mid-descent weights (E converges late); the tail is a converged
     # cloud, so averaging there is pure noise reduction.
-    swa_start = config.get("swa_start")
     if swa_start is None:
         swa_start = max(1, num_epochs - 99)
 

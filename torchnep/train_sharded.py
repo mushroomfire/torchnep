@@ -218,6 +218,7 @@ def train_nep_sharded(
     precision: str = "float32",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
+    swa_start: int = None,
     use_compile: bool = False,
     print_interval: int = 10,
     restart: bool = True,
@@ -777,7 +778,6 @@ def train_nep_sharded(
     # epochs). Averaging the whole of stage 2 drags the energy back toward
     # mid-descent weights (E converges late); the tail is a converged
     # cloud, so averaging there is pure noise reduction.
-    swa_start = config.get("swa_start")
     if swa_start is None:
         swa_start = max(1, num_epochs - 99)
 
