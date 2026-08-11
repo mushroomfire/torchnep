@@ -380,9 +380,19 @@ class NEPModel(nn.Module):
             W0 = w0s[at]
             B0 = b0s[at]
             W1 = w1s[at]
-        h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1) - B0)
-        Ei = (h * W1).sum(-1)
-        Fp = torch.bmm(W0, (W1 * (1.0 - h * h)).unsqueeze(-1)).squeeze(-1)
+        if ops.NN_MULSUM:
+            # ROCm: rocBLAS is poor on these skinny batched shapes (45% of
+            # the MI250X step went to Cijk_* GEMMs); the explicit
+            # multiply+reduce lowers to fused Triton kernels instead —
+            # measured 25% faster full step on MI250X, identical math.
+            h = torch.tanh((q_scaled.unsqueeze(-1) * W0).sum(1) - B0)
+            Ei = (h * W1).sum(-1)
+            Fp = (W0 * (W1 * (1.0 - h * h)).unsqueeze(1)).sum(-1)
+        else:
+            h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1)
+                           - B0)
+            Ei = (h * W1).sum(-1)
+            Fp = torch.bmm(W0, (W1 * (1.0 - h * h)).unsqueeze(-1)).squeeze(-1)
 
         Fp = Fp * self.q_scaler  # absorb q_scaler into Fp
         Ei = Ei - self.b1  # subtract shared output bias

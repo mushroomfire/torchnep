@@ -198,7 +198,11 @@ class CompiledAutogradForce:
         W0 = (oh @ w0s.reshape(T, -1)).view(N, q_scaled.shape[1], -1)
         B0 = oh @ b0s
         W1 = oh @ w1s
-        h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1) - B0)
+        if ops.NN_MULSUM:
+            h = torch.tanh((q_scaled.unsqueeze(-1) * W0).sum(1) - B0)
+        else:
+            h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1)
+                           - B0)
         Ei = (h * W1).sum(-1)
         return Ei - pd["b1"]
 

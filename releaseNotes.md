@@ -15,8 +15,7 @@ Defaults changed:
   automatically (with a log note) when stratification would starve the
   validation set (e.g. an all-tiny-cell dataset).
 - **SWA averages only the run tail**: new `swa_start` key, default = the
-  last 100 epochs. Averaging all of stage 2 degraded energies; the tail
-  window keeps the force / seed-consistency gains.
+  last 100 epochs (averaging all of stage 2 degraded energies).
 
 New:
 
@@ -40,6 +39,9 @@ Fixed:
   epochs are moderately faster on every GPU tested.
 - Preprocessing pool now respects the job's actual CPU allocation
   (slurm cgroups) instead of the node's core count.
+- ROCm: the fused NN uses a multiply+reduce formulation instead of
+  batched matmul (rocBLAS handles those shapes poorly) — 25% faster
+  full step on MI250X, identical math.
 
 ## 1.0.2b2
 

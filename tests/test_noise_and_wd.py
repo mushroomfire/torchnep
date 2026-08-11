@@ -235,3 +235,39 @@ def test_default_alloc_conf(monkeypatch):
     monkeypatch.setenv("PYTORCH_ALLOC_CONF", "max_split_size_mb:64")
     _default_alloc_conf()
     assert os.environ["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:64"
+
+
+def test_nn_formulations_equivalent(tmp_path):
+    """The bmm (CUDA/CPU) and multiply+reduce (ROCm) NN formulations must
+    agree — energies, forces, parameter gradients — in float64."""
+    from torchnep.model import NEPModel
+    from torchnep import ops as _ops
+    store, cfg = _store(tmp_path, n=6)
+    batch = store.collate([0, 2, 4])
+    torch.manual_seed(2)
+    m = NEPModel(cfg).to(torch.float64)
+    m.train()
+
+    results = {}
+    for flag in (False, True):
+        old = _ops.NN_MULSUM
+        _ops.NN_MULSUM = flag
+        try:
+            r = m.compute_properties_cached(batch, need_forces=True,
+                                            need_virial=True, backend="loop")
+            loss = (r["Ei"] ** 2).sum() + (r["forces"] ** 2).sum()
+            g = torch.autograd.grad(loss, list(m.parameters()),
+                                    allow_unused=True)
+            results[flag] = (r["Ei"].detach(), r["forces"].detach(), g)
+        finally:
+            _ops.NN_MULSUM = old
+
+    torch.testing.assert_close(results[True][0], results[False][0],
+                               rtol=1e-12, atol=1e-13)
+    torch.testing.assert_close(results[True][1], results[False][1],
+                               rtol=1e-9, atol=1e-11)
+    for a, b in zip(results[True][2], results[False][2]):
+        if a is None or b is None:
+            assert (a is None) == (b is None)
+            continue
+        torch.testing.assert_close(a, b, rtol=1e-8, atol=1e-10)

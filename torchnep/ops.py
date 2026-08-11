@@ -46,6 +46,13 @@ from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
 Backend = Literal["auto", "loop", "bmm", "mulsum"]
 
 
+# NN formulation switch: batched-matmul on CUDA/CPU, explicit
+# multiply+reduce on ROCm (rocBLAS handles the skinny batched shapes
+# poorly — see NEPModel._cached_core). Module-level so tests can compare
+# both formulations on any device.
+NN_MULSUM = torch.version.hip is not None
+
+
 def resolve_backend(backend: str = "auto",
                     num_types: Optional[int] = None,
                     use_compile: bool = False,
