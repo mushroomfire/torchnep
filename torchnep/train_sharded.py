@@ -1020,24 +1020,14 @@ def train_nep_sharded(
                 # no gradients, nothing to all-reduce.
                 result_m = result
                 if pos_noise > 0 and "_clean" in batch:
+                    # Analytical cached path in every force mode — needs no
+                    # autograd, so it works under no_grad (see train_nep).
                     with torch.no_grad():
                         result_m = _shim._compute_cached(
                             batch["_clean"], need_forces=has_forces,
-                            need_virial=has_virial, backend=train_backend) \
-                            if not use_autograd_forces else \
-                            raw_model.compute_properties(
-                                batch["_clean"]["rij_rad"],
-                                batch["_clean"]["rij_ang"],
-                                batch["_clean"]["pair_i_rad"],
-                                batch["_clean"]["pair_j_rad"],
-                                batch["_clean"]["pair_i_ang"],
-                                batch["_clean"]["pair_j_ang"],
-                                batch["_clean"]["atom_types"],
-                                batch["_clean"]["N"],
-                                batch["_clean"]["struct_idx"],
-                                batch["_clean"]["num_structures"],
-                                need_forces=has_forces,
-                                need_virial=has_virial, backend=backend)
+                            need_virial=has_virial,
+                            backend=(backend if use_autograd_forces
+                                     else train_backend))
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]

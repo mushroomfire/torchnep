@@ -210,3 +210,26 @@ def test_zbl_static_equivalence(tmp_path):
                                    rtol=1e-8, atol=1e-10)
         torch.testing.assert_close(gp["virial"], ref["virial"],
                                    rtol=1e-8, atol=1e-10)
+
+
+def test_pos_noise_with_autograd_forces(tmp_path):
+    """pos_noise + use_autograd_forces: the clean-metrics pass must not
+    require autograd (it runs under no_grad) — regression for the crash
+    'element 0 of tensors does not require grad' when the eager autograd
+    path was used for clean train metrics."""
+    nepin = tmp_path / "nep_ag.in"
+    nepin.write_text(NEP_IN + "epoch 2\nbatch 4\npos_noise 0.01\n")
+    frames = read_xyz(str(PBTE))[:8]
+    raw = PBTE.read_text().splitlines()
+    keep, i, k = [], 0, 0
+    while i < len(raw) and k < 8:
+        na = int(raw[i].strip()); keep += raw[i:i + na + 2]
+        i += na + 2; k += 1
+    xyz = tmp_path / "train.xyz"
+    xyz.write_text("\n".join(keep) + "\n")
+    train_nep(config_file=str(nepin), data_file=str(xyz),
+              output_dir=str(tmp_path / "ag"), device="cpu",
+              precision="float64", print_interval=100, restart=False,
+              checkpoint_interval=1000, prediction_interval=1000,
+              run_seed=5, use_autograd_forces=True)
+    assert (tmp_path / "ag" / "loss.out").exists()
