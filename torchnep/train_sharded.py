@@ -232,7 +232,7 @@ def train_nep_sharded(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    valid_strategy: str = "random",
+    valid_strategy: str = "stratified",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -397,13 +397,6 @@ def train_nep_sharded(
             _log(line)
         _log("")
     config = orig_config
-    pos_noise = config["pos_noise"]
-    # pos_noise generator — per-rank offset so each shard draws its own
-    # noise stream; reproducible from run_seed (see train_nep).
-    noise_gen = None
-    if pos_noise > 0:
-        noise_gen = torch.Generator()
-        noise_gen.manual_seed(run_seed + 104729 + rank)
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
     lr                 = config["lr"]
@@ -453,6 +446,10 @@ def train_nep_sharded(
                  f"{st['n_rare_frames']} rare-stratum frames kept fully in "
                  f"training; held out {len(val_idx)} frames, "
                  f"{len(train_idx)} remain (split drawn from run_seed)")
+            if st.get("fallback") == "random":
+                _log("  stratified split starved the validation set "
+                     "(dataset is dominated by tiny/rare strata) — fell "
+                     "back to a random split with the same seed")
         elif valid_strategy == "random":
             train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
                                                      run_seed)
@@ -762,15 +759,23 @@ def train_nep_sharded(
     raw_model = _shim.model
 
     # b1 is analytically determined (not gradient-trained) — exclude it from
-    # the optimizer (and L1), matching the single-GPU path.
-    trainable_params = [p for n, p in raw_model.named_parameters()
-                        if n != "b1"]
+    # the optimizer, matching the single-GPU path.
+    trainable_named = [(n, p) for n, p in raw_model.named_parameters()
+                       if n != "b1"]
     # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
     weight_decay = config["weight_decay"]
-    optimizer = _make_optimizer(trainable_params, lr, weight_decay)
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
+
+    # SWA window: average only the tail of the run (default: the last 100
+    # epochs). Averaging the whole of stage 2 drags the energy back toward
+    # mid-descent weights (E converges late); the tail is a converged
+    # cloud, so averaging there is pure noise reduction.
+    swa_start = config.get("swa_start")
+    if swa_start is None:
+        swa_start = max(1, num_epochs - 99)
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -1020,42 +1025,12 @@ def train_nep_sharded(
 
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_local, batch_size)]
-            for batch in iter_collated(data_store, batch_indices,
-                                       noise_gen, pos_noise):
+            for batch in iter_collated(data_store, batch_indices):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
                 result = model(batch, use_autograd_forces,
                                has_forces, has_virial, train_backend)
-
-                # pos_noise: loss from the noisy geometry, metrics + b1
-                # residual from one no-grad forward on the clean view (see
-                # train_nep). The clean forward bypasses the DDP wrapper —
-                # no gradients, nothing to all-reduce.
-                result_m = result
-                if pos_noise > 0 and "_clean" in batch:
-                    # Same computation as training where possible: the
-                    # make_fx ag graph works under no_grad (derivative is
-                    # ordinary ops); eager autograd would not — that mode
-                    # falls back to the analytical cached path (identical
-                    # to fp precision). See train_nep.
-                    with torch.no_grad():
-                        if use_autograd_forces and _shim._ag_compute is not None:
-                            cb = batch["_clean"]
-                            result_m = _shim._ag_compute.compute_properties(
-                                cb["rij_rad"], cb["rij_ang"],
-                                cb["pair_i_rad"], cb["pair_j_rad"],
-                                cb["pair_i_ang"], cb["pair_j_ang"],
-                                cb["atom_types"], cb["N"],
-                                cb["struct_idx"], cb["num_structures"],
-                                need_forces=has_forces,
-                                need_virial=has_virial, backend=backend)
-                        else:
-                            result_m = _shim._compute_cached(
-                                batch["_clean"], need_forces=has_forces,
-                                need_virial=has_virial,
-                                backend=(backend if use_autograd_forces
-                                         else train_backend))
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
@@ -1097,20 +1072,16 @@ def train_nep_sharded(
                 if batch["has_e"]:
                     de = (e_pa_pred - e_pa_ref) * emf
                     loss = loss + cur_pref_e * (de ** 2).sum() * ws / cg[0]
-                    e_pa_pred_m = result_m["Etot"] / batch["natoms"]
-                    dem = (e_pa_pred_m - e_pa_ref) * emf
-                    m_le = (dem ** 2).sum()      # global SSE
+                    m_le = (de ** 2).sum()           # global SSE
                     # Signed residual for the analytical b1 update (folded into
                     # this pass; all-reduced below with the other metrics).
-                    m_resid = dem.sum()
+                    m_resid = de.sum()
 
                 if fmf is not None and batch["has_f"]:
                     df = (result["forces"] - batch["forces"]) * fmf
                     # 3 components per atom -> divide by (3 * n_f_g)
                     loss = loss + cur_pref_f * (df ** 2).sum() * ws / (3.0 * cg[1])
-                    dfm = ((result_m["forces"] - batch["forces"]) * fmf
-                           if result_m is not result else df)
-                    m_lf = (dfm ** 2).sum() / 3.0
+                    m_lf = (df ** 2).sum() / 3.0
 
                 if (vmf is not None and batch["has_v"] and "virial" in result
                         and batch["virial"].shape[1] == 9):
@@ -1130,15 +1101,13 @@ def train_nep_sharded(
                     dv = (v_pred_pa - v_ref_pa) * vmf
                     # 6 components per frame -> divide by (6 * n_v_g)
                     loss = loss + cur_pref_v * (dv ** 2).sum() * ws / (6.0 * cg[2])
-                    dvm = ((_v_pred_pa(result_m) if result_m is not result
-                            else v_pred_pa) - v_ref_pa) * vmf
-                    m_lv = (dvm ** 2).sum() / 6.0
+                    m_lv = (dv ** 2).sum() / 6.0
                     # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
                     # clamp: masked-out frames may carry volume 0 — their
                     # contribution is already zeroed by the mask factor.
                     scale = (batch["natoms"]
                              / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
-                    m_ls = ((dvm * scale) ** 2).sum() / 6.0
+                    m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1170,7 +1139,8 @@ def train_nep_sharded(
                     optimizer.step()
                     ok_f = 1.0
 
-                if in_stage2 and swa_model is not None:
+                if (in_stage2 and swa_model is not None
+                        and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
                 zero64 = acc.new_zeros(())
@@ -1429,6 +1399,10 @@ def train_nep_sharded(
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                                max_NN_rad, max_NN_ang)
+    if swa_model is not None and int(swa_model.n_averaged) == 0:
+        _log("SWA window never reached (run ended before swa_start) — "
+             "nep_average.txt not written")
+        swa_model = None
     if swa_model is not None:
         # All ranks: load the averaged weights and re-solve b1 from the
         # GLOBAL energy residual (b1's per-epoch analytic values were

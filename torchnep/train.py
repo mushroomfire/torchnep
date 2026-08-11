@@ -180,9 +180,6 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
-    if config.get("pos_noise", 0.0):
-        lines.append(f"  {tag('pos_noise'):10}  pos_noise    "
-                     f"{config['pos_noise']}")
     if config.get("weight_decay", 0.0):
         lines.append(f"  {tag('weight_decay'):10}  weight_decay "
                      f"{config['weight_decay']}")
@@ -353,18 +350,11 @@ class StreamDataStore:
             return t.pin_memory().to(self.device, non_blocking=True)
         return t.to(self.device)
 
-    def _assemble_cpu(self, indices: List[int],
-                      noise_gen=None, noise_sigma: float = 0.0) -> Dict:
+    def _assemble_cpu(self, indices: List[int]) -> Dict:
         """CPU half of collate: gather the frames' arrays into contiguous
         (pinned) host tensors. Runs entirely on the CPU, so a background
         thread can execute it while the device chews the previous batch
-        (see ``iter_collated``).
-
-        ``noise_sigma`` > 0 draws one Gaussian displacement per atom (Å)
-        from ``noise_gen`` — a dedicated generator so the batch shuffle and
-        weight init are untouched — and stages it; ``_finalize`` applies it
-        to the pair vectors (training-time data augmentation; labels are
-        left untouched, eval passes never set it)."""
+        (see ``iter_collated``)."""
         idx = np.asarray(indices, dtype=np.int64)
         nat = self._nat[idx]
         nr = self._nrad[idx]
@@ -419,10 +409,6 @@ class StreamDataStore:
             "has_f": bool(self._f_flag_t[idx_t].any()),
             "has_v": bool(self._v_flag_t[idx_t].any()),
         }
-        if noise_sigma > 0.0:
-            out["pos_noise"] = _stage(
-                torch.randn(int(offsets[-1]), 3, generator=noise_gen,
-                            dtype=self.dtype) * noise_sigma)
         return out
 
     _DEVICE_KEYS = ("atom_types", "struct_idx", "pair_i_rad", "pair_j_rad",
@@ -472,50 +458,16 @@ class StreamDataStore:
             t = staged[key]
             batch[key] = (t.to(dev, non_blocking=True) if self._pin
                           else t.to(dev))
-        if "pos_noise" in staged:
-            # rij for pair (i, j) is r_j - r_i, so a per-atom displacement d
-            # perturbs it by d_j - d_i — the same d for the radial and
-            # angular lists keeps the noisy geometry self-consistent. The
-            # training loss consumes the noisy geometry (standard keys); a
-            # clean view (same labels/indices, clean rij + basis) rides
-            # along under "_clean" so the logged train metrics and the
-            # analytic b1 update stay TRUE errors, not jitter-inflated ones.
-            rij_r_clean = batch["rij_rad"]
-            rij_a_clean = batch["rij_ang"]
-            d = staged["pos_noise"]
-            d = d.to(dev, non_blocking=True) if self._pin else d.to(dev)
-            batch["rij_rad"] = (rij_r_clean
-                                + d[batch["pair_j_rad"]]
-                                - d[batch["pair_i_rad"]])
-            batch["rij_ang"] = (rij_a_clean
-                                + d[batch["pair_j_ang"]]
-                                - d[batch["pair_i_ang"]])
-            (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
-             batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
-             batch["blm"]) = self._basis_fn(batch["rij_rad"],
-                                            batch["rij_ang"])
-            clean = dict(batch)
-            clean.pop("_clean", None)
-            clean["rij_rad"] = rij_r_clean
-            clean["rij_ang"] = rij_a_clean
-            (clean["fk_rad"], clean["fkp_rad"], clean["d12inv_rad"],
-             clean["fk_ang"], clean["fkp_ang"], clean["d12inv_ang"],
-             clean["blm"]) = self._basis_fn(rij_r_clean, rij_a_clean)
-            batch["_clean"] = clean
-            return batch
-
         (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
          batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
          batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"])
 
         return batch
 
-    def collate(self, indices: List[int], noise_gen=None,
-                noise_sigma: float = 0.0) -> Dict:
+    def collate(self, indices: List[int]) -> Dict:
         """Assemble one batch on the CPU, ship it to the device, and compute
         the batch's basis there. Returns the collated batch dict."""
-        return self._finalize(self._assemble_cpu(indices, noise_gen,
-                                                 noise_sigma))
+        return self._finalize(self._assemble_cpu(indices))
 
 
 _PROF = int(os.environ.get("TORCHNEP_PROFILE", "0") or "0")
@@ -547,8 +499,7 @@ def _timed_iter(gen, sink, sync_cuda):
         sink[1] += time.perf_counter() - t0
 
 
-def iter_collated(data_store, index_lists, noise_gen=None,
-                  noise_sigma: float = 0.0):
+def iter_collated(data_store, index_lists):
     """Yield collated device batches for ``index_lists``, in order.
 
     For a ``StreamDataStore`` the CPU half of each collate (gather + pinning)
@@ -562,7 +513,7 @@ def iter_collated(data_store, index_lists, noise_gen=None,
     """
     if not isinstance(data_store, StreamDataStore) or len(index_lists) <= 1:
         for idx in index_lists:
-            yield data_store.collate(idx, noise_gen, noise_sigma)
+            yield data_store.collate(idx)
         return
 
     import queue
@@ -576,8 +527,7 @@ def iter_collated(data_store, index_lists, noise_gen=None,
             for idx in index_lists:
                 if stop.is_set():
                     return
-                q.put(("ok", data_store._assemble_cpu(
-                    idx, noise_gen, noise_sigma)))
+                q.put(("ok", data_store._assemble_cpu(idx)))
         except BaseException as e:          # surface in the consumer
             q.put(("err", e))
             return
@@ -818,7 +768,7 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
-def _make_optimizer(trainable_params, lr, weight_decay):
+def _make_optimizer(named_params, lr, weight_decay):
     """Adam (weight_decay=0) or AdamW (>0), fused on CUDA when available.
 
     weight_decay > 0 switches to AdamW (decoupled decay, the MACE-style
@@ -827,19 +777,68 @@ def _make_optimizer(trainable_params, lr, weight_decay):
     parameter — AdamW applies it directly to the weights. With
     weight_decay = 0 both optimizers are identical.
 
+    Two parameter groups: biases are excluded from decay ("no_decay" =
+    the per-type NN thresholds b0; the energy offset b1 is not in the
+    optimizer at all — it is solved analytically each epoch). Biases do
+    not scale features, so decaying them buys no smoothness and only
+    biases the fit — standard practice (MACE exempts biases/readouts the
+    same way). Weights w0/w1 and the descriptor expansions c2/c3 decay.
+
     ``fused=True`` runs the whole update as one kernel per device/dtype
     group instead of several ``foreach`` launches per state tensor — same
     algorithm, only the arithmetic grouping differs. The try/except keeps
     older builds or exotic device combos on the default path.
     """
+    named_params = list(named_params)
+    decay = [p for n, p in named_params if not n.endswith(".b0")]
+    no_decay = [p for n, p in named_params if n.endswith(".b0")]
+    groups = [{"params": decay, "name": "decay"},
+              {"params": no_decay, "name": "no_decay", "weight_decay": 0.0}]
     cls = torch.optim.AdamW if weight_decay > 0 else torch.optim.Adam
     kwargs = dict(lr=lr, weight_decay=weight_decay, amsgrad=True)
-    if trainable_params and trainable_params[0].device.type == "cuda":
+    if decay and decay[0].device.type == "cuda":
         try:
-            return cls(trainable_params, fused=True, **kwargs)
+            return cls(groups, fused=True, **kwargs)
         except (RuntimeError, TypeError, ValueError):
             pass
-    return cls(trainable_params, **kwargs)
+    return cls(groups, **kwargs)
+
+
+def _optimizer_param_order(model):
+    """Names of the optimizer's parameters in group-concatenation order
+    (decay group then no_decay group) — must mirror _make_optimizer."""
+    names = [n for n, _ in model.named_parameters() if n != "b1"]
+    return ([n for n in names if not n.endswith(".b0")]
+            + [n for n in names if n.endswith(".b0")])
+
+
+def _load_optimizer_state(optimizer, opt_state, model):
+    """Load an optimizer state dict, remapping single-group checkpoints
+    (written before the bias no-decay split) onto the two-group layout.
+
+    The old flat parameter order was named_parameters() minus b1; the new
+    order concatenates the decay and no_decay groups. Both derive from
+    the same deterministic name order, so the permutation is exact.
+    """
+    try:
+        optimizer.load_state_dict(opt_state)
+        return
+    except ValueError:
+        pass
+    names = [n for n, _ in model.named_parameters() if n != "b1"]
+    new_order = _optimizer_param_order(model)
+    old_index = {n: i for i, n in enumerate(names)}
+    state = {i: opt_state["state"][old_index[n]]
+             for i, n in enumerate(new_order)
+             if old_index[n] in opt_state["state"]}
+    old_g = opt_state["param_groups"][0]
+    hyper = {k: v for k, v in old_g.items() if k != "params"}
+    n_decay = sum(1 for n in new_order if not n.endswith(".b0"))
+    groups = [dict(hyper, name="decay",
+                   params=list(range(n_decay))),
+              dict(hyper, name="no_decay", weight_decay=0.0,
+                   params=list(range(n_decay, len(new_order))))]
+    optimizer.load_state_dict({"state": state, "param_groups": groups})
 
 
 def _make_lr_scheduler(optimizer, mode, factor, patience, min_lr):
@@ -944,7 +943,7 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     if model_state and all(k.startswith("model.") for k in model_state):
         model_state = {k[len("model."):]: v for k, v in model_state.items()}
     m.load_state_dict(model_state)
-    optimizer.load_state_dict(ckpt["optimizer_state"])
+    _load_optimizer_state(optimizer, ckpt["optimizer_state"], m)
     in_stage2 = ckpt.get("in_stage2", False)
     target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
               else lr_scheduler)
@@ -1253,7 +1252,7 @@ def train_nep(
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
-    valid_strategy: str = "random",
+    valid_strategy: str = "stratified",
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
 
@@ -1372,7 +1371,6 @@ def train_nep(
         _log(line)
     _log("")
     config = orig_config
-    pos_noise = config["pos_noise"]
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
@@ -1462,6 +1460,10 @@ def train_nep(
                  f"{st['n_rare_frames']} rare-stratum frames kept fully in "
                  f"training; held out {len(val_idx)} frames, "
                  f"{len(train_idx)} remain (split drawn from run_seed)")
+            if st.get("fallback") == "random":
+                _log("  stratified split starved the validation set "
+                     "(dataset is dominated by tiny/rare strata) — fell "
+                     "back to a random split with the same seed")
         elif valid_strategy == "random":
             train_idx, val_idx = valid_split_indices(len(frames), valid_ratio,
                                                      run_seed)
@@ -1545,15 +1547,6 @@ def train_nep(
     # resume, user int, or a fresh random draw) — see the resume/seed block.
     torch.manual_seed(run_seed)
 
-    # pos_noise: dedicated generator for the per-batch atomic displacements
-    # (training-time augmentation) — separate from the global RNG so weight
-    # init and batch shuffling are identical with or without noise, and the
-    # noise stream itself is reproducible from run_seed. Advances across
-    # epochs (fresh noise every epoch).
-    noise_gen = None
-    if pos_noise > 0:
-        noise_gen = torch.Generator()
-        noise_gen.manual_seed(run_seed + 104729)
 
     # ---- Model -----------------------------------------------------------
     _log("Model")
@@ -1577,7 +1570,8 @@ def train_nep(
     # b1 (global energy offset) is determined analytically each epoch, not by
     # gradient descent (see recompute_b1_shift) — exclude it from the optimizer.
     model.b1.requires_grad_(False)
-    trainable_params = [p for n, p in model.named_parameters() if n != "b1"]
+    trainable_named = [(n, p) for n, p in model.named_parameters()
+                       if n != "b1"]
     # Number of trainable variables — the divisor GPUMD uses to turn the raw
     # L1/L2 sums into a mean(|w|) and RMS(w) (see the reg block in the epoch
     # loop). GPUMD's number_of_variables also counts the single global energy
@@ -1712,10 +1706,18 @@ def train_nep(
         _log(compile_msg)
 
     weight_decay = config["weight_decay"]
-    optimizer = _make_optimizer(trainable_params, lr, weight_decay)
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
+
+    # SWA window: average only the tail of the run (default: the last 100
+    # epochs). Averaging the whole of stage 2 drags the energy back toward
+    # mid-descent weights (E converges late); the tail is a converged
+    # cloud, so averaging there is pure noise reduction.
+    swa_start = config.get("swa_start")
+    if swa_start is None:
+        swa_start = max(1, num_epochs - 99)
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -1757,10 +1759,12 @@ def train_nep(
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
         # load_state_dict restores the checkpoint's param_groups, which
-        # would silently zero a newly requested weight_decay — reapply it.
+        # would silently zero a newly requested weight_decay — reapply it
+        # (decay group only; biases stay decay-free).
         if weight_decay > 0:
             for _g in optimizer.param_groups:
-                _g["weight_decay"] = weight_decay
+                if _g.get("name") != "no_decay":
+                    _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
@@ -1963,8 +1967,7 @@ def train_nep(
                 torch.cuda.reset_peak_memory_stats()
             _t_loop0 = time.perf_counter()
             for batch in _timed_iter(
-                    iter_collated(data_store, batch_indices,
-                                  noise_gen, pos_noise),
+                    iter_collated(data_store, batch_indices),
                     _tp, _PROF >= 2 and dev.type == "cuda"):
 
                 if use_autograd_forces:
@@ -1980,39 +1983,6 @@ def train_nep(
                     result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
                         backend=train_backend)
-
-                # With pos_noise the LOSS comes from the noisy geometry (that
-                # is the regularization), but everything reported or used
-                # analytically — the rmse_* columns and the b1 residual —
-                # comes from one extra no-grad forward on the SAME batch's
-                # clean geometry, so logged train metrics are true errors.
-                result_m = result
-                if pos_noise > 0 and "_clean" in batch:
-                    # Clean metrics from the same computation as training
-                    # where possible. The make_fx ag graph works under
-                    # no_grad (its derivative is materialized as ordinary
-                    # ops at trace time); the EAGER autograd path does not
-                    # (its runtime autograd.grad would see a forward
-                    # recorded under no_grad) — that one mode falls back to
-                    # the analytical cached path, which is identical to fp
-                    # precision.
-                    with torch.no_grad():
-                        if use_autograd_forces and compile_on:
-                            cb = batch["_clean"]
-                            result_m = compute_props(
-                                cb["rij_rad"], cb["rij_ang"],
-                                cb["pair_i_rad"], cb["pair_j_rad"],
-                                cb["pair_i_ang"], cb["pair_j_ang"],
-                                cb["atom_types"], cb["N"],
-                                cb["struct_idx"], cb["num_structures"],
-                                need_forces=has_forces,
-                                need_virial=has_virial, backend=backend)
-                        else:
-                            result_m = compute_props_cached(
-                                batch["_clean"], need_forces=has_forces,
-                                need_virial=has_virial,
-                                backend=(backend if use_autograd_forces
-                                         else train_backend))
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
@@ -2030,20 +2000,17 @@ def train_nep(
                     ne_b = emf.sum()
                     de = (e_pa_pred - e_pa_ref) * emf
                     loss = loss + cur_pref_e * ((de ** 2).sum() / ne_b)
-                    e_pa_pred_m = result_m["Etot"] / batch["natoms"]
-                    dem = (e_pa_pred_m - e_pa_ref) * emf
-                    m_le = (dem ** 2).sum()
+                    m_le = (de ** 2).sum()
                     # Signed residual for the analytical b1 update (folded
                     # into this pass — no extra forward).
-                    m_resid = dem.sum()
+                    m_resid = de.sum()
 
                 if has_forces and batch["has_f"]:
                     fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
                     nf_b = fmf.sum()
                     df = (result["forces"] - batch["forces"]) * fmf
                     loss = loss + cur_pref_f * ((df ** 2).sum() / (3.0 * nf_b))
-                    dfm = (result_m["forces"] - batch["forces"]) * fmf
-                    m_lf = (dfm ** 2).sum() / 3.0
+                    m_lf = (df ** 2).sum() / 3.0
 
                 if (has_virial and "virial" in result and batch["has_v"]
                         and batch["virial"].shape[1] == 9):
@@ -2063,16 +2030,14 @@ def train_nep(
                     v_pred_pa = _v_pred_pa(result)
                     dv = (v_pred_pa - v_ref_pa) * vmf
                     loss = loss + cur_pref_v * ((dv ** 2).sum() / (6.0 * nv_b))
-                    dvm = ((_v_pred_pa(result_m) if result_m is not result
-                            else v_pred_pa) - v_ref_pa) * vmf
-                    m_lv = (dvm ** 2).sum() / 6.0
+                    m_lv = (dv ** 2).sum() / 6.0
                     # Stress RMSE (eV/A**3): convert the same diff using
                     # per-frame (natoms/volume). Sign cancels under MSE.
                     # clamp: masked-out frames may carry volume 0 — their
                     # contribution is already zeroed by the mask factor.
                     scale = (batch["natoms"]
                              / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
-                    m_ls = ((dvm * scale) ** 2).sum() / 6.0
+                    m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -2107,7 +2072,8 @@ def train_nep(
                     optimizer.step()
                     ok_f = 1.0
 
-                if in_stage2 and swa_model is not None:
+                if (in_stage2 and swa_model is not None
+                        and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
                 # Device-side metric accumulation — one fused add per step,
@@ -2366,6 +2332,10 @@ def train_nep(
     raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                            max_NN_rad, max_NN_ang)
     # SWA-averaged model (only when user opted in and stage 2 ran).
+    if swa_model is not None and int(swa_model.n_averaged) == 0:
+        _log("SWA window never reached (run ended before swa_start) — "
+             "nep_average.txt not written")
+        swa_model = None
     if swa_model is not None:
         swa_state = swa_model.module.state_dict()
         # Keep a copy of the final-epoch weights so we can restore them

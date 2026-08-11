@@ -17,8 +17,6 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
-import warnings
-
 import numpy as np
 from typing import Dict, List
 
@@ -294,26 +292,16 @@ def parse_nep_in(filename: str) -> Dict:
                 params["l_max"] = [int(x) for x in parts[1:]]
             elif key == "neuron":
                 params["neuron"] = int(parts[1])
-            elif key in ("lambda_1", "lambda_2"):
-                # Removed: GPUMD's SNES-form L1/L2 do not transfer to Adam
-                # training (the in-gradient L2 gets rescaled per-parameter by
-                # the second-moment normalization). Ignored for GPUMD nep.in
-                # compatibility; use weight_decay (AdamW) / pos_noise instead.
-                if float(parts[1]) != 0.0:
-                    warnings.warn(
-                        f"nep.in key '{key}' is no longer supported and is "
-                        "ignored — use weight_decay (AdamW) or pos_noise "
-                        "for regularization.", stacklevel=2)
             elif key == "lambda_e":
                 params["lambda_e"] = float(parts[1])
             elif key == "lambda_f":
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
-            elif key == "pos_noise":
-                params["pos_noise"] = float(parts[1])
             elif key == "weight_decay":
                 params["weight_decay"] = float(parts[1])
+            elif key == "swa_start":
+                params["swa_start"] = int(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
             elif key == "save_potential":
@@ -390,15 +378,14 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
-    params.setdefault("pos_noise", 0.0)
-    params.setdefault("weight_decay", 0.0)
+    params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)
-    params.setdefault("stage2_pref_v", 0.05)
+    params.setdefault("stage2_pref_v", 0.1)
     # start_stage2 defaults to 0.5 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and
@@ -505,7 +492,7 @@ def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):
 
 
 def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
-                       output_dir: str = "split", strategy: str = "random",
+                       output_dir: str = "split", strategy: str = "stratified",
                        min_stratum: int = 20):
     """Write GPUMD-ready ``train.xyz`` / ``test.xyz`` with train_nep's split.
 
@@ -619,11 +606,18 @@ def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
         n_val = min(max(1, int(round(valid_ratio * len(idxs)))),
                     len(idxs) - 1)
         val.extend(idxs[p] for p in perm[:n_val])
-    if not val:
-        raise ValueError(
-            "stratified split held out no frames — every stratum has fewer "
-            f"than min_stratum={min_stratum} frames; lower min_stratum or "
-            "use the random strategy")
+    # Fallback: when the eligible pool is too small for a meaningful
+    # holdout (e.g. a dataset made ENTIRELY of tiny cells, which
+    # tiny_to_train sends to training), a starved validation set would be
+    # useless-to-empty — fall back to a plain random split (same seed) and
+    # report it via stats["fallback"] so callers can log it.
+    if len(val) < max(1, int(round(0.5 * valid_ratio * len(metas)))):
+        train_idx, val_idx = valid_split_indices(len(metas), valid_ratio,
+                                                 run_seed)
+        stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+                 "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny,
+                 "fallback": "random"}
+        return train_idx, val_idx, stats
     val_set = set(val)
     train_idx = [i for i in range(len(metas)) if i not in val_set]
     stats = {"n_strata": len(strata), "n_rare_strata": n_rare,

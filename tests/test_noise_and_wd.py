@@ -1,13 +1,8 @@
 # Copyright 2025 Yongchao Wu
 # This file is part of the TorchNEP project (GPL-3.0-or-later, see train.py).
 
-"""pos_noise (training-time coordinate jitter) and weight_decay (AdamW).
-
-The noise contract: per-atom Gaussian displacements drawn from a DEDICATED
-generator (global RNG untouched), applied to the pair vectors of both the
-radial and angular lists consistently (rij' = rij + d_j - d_i), labels
-untouched, basis computed from the noisy geometry, fully reproducible.
-"""
+"""weight_decay (AdamW with bias-exempt groups), the gathered NN, and the
+compiled ZBL path."""
 import numpy as np
 import torch
 
@@ -29,53 +24,6 @@ def _store(tmp_path, n=10):
                            config=cfg), cfg
 
 
-def test_pos_noise_collate_contract(tmp_path):
-    store, cfg = _store(tmp_path)
-    idx = [0, 2, 5]
-    clean = store.collate(idx)
-
-    g = torch.Generator(); g.manual_seed(77)
-    noisy = store.collate(idx, noise_gen=g, noise_sigma=0.01)
-    g2 = torch.Generator(); g2.manual_seed(77)
-    noisy2 = store.collate(idx, noise_gen=g2, noise_sigma=0.01)
-
-    # deterministic given the generator seed
-    for k in ("rij_rad", "rij_ang", "fk_rad", "blm"):
-        assert torch.equal(noisy[k], noisy2[k]), k
-
-    # exact displacement algebra: rij' = rij + d_j - d_i, same d for both
-    # pair lists
-    g3 = torch.Generator(); g3.manual_seed(77)
-    d = torch.randn(clean["N"], 3, generator=g3,
-                    dtype=torch.float64) * 0.01
-    exp_r = (clean["rij_rad"] + d[clean["pair_j_rad"]]
-             - d[clean["pair_i_rad"]])
-    exp_a = (clean["rij_ang"] + d[clean["pair_j_ang"]]
-             - d[clean["pair_i_ang"]])
-    assert torch.equal(noisy["rij_rad"], exp_r)
-    assert torch.equal(noisy["rij_ang"], exp_a)
-
-    # labels untouched; basis follows the NOISY geometry
-    assert torch.equal(noisy["forces"], clean["forces"])
-    assert torch.equal(noisy["energy"], clean["energy"])
-    assert torch.allclose(1.0 / noisy["d12inv_rad"],
-                          torch.norm(exp_r, dim=-1))
-    assert not torch.equal(noisy["fk_rad"], clean["fk_rad"])
-
-    # the "_clean" view riding along the noisy batch is bit-identical to
-    # a plain clean collate — it is what the logged train metrics and the
-    # analytic b1 update are computed from
-    cv = noisy["_clean"]
-    for k in ("rij_rad", "rij_ang", "fk_rad", "fkp_rad", "d12inv_rad",
-              "fk_ang", "fkp_ang", "d12inv_ang", "blm"):
-        assert torch.equal(cv[k], clean[k]), k
-    assert "_clean" not in clean
-
-    # sigma 0 (default) is bit-identical to clean
-    again = store.collate(idx)
-    assert torch.equal(again["rij_rad"], clean["rij_rad"])
-
-
 def _run(tmp_path, out, extra, seed=5):
     nepin = tmp_path / f"nep_{out}.in"
     nepin.write_text(NEP_IN + "epoch 3\nbatch 4\n" + extra)
@@ -93,14 +41,6 @@ def _run(tmp_path, out, extra, seed=5):
               checkpoint_interval=1000, prediction_interval=1000,
               run_seed=seed)
     return (tmp_path / out / "loss.out").read_text()
-
-
-def test_pos_noise_training_reproducible_and_active(tmp_path):
-    a = _run(tmp_path, "n1", "pos_noise 0.02\n")
-    b = _run(tmp_path, "n2", "pos_noise 0.02\n")
-    c = _run(tmp_path, "n0", "")
-    assert a == b          # same seed + same sigma -> identical run
-    assert a != c          # noise actually changes training
 
 
 def test_weight_decay_adamw_active(tmp_path):
@@ -212,13 +152,68 @@ def test_zbl_static_equivalence(tmp_path):
                                    rtol=1e-8, atol=1e-10)
 
 
-def test_pos_noise_with_autograd_forces(tmp_path):
-    """pos_noise + use_autograd_forces: the clean-metrics pass must not
-    require autograd (it runs under no_grad) — regression for the crash
-    'element 0 of tensors does not require grad' when the eager autograd
-    path was used for clean train metrics."""
-    nepin = tmp_path / "nep_ag.in"
-    nepin.write_text(NEP_IN + "epoch 2\nbatch 4\npos_noise 0.01\n")
+def test_optimizer_groups_and_remap(tmp_path):
+    """b0 biases sit in a no-decay group; and a single-group optimizer
+    state (pre-split checkpoints) loads via the exact order remap."""
+    from torchnep.model import NEPModel
+    from torchnep.train import (_make_optimizer, _load_optimizer_state,
+                                _optimizer_param_order)
+    _, cfg = _store(tmp_path, n=4)
+    torch.manual_seed(0)
+    m = NEPModel(cfg).to(torch.float64)
+    m.b1.requires_grad_(False)
+    named = [(n, p) for n, p in m.named_parameters() if n != "b1"]
+
+    opt = _make_optimizer(named, 1e-3, 1e-4)
+    gd = {g["name"]: g for g in opt.param_groups}
+    assert gd["decay"]["weight_decay"] == 1e-4
+    assert gd["no_decay"]["weight_decay"] == 0.0
+    n_b0 = sum(1 for n, _ in named if n.endswith(".b0"))
+    assert len(gd["no_decay"]["params"]) == n_b0
+    assert (len(gd["decay"]["params"]) + n_b0) == len(named)
+
+    # old-style single-group optimizer over the same params, stepped so
+    # every param has distinct state
+    flat = [p for _, p in named]
+    old = torch.optim.AdamW(flat, lr=1e-3, weight_decay=1e-4, amsgrad=True)
+    for p in flat:
+        p.grad = torch.randn_like(p)
+    old.step()
+    sd = old.state_dict()
+
+    new = _make_optimizer(named, 1e-3, 1e-4)
+    _load_optimizer_state(new, sd, m)
+    # exp_avg of each param must land on the SAME parameter it came from
+    order = _optimizer_param_order(m)
+    name_to_param = dict(named)
+    old_flat = {i: n for i, n in enumerate(n for n, _ in named)}
+    new_params = [p for g in new.param_groups for p in g["params"]]
+    for new_idx, n in enumerate(order):
+        st = new.state[new_params[new_idx]]
+        old_idx = [i for i, nn in old_flat.items() if nn == n][0]
+        ref = old.state[flat[old_idx]]
+        assert torch.equal(st["exp_avg"], ref["exp_avg"]), n
+
+
+def test_stratified_fallback_all_tiny():
+    """A dataset made entirely of tiny cells cannot be stratified
+    (tiny_to_train sends everything to training) — the split must fall
+    back to random instead of returning an empty validation set."""
+    from torchnep.data import stratified_split_indices
+    metas = [(2, {"Te", "Pb"}) for _ in range(200)]
+    tr, va, st = stratified_split_indices(metas, 0.1, 0)
+    assert st.get("fallback") == "random"
+    assert len(va) == 20
+    assert len(tr) == 180
+    assert not set(tr) & set(va)
+
+
+def test_swa_start_window(tmp_path):
+    """swa_start gates the averaging window; a window past the end of the
+    run must produce no nep_average.txt (with the run otherwise fine)."""
+    nepin = tmp_path / "nep_swa.in"
+    nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n"
+                     "swa_start 99\n")
     frames = read_xyz(str(PBTE))[:8]
     raw = PBTE.read_text().splitlines()
     keep, i, k = [], 0, 0
@@ -228,8 +223,20 @@ def test_pos_noise_with_autograd_forces(tmp_path):
     xyz = tmp_path / "train.xyz"
     xyz.write_text("\n".join(keep) + "\n")
     train_nep(config_file=str(nepin), data_file=str(xyz),
-              output_dir=str(tmp_path / "ag"), device="cpu",
+              output_dir=str(tmp_path / "o"), device="cpu",
               precision="float64", print_interval=100, restart=False,
               checkpoint_interval=1000, prediction_interval=1000,
-              run_seed=5, use_autograd_forces=True)
-    assert (tmp_path / "ag" / "loss.out").exists()
+              run_seed=5, use_swa=True)
+    assert (tmp_path / "o" / "nep_final.txt").exists()
+    assert not (tmp_path / "o" / "nep_average.txt").exists()
+
+    # window inside the run -> average IS written
+    nepin2 = tmp_path / "nep_swa2.in"
+    nepin2.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n"
+                      "swa_start 3\n")
+    train_nep(config_file=str(nepin2), data_file=str(xyz),
+              output_dir=str(tmp_path / "o2"), device="cpu",
+              precision="float64", print_interval=100, restart=False,
+              checkpoint_interval=1000, prediction_interval=1000,
+              run_seed=5, use_swa=True)
+    assert (tmp_path / "o2" / "nep_average.txt").exists()
