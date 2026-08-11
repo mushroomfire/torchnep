@@ -161,7 +161,7 @@ from torchnep.train_sharded import train_nep_sharded
 train_nep_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3],
                   precision="float64", print_interval=100,
                   checkpoint_interval=10000, prediction_interval=10000,
-                  restart=False, run_seed=99)
+                  restart=False, run_seed=99, use_swa=True)
 """
 
 
@@ -183,7 +183,7 @@ def test_sharded_run_reproducible(tmp_path):
         pytest.skip("torchrun not on PATH")
 
     nepin = tmp_path / "nep.in"
-    nepin.write_text(NEP_IN + "epoch 3\nbatch 4\n")
+    nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 3\n")
     raw = PBTE.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < 16:

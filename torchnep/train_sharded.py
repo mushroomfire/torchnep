@@ -788,7 +788,13 @@ def train_nep_sharded(
             config.get("stage2_scheduler_factor", scheduler_factor),
             config.get("stage2_scheduler_patience", scheduler_patience),
             stop_lr)
-        if use_swa and is_main:
+        if use_swa:
+            # EVERY rank maintains the average (DDP keeps raw_model
+            # identical across ranks, so the averages are identical too).
+            # Keeping it main-only deadlocked the tail: rank 0 entered the
+            # SWA-b1 all_reduce while the other ranks skipped the block and
+            # sat in the final predict's all_gather — collective sequences
+            # diverged and both sides hit the NCCL watchdog timeout.
             swa_model = AveragedModel(raw_model)
 
     # Snapshot of current loss weights — saved in checkpoint so a restart can
@@ -813,9 +819,8 @@ def train_nep_sharded(
     if resume_ckpt is not None:
         # Every rank loads the same file; model weights go into raw_model
         # (the plain NEPModel — keeps checkpoints interchangeable with
-        # single-GPU runs). swa_model is None on non-main ranks, so SWA
-        # state is restored on rank 0 only — consistent with rank-0-only
-        # SWA updates.
+        # single-GPU runs). SWA state restores on every rank (all ranks
+        # maintain the average — see the AveragedModel construction).
         info = _load_checkpoint(resume_ckpt, raw_model, optimizer,
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
@@ -1165,7 +1170,7 @@ def train_nep_sharded(
                     optimizer.step()
                     ok_f = 1.0
 
-                if in_stage2 and swa_model is not None and is_main:
+                if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
 
                 zero64 = acc.new_zeros(())
