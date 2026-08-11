@@ -518,6 +518,35 @@ class StreamDataStore:
                                                  noise_sigma))
 
 
+_PROF = int(os.environ.get("TORCHNEP_PROFILE", "0") or "0")
+_SENTINEL = object()
+
+
+def _timed_iter(gen, sink, sync_cuda):
+    """Wrap a batch iterator, splitting wall time between "waiting for /
+    finalizing data" (sink[0]) and "the consumer's loop body" (sink[1]).
+
+    With ``sync_cuda`` (TORCHNEP_PROFILE=2) a device synchronize runs at
+    both boundaries, converting the CPU walls into true GPU-inclusive
+    phase times (at the cost of disabling pipeline overlap — profiling
+    mode only).
+    """
+    gen = iter(gen)
+    while True:
+        t0 = time.perf_counter()
+        item = next(gen, _SENTINEL)
+        if sync_cuda:
+            torch.cuda.synchronize()
+        sink[0] += time.perf_counter() - t0
+        if item is _SENTINEL:
+            return
+        t0 = time.perf_counter()
+        yield item
+        if sync_cuda:
+            torch.cuda.synchronize()
+        sink[1] += time.perf_counter() - t0
+
+
 def iter_collated(data_store, index_lists, noise_gen=None,
                   noise_sigma: float = 0.0):
     """Yield collated device batches for ``index_lists``, in order.
@@ -1923,8 +1952,14 @@ def train_nep(
 
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_structs, batch_size)]
-            for batch in iter_collated(data_store, batch_indices,
-                                       noise_gen, pos_noise):
+            _tp = [0.0, 0.0]
+            if _PROF and dev.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            _t_loop0 = time.perf_counter()
+            for batch in _timed_iter(
+                    iter_collated(data_store, batch_indices,
+                                  noise_gen, pos_noise),
+                    _tp, _PROF >= 2 and dev.type == "cuda"):
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -2089,6 +2124,11 @@ def train_nep(
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
 
+            if _PROF:
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                _t_train_wall = time.perf_counter() - _t_loop0
+
             # One epoch-level fetch of every device accumulator (the only
             # metric sync of the epoch).
             (sum_le, sum_lf, sum_lv, sum_ls, n_e_f, n_f_f, n_v_f,
@@ -2131,6 +2171,7 @@ def train_nep(
             # train-fitted by the analytical update above; never re-fitted on
             # validation data). This loss drives the plateau scheduler and
             # the best-model choice below — the anti-overfitting signal.
+            _t_v0 = time.perf_counter()
             valid_loss = None
             if valid_store is not None:
                 valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s = \
@@ -2139,6 +2180,9 @@ def train_nep(
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
                         cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+            if _PROF and dev.type == "cuda":
+                torch.cuda.synchronize()
+            _t_valid = time.perf_counter() - _t_v0
             dt = time.time() - t_epoch
 
             # With a validation set, the validation loss IS the run's loss:
@@ -2284,6 +2328,19 @@ def train_nep(
                     predict_from_store(raw_model, valid_store, output_dir,
                                        batch_size=batch_size,
                                        verbose=False, suffix="test")
+
+            if _PROF:
+                if dev.type == "cuda":
+                    torch.cuda.synchronize()
+                    _pa = torch.cuda.max_memory_allocated() / 2**30
+                    _pr = torch.cuda.max_memory_reserved() / 2**30
+                else:
+                    _pa = _pr = 0.0
+                _t_tail = (time.perf_counter() - _t_v0) - _t_valid
+                _log(f"  [prof] train {_t_train_wall:6.2f}s "
+                     f"(data-wait {_tp[0]:6.2f} step-cpu {_tp[1]:6.2f}) | "
+                     f"valid {_t_valid:5.2f}s tail {_t_tail:5.2f}s | "
+                     f"peak alloc {_pa:.2f} res {_pr:.2f} GiB")
 
             if stop_now:
                 _log(f"Early stop: {monitored} did not improve for "
