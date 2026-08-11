@@ -1922,18 +1922,31 @@ def train_nep(
                 # clean geometry, so logged train metrics are true errors.
                 result_m = result
                 if pos_noise > 0 and "_clean" in batch:
-                    # Clean metrics ALWAYS come from the analytical cached
-                    # path: it needs no autograd, so it works under no_grad
-                    # in every force mode (the eager autograd path would
-                    # crash here — its inner autograd.grad sees a forward
-                    # recorded under no_grad). Analytical == autograd forces
-                    # to fp precision, so the logged metrics are the same.
+                    # Clean metrics from the same computation as training
+                    # where possible. The make_fx ag graph works under
+                    # no_grad (its derivative is materialized as ordinary
+                    # ops at trace time); the EAGER autograd path does not
+                    # (its runtime autograd.grad would see a forward
+                    # recorded under no_grad) — that one mode falls back to
+                    # the analytical cached path, which is identical to fp
+                    # precision.
                     with torch.no_grad():
-                        result_m = compute_props_cached(
-                            batch["_clean"], need_forces=has_forces,
-                            need_virial=has_virial,
-                            backend=(backend if use_autograd_forces
-                                     else train_backend))
+                        if use_autograd_forces and compile_on:
+                            cb = batch["_clean"]
+                            result_m = compute_props(
+                                cb["rij_rad"], cb["rij_ang"],
+                                cb["pair_i_rad"], cb["pair_j_rad"],
+                                cb["pair_i_ang"], cb["pair_j_ang"],
+                                cb["atom_types"], cb["N"],
+                                cb["struct_idx"], cb["num_structures"],
+                                need_forces=has_forces,
+                                need_virial=has_virial, backend=backend)
+                        else:
+                            result_m = compute_props_cached(
+                                batch["_clean"], need_forces=has_forces,
+                                need_virial=has_virial,
+                                backend=(backend if use_autograd_forces
+                                         else train_backend))
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]

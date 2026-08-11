@@ -1020,14 +1020,28 @@ def train_nep_sharded(
                 # no gradients, nothing to all-reduce.
                 result_m = result
                 if pos_noise > 0 and "_clean" in batch:
-                    # Analytical cached path in every force mode — needs no
-                    # autograd, so it works under no_grad (see train_nep).
+                    # Same computation as training where possible: the
+                    # make_fx ag graph works under no_grad (derivative is
+                    # ordinary ops); eager autograd would not — that mode
+                    # falls back to the analytical cached path (identical
+                    # to fp precision). See train_nep.
                     with torch.no_grad():
-                        result_m = _shim._compute_cached(
-                            batch["_clean"], need_forces=has_forces,
-                            need_virial=has_virial,
-                            backend=(backend if use_autograd_forces
-                                     else train_backend))
+                        if use_autograd_forces and _shim._ag_compute is not None:
+                            cb = batch["_clean"]
+                            result_m = _shim._ag_compute.compute_properties(
+                                cb["rij_rad"], cb["rij_ang"],
+                                cb["pair_i_rad"], cb["pair_j_rad"],
+                                cb["pair_i_ang"], cb["pair_j_ang"],
+                                cb["atom_types"], cb["N"],
+                                cb["struct_idx"], cb["num_structures"],
+                                need_forces=has_forces,
+                                need_virial=has_virial, backend=backend)
+                        else:
+                            result_m = _shim._compute_cached(
+                                batch["_clean"], need_forces=has_forces,
+                                need_virial=has_virial,
+                                backend=(backend if use_autograd_forces
+                                         else train_backend))
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
