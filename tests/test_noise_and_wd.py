@@ -240,3 +240,24 @@ def test_swa_start_window(tmp_path):
               checkpoint_interval=1000, prediction_interval=1000,
               run_seed=5, use_swa=True)
     assert (tmp_path / "o2" / "nep_average.txt").exists()
+
+
+def test_default_alloc_conf(monkeypatch):
+    """expandable_segments is defaulted only when the user set nothing,
+    on CUDA, before the context exists."""
+    from torchnep.train import _default_alloc_conf
+    import torchnep.train as T
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+    _default_alloc_conf()
+    import os
+    assert os.environ["PYTORCH_ALLOC_CONF"] == "expandable_segments:True"
+
+    # user setting wins
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "max_split_size_mb:64")
+    _default_alloc_conf()
+    assert os.environ["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:64"

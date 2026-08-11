@@ -768,6 +768,27 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
 # LR scheduler helpers
 # ---------------------------------------------------------------------------
 
+def _default_alloc_conf():
+    """Default the CUDA caching allocator to expandable_segments.
+
+    Batches have a different shape every step, so the block-pool
+    allocator fragments badly — measured on unep16: reserved memory 26
+    GiB for 5.7 GiB actually allocated at batch 512; expandable segments
+    collapse that to ~6.3 GiB at identical speed. Applied only when the
+    user has not set PYTORCH_ALLOC_CONF / PYTORCH_CUDA_ALLOC_CONF
+    themselves, on CUDA (not ROCm), and only before the CUDA context
+    exists (the allocator reads the env once at first use).
+    """
+    if ("PYTORCH_ALLOC_CONF" in os.environ
+            or "PYTORCH_CUDA_ALLOC_CONF" in os.environ):
+        return
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return
+    if torch.cuda.is_initialized():
+        return
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+
 def _make_optimizer(named_params, lr, weight_decay):
     """Adam (weight_decay=0) or AdamW (>0), fused on CUDA when available.
 
@@ -1334,6 +1355,7 @@ def train_nep(
         with valid_file.
     """
     _clean_warning_format()
+    _default_alloc_conf()
 
     # ---- Device ----------------------------------------------------------
     if device is None:

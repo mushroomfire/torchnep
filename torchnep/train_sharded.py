@@ -144,7 +144,7 @@ from .train import (
     _trim_loss_log, _accumulate_true_loss_sums,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
-    _clean_warning_format, _VIRIAL_6,
+    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
 )
 
 
@@ -274,6 +274,10 @@ def train_nep_sharded(
     gradients all-reduced as usual.
     """
     _clean_warning_format()
+    _default_alloc_conf()
+    # Quiet CPU-thread oversubscription for multi-process runs (torchrun
+    # sets this itself and warns when unset; other launchers may not).
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 
     # ---- Distributed init ------------------------------------------------
     # Wrap local_rank around the number of visible GPUs — lets several

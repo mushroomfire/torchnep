@@ -119,6 +119,8 @@ def predict_dataset(
     The contraction backend is chosen automatically (see
     ``torchnep.ops.resolve_backend``).
     """
+    from .train import _default_alloc_conf
+    _default_alloc_conf()
     if device is None:
         # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
         if torch.cuda.is_available():
