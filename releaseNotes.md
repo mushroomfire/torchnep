@@ -1,6 +1,56 @@
 # Release Notes
 
-## Unreleased
+## 1.0.2
+
+Defaults changed:
+
+- **`weight_decay` default `1e-4`** (AdamW). Biases (`b0`) are exempt from
+  decay; `b1` was never in the optimizer. Checkpoints from older versions
+  load unchanged. Set `0` for plain Adam.
+- **`stage2_lambda_v` back to `0.1`** — independent-test benchmarks rank
+  0.1 > 0.05 > 0.02 on both energy and virial; the 1.0.2b2 default of
+  0.05 is reverted.
+- **`valid_strategy` default `"stratified"`**; falls back to `"random"`
+  automatically (with a log note) when stratification would starve the
+  validation set (e.g. an all-tiny-cell dataset).
+- **SWA averages only the run tail**: new `swa_start` key, default = the
+  last 100 epochs. Averaging all of stage 2 degraded energies; the tail
+  window keeps the force / seed-consistency gains.
+
+New:
+
+- **`TORCHNEP_PROFILE=1`**: per-epoch phase breakdown (data-wait,
+  step, validation, tail) plus peak allocated/reserved GPU memory.
+  `=2` adds per-step syncs for GPU-attributed times.
+
+Removed:
+
+- **`pos_noise`** — no benefit on independent tests at any dose; the
+  clean-metrics machinery it required is gone too. Unsupported nep.in
+  keys (including `lambda_1` / `lambda_2` / `pos_noise`) are now silently
+  ignored. These features remain available in ≤ 1.0.2b2.
+
+Fixed:
+
+- DDP deadlock at the end of `use_swa` runs (the SWA average is now
+  maintained on every rank).
+- A hidden per-step GPU sync in the batch pipeline (pageable-index
+  gather) and ~10 host syncs per step in the metric/loss code — real
+  epochs are moderately faster on every GPU tested.
+- Preprocessing pool now respects the job's actual CPU allocation
+  (slurm cgroups) instead of the node's core count.
+
+## 1.0.2b2
+
+- **Kernel fusion**: per-type NN → one gathered-weight batched matmul;
+  ZBL moved inside the compiled graph (branch-free, analytic pair
+  derivatives) for both the analytical and autograd force paths; fused
+  Adam on CUDA. ~2x faster training step on GH200, correctness pinned
+  by GPUMD-reference tests.
+- **`use_autograd_forces` + `use_compile` now works in DDP**
+  (`train_nep_sharded`).
+- **`lambda_1` / `lambda_2` removed** — SNES-form L1/L2 has no usable
+  meaning under Adam's per-parameter normalization; use `weight_decay`.
 
 - **`stage2_lambda_v` default 0.1 → 0.05** (same as `stage2_lambda_f`):
   the old value measurably overfits the virial in stage 2 on
