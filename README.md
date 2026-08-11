@@ -132,10 +132,10 @@ function (`train_nep` / `train_nep_sharded`):
 | `use_autograd_forces` | `False` | autograd-through-rij |
 | `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
 | `swa_start` | last 100 epochs | first epoch included in the SWA average |
-| `use_compile` | `False` | `torch.compile` the compute (faster epochs after a one-time compile; needs Triton). |
-| `print_interval` | `10` | log to screen every N epochs |
+| `use_compile` | `None` | auto: compile on GPU, eager on CPU; `True`/`False` force it. Missing Triton/C++ toolchain degrades to eager with a log note |
+| `print_interval` | `1` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
-| `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
+| `prediction_interval` | `100` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
 | `restart` | `True` | resume from `checkpoint.pt` if present |
 | `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` and start a NEW training from them |
 | `resume_from` | `None` | path to a checkpoint to CONTINUE from (e.g. `checkpoint_stage1.pt` to redo Stage 2); takes precedence over the automatic `checkpoint.pt` pickup |

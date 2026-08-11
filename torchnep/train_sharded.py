@@ -219,11 +219,11 @@ def train_nep_sharded(
     use_autograd_forces: bool = False,
     use_swa: bool = False,
     swa_start: int = None,
-    use_compile: bool = False,
-    print_interval: int = 10,
+    use_compile: bool = None,
+    print_interval: int = 1,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    prediction_interval: int = 20,
+    prediction_interval: int = 100,
     finetune_from: str = None,
     resume_from: str = None,
     recompute_q_scaler: bool = False,
@@ -681,6 +681,13 @@ def train_nep_sharded(
     # backend — the backend choice depends on it. Only the analytical path is
     # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
+    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # stay eager on CPU (C++ Inductor warmup outweighs the gain for
+    # typical CPU-sized runs). Explicit True/False always wins; every
+    # failed capability check degrades to eager with a log line instead
+    # of raising.
+    if use_compile is None:
+        use_compile = dev.type in ("cuda", "xpu")
     compile_on = False
     compile_msg = None
     if use_compile:

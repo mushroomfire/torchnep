@@ -18,6 +18,9 @@ Defaults changed:
 
 New:
 
+- **`use_compile` defaults to auto**: compile on GPU, eager on CPU;
+  missing Triton / C++ toolchain degrades to eager instead of raising.
+  `print_interval` default 10 → 1, `prediction_interval` 20 → 100.
 - **`TORCHNEP_PROFILE=1`**: per-epoch phase breakdown (data-wait,
   step, validation, tail) plus peak allocated/reserved GPU memory.
   `=2` adds per-step syncs for GPU-attributed times.

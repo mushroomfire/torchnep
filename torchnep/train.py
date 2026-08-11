@@ -1204,6 +1204,12 @@ def _compile_check(dev):
             return False, ("Triton not found (the CUDA TorchInductor backend "
                            "needs it) — install triton, or set "
                            "use_compile=False to silence this")
+    else:
+        # CPU Inductor generates and builds C++ — needs a compiler.
+        import shutil
+        if not any(shutil.which(c) for c in ("g++", "clang++", "c++")):
+            return False, ("no C++ compiler found (the CPU TorchInductor "
+                           "backend needs one) — falling back to eager")
     return True, ""
 
 
@@ -1220,11 +1226,11 @@ def train_nep(
     use_autograd_forces: bool = False,
     use_swa: bool = False,
     swa_start: int = None,
-    use_compile: bool = False,
-    print_interval: int = 10,
+    use_compile: bool = None,
+    print_interval: int = 1,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    prediction_interval: int = 20,
+    prediction_interval: int = 100,
     finetune_from: str = None,
     resume_from: str = None,
     recompute_q_scaler: bool = False,
@@ -1256,7 +1262,9 @@ def train_nep(
         as ``nep_average.txt`` at the end.
     swa_start : first epoch included in the SWA average (default: the
         last 100 epochs). Averaging all of stage 2 degrades energies.
-    use_compile : torch.compile the analytical compute method (~1.3x faster per
+    use_compile : None (default) = auto — compile on GPU, eager on
+        CPU; True/False force it. Missing Triton (GPU) or C++
+        toolchain (CPU) degrades to eager with a log note.
         epoch after a one-time first-epoch compilation cost; needs Triton, which
         ships with the CUDA PyTorch build). With autograd forces the
         first-order gradient is materialized via make_fx and compiled too.
@@ -1605,6 +1613,13 @@ def train_nep(
     # backend — the backend choice depends on it. Only the analytical path is
     # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
+    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # stay eager on CPU (C++ Inductor warmup outweighs the gain for
+    # typical CPU-sized runs). Explicit True/False always wins; every
+    # failed capability check degrades to eager with a log line instead
+    # of raising.
+    if use_compile is None:
+        use_compile = dev.type in ("cuda", "xpu")
     compile_on = False
     compile_msg = None
     if use_compile:
