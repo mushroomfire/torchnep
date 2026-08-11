@@ -798,68 +798,28 @@ def _make_optimizer(named_params, lr, weight_decay):
     parameter — AdamW applies it directly to the weights. With
     weight_decay = 0 both optimizers are identical.
 
-    Two parameter groups: biases are excluded from decay ("no_decay" =
-    the per-type NN thresholds b0; the energy offset b1 is not in the
-    optimizer at all — it is solved analytically each epoch). Biases do
-    not scale features, so decaying them buys no smoothness and only
-    biases the fit — standard practice (MACE exempts biases/readouts the
-    same way). Weights w0/w1 and the descriptor expansions c2/c3 decay.
+    ALL trainable parameters decay, including the b0 biases (b1 is not
+    in the optimizer — it is solved analytically). A bias-exempt group
+    was tried and rejected: it fit the training set identically but lost
+    ~30-40% on validation/independent-test energies (unep16, 2 seeds) —
+    for this architecture the thresholds b0 need the same shrinkage
+    pressure as the weights, matching GPUMD's all-parameter
+    regularization.
 
     ``fused=True`` runs the whole update as one kernel per device/dtype
     group instead of several ``foreach`` launches per state tensor — same
     algorithm, only the arithmetic grouping differs. The try/except keeps
     older builds or exotic device combos on the default path.
     """
-    named_params = list(named_params)
-    decay = [p for n, p in named_params if not n.endswith(".b0")]
-    no_decay = [p for n, p in named_params if n.endswith(".b0")]
-    groups = [{"params": decay, "name": "decay"},
-              {"params": no_decay, "name": "no_decay", "weight_decay": 0.0}]
+    params = [p for _, p in named_params]
     cls = torch.optim.AdamW if weight_decay > 0 else torch.optim.Adam
     kwargs = dict(lr=lr, weight_decay=weight_decay, amsgrad=True)
-    if decay and decay[0].device.type == "cuda":
+    if params and params[0].device.type == "cuda":
         try:
-            return cls(groups, fused=True, **kwargs)
+            return cls(params, fused=True, **kwargs)
         except (RuntimeError, TypeError, ValueError):
             pass
-    return cls(groups, **kwargs)
-
-
-def _optimizer_param_order(model):
-    """Names of the optimizer's parameters in group-concatenation order
-    (decay group then no_decay group) — must mirror _make_optimizer."""
-    names = [n for n, _ in model.named_parameters() if n != "b1"]
-    return ([n for n in names if not n.endswith(".b0")]
-            + [n for n in names if n.endswith(".b0")])
-
-
-def _load_optimizer_state(optimizer, opt_state, model):
-    """Load an optimizer state dict, remapping single-group checkpoints
-    (written before the bias no-decay split) onto the two-group layout.
-
-    The old flat parameter order was named_parameters() minus b1; the new
-    order concatenates the decay and no_decay groups. Both derive from
-    the same deterministic name order, so the permutation is exact.
-    """
-    try:
-        optimizer.load_state_dict(opt_state)
-        return
-    except ValueError:
-        pass
-    names = [n for n, _ in model.named_parameters() if n != "b1"]
-    new_order = _optimizer_param_order(model)
-    old_index = {n: i for i, n in enumerate(names)}
-    state = {i: opt_state["state"][old_index[n]]
-             for i, n in enumerate(new_order)
-             if old_index[n] in opt_state["state"]}
-    old_g = opt_state["param_groups"][0]
-    hyper = {k: v for k, v in old_g.items() if k != "params"}
-    n_decay = sum(1 for n in new_order if not n.endswith(".b0"))
-    groups = [dict(hyper, name="decay",
-                   params=list(range(n_decay))),
-              dict(hyper, name="no_decay", weight_decay=0.0,
-                   params=list(range(n_decay, len(new_order))))]
-    optimizer.load_state_dict({"state": state, "param_groups": groups})
+    return cls(params, **kwargs)
 
 
 def _make_lr_scheduler(optimizer, mode, factor, patience, min_lr):
@@ -964,7 +924,7 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     if model_state and all(k.startswith("model.") for k in model_state):
         model_state = {k[len("model."):]: v for k, v in model_state.items()}
     m.load_state_dict(model_state)
-    _load_optimizer_state(optimizer, ckpt["optimizer_state"], m)
+    optimizer.load_state_dict(ckpt["optimizer_state"])
     in_stage2 = ckpt.get("in_stage2", False)
     target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
               else lr_scheduler)
@@ -1781,12 +1741,10 @@ def train_nep(
                                 lr_scheduler, stage2_scheduler,
                                 swa_model, dev)
         # load_state_dict restores the checkpoint's param_groups, which
-        # would silently zero a newly requested weight_decay — reapply it
-        # (decay group only; biases stay decay-free).
+        # would silently zero a newly requested weight_decay — reapply it.
         if weight_decay > 0:
             for _g in optimizer.param_groups:
-                if _g.get("name") != "no_decay":
-                    _g["weight_decay"] = weight_decay
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]

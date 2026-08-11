@@ -118,7 +118,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight. Independent-test benchmarks on multi-element data rank 0.1 > 0.05 > 0.02 on both energy and virial — the apparent virial "overfit" on the validation curve does not cost generalization |
-| `weight_decay` | `1e-4` | AdamW decoupled weight decay (the MACE-style regularizer; the only regularizer that improved independent-test errors — 4-seed benchmark: F better on 4/4 seeds, E on 3/4). Biases are exempt from decay (b0; b1 is solved analytically). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
+| `weight_decay` | `1e-4` | AdamW decoupled weight decay (the only regularizer that improved independent-test errors — 4-seed benchmark: F better on 4/4 seeds, E on 3/4). All trainable parameters decay (a bias-exempt variant tested clearly worse); `b1` is solved analytically and never decays. `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
 
 ### Runtime arguments
 

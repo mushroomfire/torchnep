@@ -152,47 +152,21 @@ def test_zbl_static_equivalence(tmp_path):
                                    rtol=1e-8, atol=1e-10)
 
 
-def test_optimizer_groups_and_remap(tmp_path):
-    """b0 biases sit in a no-decay group; and a single-group optimizer
-    state (pre-split checkpoints) loads via the exact order remap."""
+def test_optimizer_all_params_decay(tmp_path):
+    """Every trainable parameter (including b0 biases) sits in ONE decay
+    group — the bias-exempt variant was tried and rejected (it fit train
+    identically but lost 30-40% on independent-test energies)."""
     from torchnep.model import NEPModel
-    from torchnep.train import (_make_optimizer, _load_optimizer_state,
-                                _optimizer_param_order)
+    from torchnep.train import _make_optimizer
     _, cfg = _store(tmp_path, n=4)
     torch.manual_seed(0)
     m = NEPModel(cfg).to(torch.float64)
     m.b1.requires_grad_(False)
     named = [(n, p) for n, p in m.named_parameters() if n != "b1"]
-
     opt = _make_optimizer(named, 1e-3, 1e-4)
-    gd = {g["name"]: g for g in opt.param_groups}
-    assert gd["decay"]["weight_decay"] == 1e-4
-    assert gd["no_decay"]["weight_decay"] == 0.0
-    n_b0 = sum(1 for n, _ in named if n.endswith(".b0"))
-    assert len(gd["no_decay"]["params"]) == n_b0
-    assert (len(gd["decay"]["params"]) + n_b0) == len(named)
-
-    # old-style single-group optimizer over the same params, stepped so
-    # every param has distinct state
-    flat = [p for _, p in named]
-    old = torch.optim.AdamW(flat, lr=1e-3, weight_decay=1e-4, amsgrad=True)
-    for p in flat:
-        p.grad = torch.randn_like(p)
-    old.step()
-    sd = old.state_dict()
-
-    new = _make_optimizer(named, 1e-3, 1e-4)
-    _load_optimizer_state(new, sd, m)
-    # exp_avg of each param must land on the SAME parameter it came from
-    order = _optimizer_param_order(m)
-    name_to_param = dict(named)
-    old_flat = {i: n for i, n in enumerate(n for n, _ in named)}
-    new_params = [p for g in new.param_groups for p in g["params"]]
-    for new_idx, n in enumerate(order):
-        st = new.state[new_params[new_idx]]
-        old_idx = [i for i, nn in old_flat.items() if nn == n][0]
-        ref = old.state[flat[old_idx]]
-        assert torch.equal(st["exp_avg"], ref["exp_avg"]), n
+    assert len(opt.param_groups) == 1
+    assert opt.param_groups[0]["weight_decay"] == 1e-4
+    assert len(opt.param_groups[0]["params"]) == len(named)
 
 
 def test_stratified_fallback_all_tiny():

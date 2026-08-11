@@ -4,9 +4,10 @@
 
 Defaults changed:
 
-- **`weight_decay` default `1e-4`** (AdamW). Biases (`b0`) are exempt from
-  decay; `b1` was never in the optimizer. Checkpoints from older versions
-  load unchanged. Set `0` for plain Adam.
+- **`weight_decay` default `1e-4`** (AdamW), applied to all trainable
+  parameters (a bias-exempt variant fit the training set identically but
+  lost 30-40% on independent-test energies — rejected). `b1` is solved
+  analytically and never decays. Set `0` for plain Adam.
 - **`stage2_lambda_v` back to `0.1`** — independent-test benchmarks rank
   0.1 > 0.05 > 0.02 on both energy and virial; the 1.0.2b2 default of
   0.05 is reverted.
