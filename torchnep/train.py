@@ -558,61 +558,13 @@ def iter_collated(data_store, index_lists, noise_gen=None,
                          name="torchnep-stream-prefetch")
     t.start()
     try:
-        if data_store.device.type != "cuda":
-            while True:
-                tag, payload = q.get()
-                if tag == "done":
-                    break
-                if tag == "err":
-                    raise payload
-                yield data_store._finalize(payload)
-            return
-
-        # CUDA: run the device half (H2D + basis kernels) one batch AHEAD
-        # on a dedicated side stream, so the copy engine and the basis
-        # kernels overlap the caller's compute on the current batch
-        # instead of queueing behind it on the compute stream. Handing a
-        # batch over = make the consumer stream wait on the side stream's
-        # event, then record_stream every tensor so the caching allocator
-        # cannot recycle side-stream allocations while consumer kernels
-        # still read them. Batch contents and order are unchanged — only
-        # WHERE/WHEN the copies and basis kernels run moves.
-        side = torch.cuda.Stream(device=data_store.device)
-
-        def _finalize_ahead(staged):
-            with torch.cuda.stream(side):
-                batch = data_store._finalize(staged)
-                ev = torch.cuda.Event()
-                ev.record(side)
-            return batch, ev
-
-        def _hand_over(item):
-            batch, ev = item
-            cur = torch.cuda.current_stream()
-            cur.wait_event(ev)
-            for v in batch.values():
-                if torch.is_tensor(v) and v.is_cuda:
-                    v.record_stream(cur)
-            clean = batch.get("_clean")
-            if clean is not None:
-                for v in clean.values():
-                    if torch.is_tensor(v) and v.is_cuda:
-                        v.record_stream(cur)
-            return batch
-
-        pending = None
         while True:
             tag, payload = q.get()
-            if tag == "err":
-                raise payload
             if tag == "done":
                 break
-            item = _finalize_ahead(payload)
-            if pending is not None:
-                yield _hand_over(pending)
-            pending = item
-        if pending is not None:
-            yield _hand_over(pending)
+            if tag == "err":
+                raise payload
+            yield data_store._finalize(payload)
     finally:
         stop.set()
         # Unblock the worker if it is waiting on a full queue.
