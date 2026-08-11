@@ -919,6 +919,13 @@ def train_nep_sharded(
 
     train_t0 = time.time()
 
+    # GPU-side non-finite-gradient guard when the fused optimizer supports
+    # the AMP found_inf hook — see train_nep.
+    async_guard = (dev.type == "cuda"
+                   and optimizer.param_groups[0].get("fused", False)
+                   and getattr(optimizer, "_step_supports_amp_scaling",
+                               False))
+
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
@@ -933,10 +940,12 @@ def train_nep_sharded(
             g.manual_seed(run_seed + epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
-            max_gn = 0.0
+            # Device-side accumulators, fetched (and all-reduced) once per
+            # epoch — see train_nep. Layout:
+            # [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
+            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            max_gn_t = torch.zeros((), dtype=dtype, device=dev)
+            n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1045,9 +1054,11 @@ def train_nep_sharded(
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                e_mask = batch["energy_mask"]
-                f_mask = batch["force_mask"] if has_forces else None
-                v_mask = batch["virial_mask"] if has_virial else None
+                emf = batch["energy_mask"].to(dtype)
+                fmf = (batch["force_mask"].to(dtype).unsqueeze(-1)
+                       if has_forces else None)
+                vmf = (batch["virial_mask"].to(dtype).unsqueeze(-1)
+                       if has_virial else None)
 
                 # --- DDP-correct normalisation --------------------------
                 # DDP averages gradients by world_size. If each rank used a
@@ -1060,106 +1071,132 @@ def train_nep_sharded(
                 # by the GLOBAL count (all-reduced per batch). The * world_size
                 # factor cancels DDP's /world_size averaging — giving a true
                 # global-mean loss regardless of how atoms are sharded.
-                counts = torch.tensor([
-                    float(e_mask.sum().item()),
-                    float(f_mask.sum().item()) if f_mask is not None else 0.0,
-                    float(v_mask.sum().item()) if v_mask is not None else 0.0,
-                ], device=dev, dtype=torch.float64)
+                # Counts stay DEVICE tensors end to end (the all_reduce and
+                # the divisions are stream-ordered) — fetching them per batch
+                # would drain the compute stream every step. Loss and metric
+                # terms are likewise branchless masked sums; the scalars are
+                # read back together after the grad-norm guard's sync, where
+                # they cost nothing.
+                counts = torch.stack([
+                    emf.sum(),
+                    fmf.sum() if fmf is not None else emf.new_zeros(()),
+                    vmf.sum() if vmf is not None else emf.new_zeros(()),
+                ]).to(torch.float64)
                 dist.all_reduce(counts)
-                n_e_g = max(counts[0].item(), 1.0)
-                n_f_g = max(counts[1].item(), 1.0)
-                n_v_g = max(counts[2].item(), 1.0)
+                cg = counts.clamp(min=1.0).to(dtype)
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                m_le = m_resid = m_lf = m_lv = m_ls = None
 
-                if e_mask.any():
-                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    loss = loss + cur_pref_e * (diff_e ** 2).sum() * ws / n_e_g
+                if batch["has_e"]:
+                    de = (e_pa_pred - e_pa_ref) * emf
+                    loss = loss + cur_pref_e * (de ** 2).sum() * ws / cg[0]
                     e_pa_pred_m = result_m["Etot"] / batch["natoms"]
-                    diff_e_m = e_pa_pred_m[e_mask] - e_pa_ref[e_mask]
-                    sum_le += (diff_e_m ** 2).sum().item()  # global SSE
+                    dem = (e_pa_pred_m - e_pa_ref) * emf
+                    m_le = (dem ** 2).sum()      # global SSE
                     # Signed residual for the analytical b1 update (folded into
                     # this pass; all-reduced below with the other metrics).
-                    sum_e_resid += diff_e_m.sum().item()
+                    m_resid = dem.sum()
 
-                if f_mask is not None and f_mask.any():
-                    f_ref = batch["forces"][f_mask]
-                    sum_sq_f = ((result["forces"][f_mask] - f_ref) ** 2).sum()
+                if fmf is not None and batch["has_f"]:
+                    df = (result["forces"] - batch["forces"]) * fmf
                     # 3 components per atom -> divide by (3 * n_f_g)
-                    loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
-                    sum_lf += ((((result_m["forces"][f_mask] - f_ref) ** 2)
-                                .sum().item() / 3.0)
-                               if result_m is not result
-                               else (sum_sq_f.item() / 3.0))
+                    loss = loss + cur_pref_f * (df ** 2).sum() * ws / (3.0 * cg[1])
+                    dfm = ((result_m["forces"] - batch["forces"]) * fmf
+                           if result_m is not result else df)
+                    m_lf = (dfm ** 2).sum() / 3.0
 
-                if v_mask is not None and v_mask.any() and "virial" in result:
+                if (vmf is not None and batch["has_v"] and "virial" in result
+                        and batch["virial"].shape[1] == 9):
+                    na = batch["natoms"].unsqueeze(-1)
+
                     def _v_pred_pa(res):
                         v_sys = torch.zeros(batch["num_structures"], 9,
                                             dtype=dtype, device=dev)
                         si = batch["struct_idx"].unsqueeze(-1).expand_as(
                             res["virial"])
                         v_sys.scatter_add_(0, si, res["virial"])
-                        na = batch["natoms"][v_mask].unsqueeze(-1)
-                        return v_sys[:, _VIRIAL_6][v_mask] / na
-                    v_ref = batch["virial"]
-                    if v_ref.shape[1] == 9:
-                        na = batch["natoms"][v_mask].unsqueeze(-1)
-                        # 6 unique components only (see _VIRIAL_6); all 9 would
-                        # weight the symmetric off-diagonals twice.
-                        v_pred_pa = _v_pred_pa(result)
-                        v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                        # 6 components per frame -> divide by (6 * n_v_g)
-                        loss = (loss + cur_pref_v
-                                * ((v_pred_pa - v_ref_pa) ** 2).sum()
-                                * ws / (6.0 * n_v_g))
-                        v_diff = (_v_pred_pa(result_m)
-                                  if result_m is not result
-                                  else v_pred_pa) - v_ref_pa
-                        sum_lv += ((v_diff ** 2).sum().item() / 6.0)
-                        # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
-                        scale = (batch["natoms"][v_mask]
-                                 / batch["volumes"][v_mask]).unsqueeze(-1)
-                        sum_sq_s = ((v_diff * scale) ** 2).sum()
-                        sum_ls += (sum_sq_s.item() / 6.0)
+                        return v_sys[:, _VIRIAL_6] / na
+                    # 6 unique components only (see _VIRIAL_6); all 9 would
+                    # weight the symmetric off-diagonals twice.
+                    v_pred_pa = _v_pred_pa(result)
+                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    dv = (v_pred_pa - v_ref_pa) * vmf
+                    # 6 components per frame -> divide by (6 * n_v_g)
+                    loss = loss + cur_pref_v * (dv ** 2).sum() * ws / (6.0 * cg[2])
+                    dvm = ((_v_pred_pa(result_m) if result_m is not result
+                            else v_pred_pa) - v_ref_pa) * vmf
+                    m_lv = (dvm ** 2).sum() / 6.0
+                    # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
+                    # clamp: masked-out frames may carry volume 0 — their
+                    # contribution is already zeroed by the mask factor.
+                    scale = (batch["natoms"]
+                             / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
+                    m_ls = ((dvm * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
                 if max_grad_norm > 0:
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm).item()
+                    gn_t = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
                 else:
-                    gn = torch.sqrt(sum(
+                    gn_t = torch.sqrt(sum(
                         p.grad.norm() ** 2 for p in raw_model.parameters()
-                        if p.grad is not None)).item()
+                        if p.grad is not None))
 
-                if not np.isfinite(gn):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-
-                optimizer.step()
+                if async_guard:
+                    # GPU-side non-finite skip via the fused-Adam AMP hook —
+                    # see train_nep. NOTE: with the sync guard each rank
+                    # could in principle skip independently (a latent
+                    # lock-step hazard); the async flag keeps every rank
+                    # stepping, so collectives always stay aligned.
+                    bad = (~torch.isfinite(gn_t)).to(dtype)
+                    optimizer.found_inf = bad
+                    optimizer.step()
+                    n_bad_t += bad
+                    ok_f = (1.0 - bad).to(torch.float64)
+                else:
+                    gn = float(gn_t)
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    ok_f = 1.0
 
                 if in_stage2 and swa_model is not None and is_main:
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().item()
-                sum_f_atoms += batch["force_mask"].sum().item()
-                sum_v_structs += batch["virial_mask"].sum().item()
-                max_gn = max(max_gn, gn)
+                zero64 = acc.new_zeros(())
+                acc += ok_f * torch.stack([
+                    m_le.double() if m_le is not None else zero64,
+                    m_lf.double() if m_lf is not None else zero64,
+                    m_lv.double() if m_lv is not None else zero64,
+                    m_ls.double() if m_ls is not None else zero64,
+                    (batch["energy_mask"].sum().double()
+                     if m_le is not None else zero64),
+                    (batch["force_mask"].sum().double()
+                     if m_lf is not None else zero64),
+                    (batch["virial_mask"].sum().double()
+                     if m_lv is not None else zero64),
+                    m_resid.double() if m_resid is not None else zero64,
+                ])
+                max_gn_t = torch.maximum(
+                    max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
 
-            metrics = torch.tensor(
-                [sum_le, sum_lf, sum_lv, sum_ls,
-                 float(sum_e_structs), float(sum_f_atoms),
-                 float(sum_v_structs), sum_e_resid],
-                device=dev)
-            dist.all_reduce(metrics)
-            gn_t = torch.tensor(max_gn, device=dev)
-            dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
+            # One epoch-level all-reduce + fetch of the device accumulators
+            # (the only metric sync of the epoch).
+            dist.all_reduce(acc)
+            dist.all_reduce(max_gn_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(n_bad_t, op=dist.ReduceOp.MAX)
             (sum_le, sum_lf, sum_lv, sum_ls,
              sum_e_structs, sum_f_atoms, sum_v_structs,
-             sum_e_resid) = metrics.tolist()
-            max_gn = gn_t.item()
+             sum_e_resid) = acc.tolist()
+            max_gn = float(max_gn_t)
+            if is_main and int(n_bad_t):
+                _log(f"  warning: {int(n_bad_t)} step(s) skipped this epoch "
+                     f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass and
             # all-reduced above — identical on every rank. Updated before the

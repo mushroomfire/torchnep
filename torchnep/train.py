@@ -318,11 +318,16 @@ class StreamDataStore:
         self.forces = list(torch.split(self._f_all, self.natoms))
         self.virial = list(torch.unbind(self._v_all, dim=0))
 
-        # Tiny (n,) tensor; kept on device (collate indexes it with a
-        # device tensor and predict calls .cpu() on it).
+        # Device copy is kept for predict_from_store (which calls .cpu() on
+        # it); collate gathers from the CPU copy and ships the gathered
+        # slice through the same pinned/async channel as every other field —
+        # indexing the device copy with a pageable index tensor would force
+        # a full compute-stream drain per batch (a hidden ~5-10 ms/step
+        # sync, the single largest pipeline stall found by profiling).
         vol_cat = np.asarray([s.get("volume", 0.0) for s in structures],
                              dtype=np_dtype)
-        self.volumes = torch.from_numpy(vol_cat).to(device=device, dtype=dtype)
+        self._vol_cpu = torch.from_numpy(vol_cat).to(dtype)
+        self.volumes = self._vol_cpu.to(device=device)
 
         self._e_flag_t = torch.tensor(self.has_energy_flag, dtype=torch.bool)
         self._f_flag_t = torch.tensor(self.has_forces_flag, dtype=torch.bool)
@@ -405,6 +410,14 @@ class StreamDataStore:
                 self._f_flag_t[idx_t], nat_t)),
             "virial": _stage(self._v_all[idx_t].to(self.dtype)),
             "virial_mask": _stage(self._v_flag_t[idx_t]),
+            "volumes": _stage(self._vol_cpu[idx_t]),
+            # CPU-side mask summaries: the training loop branches on
+            # "does this batch have any energy/force/virial labels" — as
+            # host bools they cost nothing, while `mask.any()` on the
+            # device tensor would drain the compute stream every step.
+            "has_e": bool(self._e_flag_t[idx_t].any()),
+            "has_f": bool(self._f_flag_t[idx_t].any()),
+            "has_v": bool(self._v_flag_t[idx_t].any()),
         }
         if noise_sigma > 0.0:
             out["pos_noise"] = _stage(
@@ -415,7 +428,7 @@ class StreamDataStore:
     _DEVICE_KEYS = ("atom_types", "struct_idx", "pair_i_rad", "pair_j_rad",
                     "rij_rad", "pair_i_ang", "pair_j_ang", "rij_ang",
                     "energy", "natoms", "energy_mask", "forces",
-                    "force_mask", "virial", "virial_mask")
+                    "force_mask", "virial", "virial_mask", "volumes")
 
     def _basis_impl(self, rij_r, rij_a):
         """Per-batch Chebyshev/angular basis.
@@ -452,13 +465,13 @@ class StreamDataStore:
         """Device half of collate: ship the staged host tensors to the
         device (async — they are pinned) and compute the batch's basis."""
         dev = self.device
-        batch = {"N": staged["N"], "num_structures": staged["num_structures"]}
+        batch = {"N": staged["N"], "num_structures": staged["num_structures"],
+                 "has_e": staged["has_e"], "has_f": staged["has_f"],
+                 "has_v": staged["has_v"]}
         for key in self._DEVICE_KEYS:
             t = staged[key]
             batch[key] = (t.to(dev, non_blocking=True) if self._pin
                           else t.to(dev))
-        batch["volumes"] = self.volumes[staged["idx_t"].to(dev)]
-
         if "pos_noise" in staged:
             # rij for pair (i, j) is r_j - r_i, so a per-atom displacement d
             # perturbs it by d_j - d_i — the same d for the radial and
@@ -545,13 +558,61 @@ def iter_collated(data_store, index_lists, noise_gen=None,
                          name="torchnep-stream-prefetch")
     t.start()
     try:
+        if data_store.device.type != "cuda":
+            while True:
+                tag, payload = q.get()
+                if tag == "done":
+                    break
+                if tag == "err":
+                    raise payload
+                yield data_store._finalize(payload)
+            return
+
+        # CUDA: run the device half (H2D + basis kernels) one batch AHEAD
+        # on a dedicated side stream, so the copy engine and the basis
+        # kernels overlap the caller's compute on the current batch
+        # instead of queueing behind it on the compute stream. Handing a
+        # batch over = make the consumer stream wait on the side stream's
+        # event, then record_stream every tensor so the caching allocator
+        # cannot recycle side-stream allocations while consumer kernels
+        # still read them. Batch contents and order are unchanged — only
+        # WHERE/WHEN the copies and basis kernels run moves.
+        side = torch.cuda.Stream(device=data_store.device)
+
+        def _finalize_ahead(staged):
+            with torch.cuda.stream(side):
+                batch = data_store._finalize(staged)
+                ev = torch.cuda.Event()
+                ev.record(side)
+            return batch, ev
+
+        def _hand_over(item):
+            batch, ev = item
+            cur = torch.cuda.current_stream()
+            cur.wait_event(ev)
+            for v in batch.values():
+                if torch.is_tensor(v) and v.is_cuda:
+                    v.record_stream(cur)
+            clean = batch.get("_clean")
+            if clean is not None:
+                for v in clean.values():
+                    if torch.is_tensor(v) and v.is_cuda:
+                        v.record_stream(cur)
+            return batch
+
+        pending = None
         while True:
             tag, payload = q.get()
-            if tag == "done":
-                break
             if tag == "err":
                 raise payload
-            yield data_store._finalize(payload)
+            if tag == "done":
+                break
+            item = _finalize_ahead(payload)
+            if pending is not None:
+                yield _hand_over(pending)
+            pending = item
+        if pending is not None:
+            yield _hand_over(pending)
     finally:
         stop.set()
         # Unblock the worker if it is waiting on a full queue.
@@ -1811,6 +1872,15 @@ def train_nep(
 
     train_t0 = time.time()
 
+    # Non-finite-gradient guard flavour: with a fused CUDA optimizer the
+    # skip runs GPU-side via the AMP found_inf hook (no per-step host
+    # sync — the sync otherwise costs a full launch-pipeline stall every
+    # step); anywhere else the classic synchronous check runs.
+    async_guard = (dev.type == "cuda"
+                   and optimizer.param_groups[0].get("fused", False)
+                   and getattr(optimizer, "_step_supports_amp_scaling",
+                               False))
+
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
@@ -1824,11 +1894,14 @@ def train_nep(
             g.manual_seed(run_seed + epoch)
             perm = torch.randperm(n_structs, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = 0.0
-            sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
-            max_gn = 0.0
+            # Metric accumulators live on the DEVICE and are fetched once
+            # per epoch — per-step .item() reads would stall the launch
+            # pipeline (the CPU must run a full step ahead of the GPU for
+            # the streamed collate + kernel launches to hide).
+            # Layout: [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
+            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            max_gn_t = torch.zeros((), dtype=dtype, device=dev)
+            n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1950,84 +2023,132 @@ def train_nep(
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                e_mask = batch["energy_mask"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                # sum_l* accumulates per-batch MSE so the rmse_* columns in
-                # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
-                if e_mask.any():
-                    loss_e = _loss_fn(e_pa_pred[e_mask], e_pa_ref[e_mask])
-                    loss = loss + cur_pref_e * loss_e
+                # Loss + metrics are built BRANCHLESSLY (masked weighted
+                # sums, host-side has_* flags) and kept as device scalars:
+                # boolean-mask indexing or `.any()` here would drain the
+                # compute stream mid-step. The scalars are fetched together
+                # AFTER the one unavoidable sync (the grad-norm guard), where
+                # the reads are free. Same math as the old masked-select
+                # form: sum(d^2 * mask) / sum(mask) == mean over selected.
+                m_le = m_resid = m_lf = m_lv = m_ls = None
+                if batch["has_e"]:
+                    emf = batch["energy_mask"].to(dtype)
+                    ne_b = emf.sum()
+                    de = (e_pa_pred - e_pa_ref) * emf
+                    loss = loss + cur_pref_e * ((de ** 2).sum() / ne_b)
                     e_pa_pred_m = result_m["Etot"] / batch["natoms"]
-                    diff_e = e_pa_pred_m[e_mask] - e_pa_ref[e_mask]
-                    sum_le += (diff_e ** 2).mean().item() * e_mask.sum().item()
-                    # Accumulate the signed residual for the analytical b1
-                    # update (folded into this pass — no extra forward).
-                    sum_e_resid += diff_e.sum().item()
+                    dem = (e_pa_pred_m - e_pa_ref) * emf
+                    m_le = (dem ** 2).sum()
+                    # Signed residual for the analytical b1 update (folded
+                    # into this pass — no extra forward).
+                    m_resid = dem.sum()
 
-                if has_forces:
-                    f_mask = batch["force_mask"]
-                    if f_mask.any():
-                        loss_f = _loss_fn(result["forces"][f_mask],
-                                          batch["forces"][f_mask])
-                        loss = loss + cur_pref_f * loss_f
-                        f_pred = result_m["forces"][f_mask]
-                        f_ref = batch["forces"][f_mask]
-                        sum_lf += ((f_pred - f_ref) ** 2).mean().item() * f_mask.sum().item()
+                if has_forces and batch["has_f"]:
+                    fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
+                    nf_b = fmf.sum()
+                    df = (result["forces"] - batch["forces"]) * fmf
+                    loss = loss + cur_pref_f * ((df ** 2).sum() / (3.0 * nf_b))
+                    dfm = (result_m["forces"] - batch["forces"]) * fmf
+                    m_lf = (dfm ** 2).sum() / 3.0
 
-                if has_virial and "virial" in result:
-                    v_mask = batch["virial_mask"]
-                    if v_mask.any():
-                        def _v_pred_pa(res):
-                            v_sys = torch.zeros(batch["num_structures"], 9,
-                                                dtype=dtype, device=dev)
-                            si = batch["struct_idx"].unsqueeze(-1).expand_as(
-                                res["virial"])
-                            v_sys.scatter_add_(0, si, res["virial"])
-                            na = batch["natoms"][v_mask].unsqueeze(-1)
-                            return v_sys[:, _VIRIAL_6][v_mask] / na
-                        v_ref = batch["virial"]
-                        if v_ref.shape[1] == 9:
-                            na = batch["natoms"][v_mask].unsqueeze(-1)
-                            # 6 unique components only (see _VIRIAL_6).
-                            v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                            v_pred_pa = _v_pred_pa(result)
-                            loss_v = _loss_fn(v_pred_pa, v_ref_pa)
-                            loss = loss + cur_pref_v * loss_v
-                            v_diff = (_v_pred_pa(result_m)
-                                      if result_m is not result
-                                      else v_pred_pa) - v_ref_pa
-                            sum_lv += (v_diff ** 2).mean().item() * v_mask.sum().item()
-                            # Stress RMSE (eV/A**3): convert the same diff using
-                            # per-frame (natoms/volume). Sign cancels under MSE.
-                            scale = (batch["natoms"][v_mask]
-                                     / batch["volumes"][v_mask]).unsqueeze(-1)
-                            s_diff = v_diff * scale
-                            sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
+                if (has_virial and "virial" in result and batch["has_v"]
+                        and batch["virial"].shape[1] == 9):
+                    vmf = batch["virial_mask"].to(dtype).unsqueeze(-1)
+                    nv_b = vmf.sum()
+                    na = batch["natoms"].unsqueeze(-1)
+
+                    def _v_pred_pa(res):
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                            res["virial"])
+                        v_sys.scatter_add_(0, si, res["virial"])
+                        return v_sys[:, _VIRIAL_6] / na
+                    # 6 unique components only (see _VIRIAL_6).
+                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    v_pred_pa = _v_pred_pa(result)
+                    dv = (v_pred_pa - v_ref_pa) * vmf
+                    loss = loss + cur_pref_v * ((dv ** 2).sum() / (6.0 * nv_b))
+                    dvm = ((_v_pred_pa(result_m) if result_m is not result
+                            else v_pred_pa) - v_ref_pa) * vmf
+                    m_lv = (dvm ** 2).sum() / 6.0
+                    # Stress RMSE (eV/A**3): convert the same diff using
+                    # per-frame (natoms/volume). Sign cancels under MSE.
+                    # clamp: masked-out frames may carry volume 0 — their
+                    # contribution is already zeroed by the mask factor.
+                    scale = (batch["natoms"]
+                             / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
+                    m_ls = ((dvm * scale) ** 2).sum() / 6.0
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
                 if max_grad_norm > 0:
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm).item()
+                    gn_t = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
                 else:
-                    gn = torch.sqrt(sum(
+                    gn_t = torch.sqrt(sum(
                         p.grad.norm()**2 for p in raw_model.parameters()
-                        if p.grad is not None)).item()
+                        if p.grad is not None))
 
-                if not np.isfinite(gn):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-
-                optimizer.step()
+                if async_guard:
+                    # Non-finite-gradient protection WITHOUT a host sync:
+                    # the fused Adam kernel skips the whole update GPU-side
+                    # when ``found_inf`` is nonzero (the AMP mechanism), so
+                    # the parameters are protected exactly as with the
+                    # synchronous skip. Divergence from the sync path only
+                    # on the (pathological, ~never) bad step itself: SWA
+                    # still averages the (unchanged) weights, and that
+                    # step's metrics are excluded via the same flag.
+                    bad = (~torch.isfinite(gn_t)).to(dtype)
+                    optimizer.found_inf = bad
+                    optimizer.step()
+                    n_bad_t += bad
+                    ok_f = (1.0 - bad).to(torch.float64)
+                else:
+                    gn = float(gn_t)
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    ok_f = 1.0
 
                 if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().item()
-                sum_f_atoms += batch["force_mask"].sum().item()
-                sum_v_structs += batch["virial_mask"].sum().item()
-                max_gn = max(max_gn, gn)
+                # Device-side metric accumulation — one fused add per step,
+                # fetched once per epoch. Bad steps contribute zero via ok_f
+                # (consistently for sums AND counts).
+                zero64 = acc.new_zeros(())
+                acc += ok_f * torch.stack([
+                    m_le.double() if m_le is not None else zero64,
+                    m_lf.double() if m_lf is not None else zero64,
+                    m_lv.double() if m_lv is not None else zero64,
+                    m_ls.double() if m_ls is not None else zero64,
+                    (batch["energy_mask"].sum().double()
+                     if m_le is not None else zero64),
+                    (batch["force_mask"].sum().double()
+                     if m_lf is not None else zero64),
+                    (batch["virial_mask"].sum().double()
+                     if m_lv is not None else zero64),
+                    m_resid.double() if m_resid is not None else zero64,
+                ])
+                max_gn_t = torch.maximum(
+                    max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
+
+            # One epoch-level fetch of every device accumulator (the only
+            # metric sync of the epoch).
+            (sum_le, sum_lf, sum_lv, sum_ls, n_e_f, n_f_f, n_v_f,
+             sum_e_resid) = acc.tolist()
+            sum_e_structs = int(round(n_e_f))
+            sum_f_atoms = int(round(n_f_f))
+            sum_v_structs = int(round(n_v_f))
+            max_gn = float(max_gn_t)
+            n_bad = int(n_bad_t)
+            if n_bad:
+                _log(f"  warning: {n_bad} step(s) skipped this epoch "
+                     f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
             # absorbs this epoch's mean per-atom energy residual. Updated AFTER
