@@ -662,7 +662,13 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
     max_rc = max(rc_rad, rc_ang)
 
     if n_workers is None:
-        cpu_total = os.cpu_count() or 1
+        # sched_getaffinity respects cgroup/slurm CPU limits;
+        # os.cpu_count() reports the whole node and oversubscribes the
+        # allocation (e.g. 80 workers fighting over a 24-core cgroup).
+        try:
+            cpu_total = len(os.sched_getaffinity(0))
+        except AttributeError:          # non-Linux
+            cpu_total = os.cpu_count() or 1
         local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
         n_workers = max(1, cpu_total // local_world)
         n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
