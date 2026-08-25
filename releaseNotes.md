@@ -1,5 +1,19 @@
 # Release Notes
 
+## 1.0.3a1
+
+- **Streamed shard loading** (`train_nep_sharded`): each rank reads only
+  its own byte range of the xyz file (auto for files ≥ 2 GiB,
+  `TORCHNEP_STREAM_THRESHOLD` to override). Bit-identical results;
+  stratified validation split falls back to random.
+- **Fix multi-node DDP backend**: the GPU-sharing check now counts ranks
+  per node (`LOCAL_WORLD_SIZE` / `SLURM_NTASKS_PER_NODE`) instead of
+  globally, so multi-node jobs use NCCL/RCCL; gloo stays the CPU /
+  GPU-sharing fallback.
+- **`predict_dataset`**: `dtype` default `float32`; `batch_size=None`
+  auto-sizes from free GPU memory with OOM retry; prints an E/F/V
+  RMSE/MAE table.
+
 ## 1.0.2
 
 Defaults changed:

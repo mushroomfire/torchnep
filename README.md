@@ -361,8 +361,6 @@ predict_dataset(
     "nep.txt",
     "test.xyz",
     output_dir="results",
-    dtype="float32",       # float32 or float64
-    batch_size=500,
     output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
 )
 # writes energy_train.out, force_train.out, virial_train.out,

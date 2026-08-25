@@ -68,6 +68,13 @@ def _register_pg_atexit():
 
     def _cleanup():
         if dist.is_available() and dist.is_initialized():
+            # Rendezvous before tearing down: rank 0 hosts the TCPStore, and
+            # if it exits first the other ranks' NCCL heartbeat monitors spam
+            # "failed to recv" warnings while polling the dead store.
+            try:
+                dist.barrier()
+            except Exception:
+                pass
             dist.destroy_process_group()
 
     atexit.register(_cleanup)
@@ -284,7 +291,7 @@ def train_nep_sharded(
     # Wrap local_rank around the number of visible GPUs — lets several
     # processes share one GPU (useful for locally simulating multi-rank DDP).
     # NCCL refuses to share a GPU across ranks, so fall back to gloo (slower
-    # but correct) when world_size > available GPUs.
+    # but correct) when the ranks on this node outnumber its GPUs.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     cuda_available = torch.cuda.is_available()
     n_gpus = torch.cuda.device_count() if cuda_available else 0
@@ -297,7 +304,18 @@ def train_nep_sharded(
         dev = torch.device("cpu")
     if not dist.is_initialized():
         world_size_env = int(os.environ.get("WORLD_SIZE", 1))
-        ddp_backend = "nccl" if cuda_available and world_size_env <= n_gpus else "gloo"
+        # GPU sharing is a per-NODE question: on a multi-node run each node
+        # hosts LOCAL_WORLD_SIZE ranks (torchrun sets it; srun-style
+        # launchers expose SLURM_NTASKS_PER_NODE), and NCCL is fine as long
+        # as no two ranks on one node share a GPU. Comparing the GLOBAL
+        # world size against the local GPU count (the old heuristic) forced
+        # every multi-node run onto gloo.
+        local_world_env = int(
+            os.environ.get("LOCAL_WORLD_SIZE",
+                           os.environ.get("SLURM_NTASKS_PER_NODE",
+                                          world_size_env)))
+        ddp_backend = ("nccl" if cuda_available and local_world_env <= n_gpus
+                       else "gloo")
         # Pass device_id so NCCL can bind the rank to its CUDA device
         # deterministically (silences "Guessing device ID based on global
         # rank" and the collective-context warnings, and prevents hangs on
@@ -424,9 +442,124 @@ def train_nep_sharded(
     # ---- Data: each rank loads 1/world_size of structures ----------------
     _log("Data")
     _log("----")
-    frames = read_xyz(data_file, energy_key=energy_key)
-    _log(f"  read {len(frames)} structures from {data_file} "
-         f"(energy label: {energy_key})")
+
+    # Streamed shard loading for large files: rank 0 makes one index pass
+    # (byte offset + natoms per frame, no parsing), broadcasts the offsets,
+    # and every rank then seek-reads ONLY its own frames. This replaces the
+    # old "every rank parses the whole file" path, whose readlines() line
+    # list alone costs tens of GB per rank on a multi-10-GB file.
+    _STREAM_THRESHOLD = int(os.environ.get("TORCHNEP_STREAM_THRESHOLD",
+                                           2 * 1024 ** 3))
+    streamed = os.path.getsize(data_file) >= _STREAM_THRESHOLD
+    _stream_valid_local = None
+    _slim_keep = None
+    if streamed:
+        from .data import index_xyz, read_xyz_at
+        bcast_dev = dev if dist.get_backend() == "nccl" else torch.device("cpu")
+        if is_main:
+            t0 = time.time()
+            offs_np, _nat_np = index_xyz(data_file)
+            _log(f"  indexed {len(offs_np)} structures from {data_file} in "
+                 f"{time.time() - t0:.1f}s (streamed shard loading, "
+                 f"{os.path.getsize(data_file) / 2**30:.1f} GiB; "
+                 f"energy label: {energy_key})")
+            n_all_t = torch.tensor([len(offs_np)], dtype=torch.long,
+                                   device=bcast_dev)
+        else:
+            n_all_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+        dist.broadcast(n_all_t, 0)
+        n_all = int(n_all_t.item())
+        offs_t = torch.empty(n_all, dtype=torch.long, device=bcast_dev)
+        if is_main:
+            offs_t.copy_(torch.from_numpy(offs_np).to(bcast_dev))
+        dist.broadcast(offs_t, 0)
+        offs_all = offs_t.cpu().numpy()
+        del offs_t
+
+        if valid_file is not None and valid_ratio is not None:
+            raise ValueError(
+                "valid_file and valid_ratio are mutually exclusive")
+        val_idx_s = None
+        if valid_ratio is not None:
+            if valid_strategy == "stratified":
+                _log("  streamed loader: the stratified valid split needs "
+                     "full-file metadata — using the random strategy "
+                     "(same run_seed) for this large file")
+            train_idx_s, val_idx_s = valid_split_indices(
+                n_all, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx_s)} "
+                 f"frames for validation, {len(train_idx_s)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            train_idx_s = np.arange(n_all)
+        train_offs = offs_all[np.asarray(train_idx_s, dtype=np.int64)]
+        n_total = len(train_offs)
+
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        if pad:
+            global_perm = global_perm + global_perm[:pad]
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        t0 = time.time()
+        frames = None
+        local_frames = read_xyz_at(
+            data_file, train_offs[np.asarray(local_global_idx)],
+            energy_key=energy_key)
+        _log(f"  parsed local shard ({len(local_frames)} frames) in "
+             f"{time.time() - t0:.1f}s")
+
+        valid_frames = None
+        n_valid_total = 0
+        valid_local_global_idx = None
+        if val_idx_s is not None and len(val_idx_s):
+            n_valid_total = len(val_idx_s)
+            voffs = offs_all[np.asarray(val_idx_s, dtype=np.int64)]
+            vsh_g = torch.Generator()
+            vsh_g.manual_seed(0)
+            vperm_sh = torch.randperm(n_valid_total,
+                                      generator=vsh_g).tolist()
+            n_vlocal = (n_valid_total + world_size - 1) // world_size
+            vpad = n_vlocal * world_size - n_valid_total
+            if vpad:
+                vperm_sh = vperm_sh + vperm_sh[:vpad]
+            valid_local_global_idx = \
+                vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
+            _stream_valid_local = read_xyz_at(
+                data_file, voffs[np.asarray(valid_local_global_idx)],
+                energy_key=energy_key)
+
+        if slim_types:
+            # Global species union from the local shards (bitmask MAX).
+            present = torch.zeros(len(orig_config["type_names"]),
+                                  dtype=torch.long, device=dev)
+            name_pos = {t: i for i, t in
+                        enumerate(orig_config["type_names"])}
+            for f_ in local_frames + (_stream_valid_local or []):
+                for s in set(f_["species"]):
+                    present[name_pos[s]] = 1
+            dist.all_reduce(present, op=dist.ReduceOp.MAX)
+            keep = [t for i, t in enumerate(orig_config["type_names"])
+                    if int(present[i])]
+            removed = [t for t in orig_config["type_names"]
+                       if t not in keep]
+            if removed:
+                _slim_keep = keep
+                config = dict(orig_config)
+                config["type_names"] = keep
+                config["num_types"] = len(keep)
+                _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
+                     f"(removing: {removed})")
+            else:
+                _log("  slim_types: all types present in data, "
+                     "nothing to remove")
+
+    if not streamed:
+        frames = read_xyz(data_file, energy_key=energy_key)
+        _log(f"  read {len(frames)} structures from {data_file} "
+             f"(energy label: {energy_key})")
 
     # ---- Validation set (same semantics as train_nep) ---------------------
     # The ratio split draws from run_seed via a dedicated generator —
@@ -434,12 +567,13 @@ def train_nep_sharded(
     # on the partition. Sorted indices keep *_test.out rows in input order.
     if valid_file is not None and valid_ratio is not None:
         raise ValueError("valid_file and valid_ratio are mutually exclusive")
-    valid_frames = None
+    if not streamed:
+        valid_frames = None
     if valid_file is not None:
         valid_frames = read_xyz(valid_file, energy_key=energy_key)
         _log(f"  read {len(valid_frames)} validation structures "
              f"from {valid_file}")
-    elif valid_ratio is not None:
+    elif not streamed and valid_ratio is not None:
         # Same draw as export_valid_split / train_nep (see data.py).
         if valid_strategy == "stratified":
             metas = [(f["natoms"], f["species"]) for f in frames]
@@ -465,11 +599,11 @@ def train_nep_sharded(
             raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
         valid_frames = [frames[i] for i in val_idx]
         frames = [frames[i] for i in train_idx]
-    n_total = len(frames)
+    if not streamed:
+        n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
-    _slim_keep = None
-    if slim_types:
+    if not streamed and slim_types:
         seen_species = set(s for f in frames for s in f["species"])
         if valid_frames is not None:
             seen_species |= set(s for f in valid_frames
@@ -497,19 +631,20 @@ def train_nep_sharded(
     # both numerator and denominator), and the predict scatter writes
     # identical values into the duplicated slots, so output is loss-fair
     # and complete.
-    shuffle_g = torch.Generator()
-    shuffle_g.manual_seed(0)
-    global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
-    n_local = (n_total + world_size - 1) // world_size  # ceil
-    pad = n_local * world_size - n_total
-    if pad:
-        global_perm = global_perm + global_perm[:pad]
-    local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
-    local_frames = [frames[i] for i in local_global_idx]
+    if not streamed:
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        if pad:
+            global_perm = global_perm + global_perm[:pad]
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        local_frames = [frames[i] for i in local_global_idx]
     pad_note = (f", {pad} frame(s) duplicated for even split"
                 if pad else "")
     _log(f"  sharded across {world_size} ranks: "
-         f"{n_local} frames per rank{pad_note}")
+         f"{len(local_frames)} frames per rank{pad_note}")
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
@@ -535,8 +670,13 @@ def train_nep_sharded(
     # both numerator and denominator of the all-reduced sums — loss-fair,
     # same argument as the training shards).
     structures_v = None
-    valid_local_global_idx = None
-    n_valid_total = 0
+    if not streamed or valid_frames is not None:
+        valid_local_global_idx = None
+        n_valid_total = 0
+    if _stream_valid_local is not None:
+        structures_v = preprocess_structures(_stream_valid_local, config,
+                                             np_dtype)
+        del _stream_valid_local
     if valid_frames is not None:
         n_valid_total = len(valid_frames)
         vsh_g = torch.Generator()

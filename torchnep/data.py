@@ -124,6 +124,60 @@ def _split_frames(lines):
     return blocks
 
 
+def index_xyz(filename: str):
+    """Single streaming pass over an extended-XYZ file: frame index only.
+
+    Returns ``(offsets, natoms)`` — two int64 numpy arrays with, for every
+    frame, the byte offset of its ``natoms`` line and its atom count. No
+    frame content is parsed and no line list is kept, so the pass runs at
+    I/O speed with O(n_frames) memory — this is what makes multi-rank
+    sharded loading of very large files (tens of GB) feasible: one rank
+    indexes, the offsets are broadcast, and every rank then seek-reads only
+    its own frames (see :func:`read_xyz_at`).
+    """
+    offsets, natoms = [], []
+    with open(filename, "rb") as f:
+        pos = 0
+        line = f.readline()
+        while line:
+            stripped = line.strip()
+            if not stripped:          # tolerate stray blank lines between frames
+                pos = f.tell()
+                line = f.readline()
+                continue
+            n = int(stripped)
+            offsets.append(pos)
+            natoms.append(n)
+            for _ in range(n + 1):
+                f.readline()
+            pos = f.tell()
+            line = f.readline()
+    return (np.asarray(offsets, dtype=np.int64),
+            np.asarray(natoms, dtype=np.int64))
+
+
+def read_xyz_at(filename: str, offsets, energy_key: str = "energy"):
+    """Parse only the frames starting at the given byte offsets.
+
+    ``offsets`` come from :func:`index_xyz`; they may be in any order — the
+    file is swept in ascending-offset order (sequential-friendly for
+    parallel file systems) and the result list matches the ORDER OF
+    ``offsets`` as passed in. Only the requested frames' bytes are read.
+    """
+    offsets = np.asarray(offsets, dtype=np.int64)
+    order = np.argsort(offsets, kind="stable")
+    out = [None] * len(offsets)
+    with open(filename, "rb") as f:
+        for k in order:
+            f.seek(int(offsets[k]))
+            first = f.readline()
+            n = int(first)
+            block = [first.decode()]
+            block.extend(f.readline().decode() for _ in range(n + 1))
+            out[int(k)] = _parse_frame_block(block, energy_key=energy_key)
+    return out
+
+
 def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
     """Read extended XYZ file (GPUMD format).
 

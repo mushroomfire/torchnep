@@ -88,9 +88,9 @@ def predict_dataset(
     model_file: str,
     xyz_file: str,
     output_dir: str = ".",
-    dtype: str = "float64",
+    dtype: str = "float32",
     device: str = None,
-    batch_size: int = 1000,
+    batch_size: int = None,
     verbose: bool = True,
     energy_key: str = "energy",
     output_descriptor: int = 0,
@@ -107,10 +107,15 @@ def predict_dataset(
         Matches GPUMD's ``output_descriptor`` / ``descriptor.out`` schema.
 
     The format mirrors GPUMD's *_train.out files, so the two can be diffed
-    column by column.
+    column by column. When reference labels are present, a summary of the
+    energy/force/virial RMSE and MAE is printed at the end.
 
     Parameters
     ----------
+    batch_size : int or None
+        Frames per compute batch. ``None`` (default) sizes the batch
+        automatically from the device's free memory and the dataset's
+        average pair counts (CUDA/ROCm; other devices fall back to 1000).
     output_descriptor : int
         0 — disabled (default).
         1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
@@ -255,6 +260,41 @@ def predict_dataset(
     natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
     _log(f"  staging:     {time.time() - t0:5.1f}s")
 
+    # Auto batch size: bound the per-batch device footprint by a fraction of
+    # the free memory, using the dataset's average per-frame pair counts and
+    # a conservative bytes-per-pair model of the batch tensors plus the
+    # kernels' intermediates (safety factor absorbs backend differences).
+    if batch_size is None:
+        batch_size = 1000
+        if torch.device(device).type == "cuda":
+            try:
+                free_b, _ = torch.cuda.mem_get_info()
+                esize = 8 if dt == torch.float64 else 4
+                avg_nrad = max(1.0, float(nrad_arr.mean()))
+                avg_nang = max(1.0, float(nang_arr.mean()))
+                avg_nat = max(1.0, float(natoms_arr.mean()))
+                nmax_a = calc.n_max_angular
+                # dominant term: the analytical-force angular intermediates
+                # hold ~(n_max_a+1) x num_lm floats per angular pair, a few
+                # times over.
+                per_frame = (
+                    avg_nrad * (esize * (2 * (basis_r + 1) + 8) + 16)
+                    + avg_nang * (esize * (3 * (nmax_a + 1) * num_lm
+                                           + 2 * (basis_a + 1) + 2 * num_lm
+                                           + 12) + 16)
+                    + avg_nat * esize * 4 * calc.dim)
+                budget = 0.25 * free_b
+                batch_size = int(budget / (3.0 * per_frame))
+                # Throughput is flat beyond a few thousand frames per batch
+                # (measured on V100/MI250X), so cap the auto choice — larger
+                # batches only inflate the memory peak.
+                batch_size = max(16, min(batch_size, n_struct, 16384))
+                _log(f"  batch_size:  auto -> {batch_size} "
+                     f"(free {free_b/2**30:.1f} GiB, "
+                     f"~{per_frame/1024:.0f} KiB/frame est.)")
+            except Exception:
+                pass
+
     # 4) Batched compute loop ------------------------------------------------
     e_pred_arr = np.empty(n_struct, dtype=np.float64)
     f_pred_arr = (np.empty((N_atoms_total, 3), dtype=np.float64)
@@ -272,84 +312,98 @@ def predict_dataset(
 
     t0 = time.time()
     with torch.no_grad():
-        for start in range(0, n_struct, batch_size):
+        start = 0
+        while start < n_struct:
             end = min(start + batch_size, n_struct)
             B = end - start
-            a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
-            r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
-            g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
-            N = a_hi - a_lo
+            try:
+                a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
+                r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
+                g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
+                N = a_hi - a_lo
 
-            atom_types = at_cpu[a_lo:a_hi].to(device)
-            pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
-            pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
-            rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
-            pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
-            pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
-            rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
+                atom_types = at_cpu[a_lo:a_hi].to(device)
+                pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
+                pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
+                rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
+                pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
+                pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
+                rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
 
-            struct_idx = torch.repeat_interleave(
-                torch.arange(B, device=device, dtype=torch.long),
-                natoms_gpu[start:end])
+                struct_idx = torch.repeat_interleave(
+                    torch.arange(B, device=device, dtype=torch.long),
+                    natoms_gpu[start:end])
 
-            dr = torch.norm(rij_r, dim=-1)
-            fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
-            d12inv_r = 1.0 / dr.clamp(min=1e-10)
+                dr = torch.norm(rij_r, dim=-1)
+                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+                d12inv_r = 1.0 / dr.clamp(min=1e-10)
 
-            if rij_a.shape[0] > 0:
-                da = torch.norm(rij_a, dim=-1)
-                fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
-                    da, rc_ang, basis_a)
-                d12inv_a = 1.0 / da.clamp(min=1e-10)
-                blm = ops.angular_basis(
-                    rij_a[:, 0] * d12inv_a,
-                    rij_a[:, 1] * d12inv_a,
-                    rij_a[:, 2] * d12inv_a,
-                    l_max_3b)
-            else:
-                fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                d12inv_a = torch.zeros(0, dtype=dt, device=device)
-                blm = torch.zeros(0, num_lm, dtype=dt, device=device)
-
-            batch = {
-                "N": N, "num_structures": B,
-                "atom_types": atom_types, "struct_idx": struct_idx,
-                "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
-                "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
-                "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-                "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
-                "blm": blm,
-            }
-            result = calc.compute_batch(batch, backend=backend)
-
-            Etot = result["Etot"]
-            v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
-            v_per_frame.scatter_add_(
-                0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
-
-            # Single H2D copy per batch for the per-frame outputs
-            Etot_np = Etot.cpu().numpy()
-            v_np = v_per_frame.cpu().numpy()
-            nat_slice = natoms_arr[start:end].astype(np.float64)
-            e_pred_arr[start:end] = Etot_np / nat_slice
-            v_pred = _virial9_to_6(v_np) / nat_slice[:, None]
-            v_pred_arr[start:end] = v_pred
-
-            if f_pred_arr is not None:
-                f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
-
-            if output_descriptor:
-                # ``compute_batch`` already returns ``q * q_scaler``.
-                desc_np = result["descriptor"].cpu().numpy()
-                if output_descriptor == 2:
-                    d_pred_arr[a_lo:a_hi] = desc_np
+                if rij_a.shape[0] > 0:
+                    da = torch.norm(rij_a, dim=-1)
+                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
+                        da, rc_ang, basis_a)
+                    d12inv_a = 1.0 / da.clamp(min=1e-10)
+                    blm = ops.angular_basis(
+                        rij_a[:, 0] * d12inv_a,
+                        rij_a[:, 1] * d12inv_a,
+                        rij_a[:, 2] * d12inv_a,
+                        l_max_3b)
                 else:
-                    # Per-frame mean: scatter-sum onto frame index then /Na.
-                    sums = np.zeros((B, calc.dim), dtype=np.float64)
-                    si_np = struct_idx.cpu().numpy()
-                    np.add.at(sums, si_np, desc_np)
-                    d_pred_arr[start:end] = sums / natoms_arr[start:end][:, None]
+                    fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    d12inv_a = torch.zeros(0, dtype=dt, device=device)
+                    blm = torch.zeros(0, num_lm, dtype=dt, device=device)
+
+                batch = {
+                    "N": N, "num_structures": B,
+                    "atom_types": atom_types, "struct_idx": struct_idx,
+                    "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
+                    "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
+                    "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
+                    "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
+                    "blm": blm,
+                }
+                result = calc.compute_batch(batch, backend=backend)
+
+                Etot = result["Etot"]
+                v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
+                v_per_frame.scatter_add_(
+                    0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
+
+                # Single H2D copy per batch for the per-frame outputs
+                Etot_np = Etot.cpu().numpy()
+                v_np = v_per_frame.cpu().numpy()
+                nat_slice = natoms_arr[start:end].astype(np.float64)
+                e_pred_arr[start:end] = Etot_np / nat_slice
+                v_pred = _virial9_to_6(v_np) / nat_slice[:, None]
+                v_pred_arr[start:end] = v_pred
+
+                if f_pred_arr is not None:
+                    f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
+
+                if output_descriptor:
+                    # ``compute_batch`` already returns ``q * q_scaler``.
+                    desc_np = result["descriptor"].cpu().numpy()
+                    if output_descriptor == 2:
+                        d_pred_arr[a_lo:a_hi] = desc_np
+                    else:
+                        # Per-frame mean: scatter-sum onto frame index then /Na.
+                        sums = np.zeros((B, calc.dim), dtype=np.float64)
+                        si_np = struct_idx.cpu().numpy()
+                        np.add.at(sums, si_np, desc_np)
+                        d_pred_arr[start:end] = sums / natoms_arr[start:end][:, None]
+            except torch.OutOfMemoryError:
+                # Adaptive backoff: free the pool, halve the batch and
+                # redo this chunk — robust across models/hardware where
+                # any static memory estimate can be off.
+                if batch_size <= 16:
+                    raise
+                torch.cuda.empty_cache()
+                batch_size = max(16, batch_size // 2)
+                _log(f"  OOM at batch of {B} frames -> "
+                     f"retrying with batch_size={batch_size}")
+                continue
+            start = end
 
     if device.startswith("cuda"):
         torch.cuda.synchronize()
@@ -392,6 +446,34 @@ def predict_dataset(
 
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+
+    # ---- Metrics summary vs available reference labels ---------------------
+    if verbose:
+        rows = []
+        de = e_pred_arr - e_ref_pa
+        de = de[np.isfinite(de)]
+        if de.size:
+            rows.append(("Energy (eV/atom)",
+                         np.sqrt(np.mean(de ** 2)), np.mean(np.abs(de)),
+                         f"{de.size} frames"))
+        df = (f_pred_arr - forces_ref).ravel()
+        df = df[np.isfinite(df)]
+        if df.size:
+            rows.append(("Force  (eV/A)",
+                         np.sqrt(np.mean(df ** 2)), np.mean(np.abs(df)),
+                         f"{df.size // 3} atoms"))
+        vmask = virial_ref[:, 0] > _MISSING_VIRIAL / 2
+        dv = (v_pred_arr[vmask] - virial_ref[vmask]).ravel()
+        if dv.size:
+            rows.append(("Virial (eV/atom)",
+                         np.sqrt(np.mean(dv ** 2)), np.mean(np.abs(dv)),
+                         f"{int(vmask.sum())} frames"))
+        if rows:
+            _log("  " + "-" * 58)
+            _log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")
+            for label, rmse, mae, cov in rows:
+                _log(f"  {label:18s} {rmse:12.6f} {mae:12.6f}   ({cov})")
+            _log("  " + "-" * 58)
 
 
 # ---------------------------------------------------------------------------
