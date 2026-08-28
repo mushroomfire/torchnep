@@ -14,12 +14,15 @@
 """
 Full-dataset prediction for NEP models.
 
-Pipeline:
-  1. read_xyz
-  2. preprocess_structures(...)  — multi-process neighbor lists (CPU)
-  3. concatenate all structures into flat tensors uploaded to the GPU once
-  4. batched compute_batch loop (basis recomputed per batch, no host transfer)
-  5. vectorised numpy.savetxt for outputs (per-atom virial matches GPUMD)
+Pipeline (streamed, 1.0.3a2):
+  1. index_xyz — byte offsets + atom counts, one I/O pass, no parsing
+  2. per chunk of ~chunk_atoms atoms: read_xyz_at -> preprocess_structures
+     (multi-process neighbor lists, CPU) -> flat host arrays
+  3. batched compute_batch loop over the chunk (basis recomputed per batch,
+     only the batch slice goes to the device; auto batch size + OOM retry)
+  4. numpy.savetxt appends the chunk's rows (per-atom virial matches GPUMD)
+Host memory is bounded by the chunk, device memory by the batch: any dataset
+finishes on any machine, only the wall time differs.
 """
 
 import os
@@ -28,7 +31,6 @@ import torch
 import numpy as np
 
 from .nep import NEPCalculator
-from .data import read_xyz
 from . import ops
 
 
@@ -84,6 +86,263 @@ def _virial9_to_6(v9):
     return out
 
 
+class _Progress:
+    """Frames-done progress line for predict_dataset: tqdm when installed,
+    otherwise a dependency-free single-line bar. Silent when verbose=False."""
+
+    def __init__(self, total, enabled):
+        self.total, self.enabled, self.n, self.t0 = total, enabled, 0, time.time()
+        self.bar = None
+        if enabled:
+            try:
+                from tqdm import tqdm
+                self.bar = tqdm(total=total, unit="frame", unit_scale=True,
+                                desc="  predict", dynamic_ncols=True, leave=True)
+            except Exception:
+                self.bar = None
+                self._draw()
+
+    def update(self, k):
+        if not self.enabled:
+            return
+        self.n += k
+        if self.bar is not None:
+            self.bar.update(k)
+        else:
+            self._draw()
+
+    def _draw(self):
+        frac = self.n / max(1, self.total); el = time.time() - self.t0
+        eta = el / frac - el if frac > 0 else 0.0
+        width = 30; done = int(width * frac)
+        print(f"\r  predict [{'#' * done}{'-' * (width - done)}] {self.n}/{self.total} frames "
+              f"{100 * frac:5.1f}%  {el:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
+
+    def close(self):
+        if not self.enabled:
+            return
+        if self.bar is not None:
+            self.bar.close()
+        else:
+            print(flush=True)
+
+    def write(self, msg):
+        if not self.enabled:
+            return
+        if self.bar is not None:
+            self.bar.write(msg)
+        else:
+            print("\r" + msg + " " * 20, flush=True); self._draw()
+
+
+def _chunk_bounds(natoms, chunk_atoms, max_frames):
+    """Split frames [0, n) into consecutive chunks holding ~``chunk_atoms`` atoms
+    (at most ``max_frames`` frames, always >= 1 frame). Returns (lo, hi) pairs."""
+    bounds, lo, acc = [], 0, 0
+    for i, n in enumerate(natoms):
+        acc += int(n)
+        if acc >= chunk_atoms or (i + 1 - lo) >= max_frames:
+            bounds.append((lo, i + 1)); lo, acc = i + 1, 0
+    if lo < len(natoms):
+        bounds.append((lo, len(natoms)))
+    return bounds
+
+
+def _chunk_arrays(structures, np_dtype):
+    """Concatenate one chunk of preprocessed structures into flat host arrays."""
+    natoms_arr = np.asarray([s["natoms"] for s in structures], dtype=np.int64)
+    volumes_arr = np.asarray([s.get("volume", 0.0) for s in structures],
+                             dtype=np.float64)
+    nrad_arr = np.asarray([len(s["pair_i_rad"]) for s in structures],
+                          dtype=np.int64)
+    nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
+                          dtype=np.int64)
+    nat_cum = np.concatenate([[0], np.cumsum(natoms_arr)])
+    c = dict(
+        natoms=natoms_arr, volumes=volumes_arr, nrad=nrad_arr, nang=nang_arr,
+        nat_cum=nat_cum,
+        nrad_cum=np.concatenate([[0], np.cumsum(nrad_arr)]),
+        nang_cum=np.concatenate([[0], np.cumsum(nang_arr)]),
+        # Pair indices are global within the chunk (atom positions in the
+        # concatenation); a batch slice only subtracts its first-atom offset.
+        at=np.concatenate([s["atom_types"] for s in structures]),
+        pi_r=np.concatenate([s["pair_i_rad"] + nat_cum[i] for i, s in enumerate(structures)]),
+        pj_r=np.concatenate([s["pair_j_rad"] + nat_cum[i] for i, s in enumerate(structures)]),
+        rij_r=np.concatenate([s["rij_rad"] for s in structures]),
+        pi_a=np.concatenate([s["pair_i_ang"] + nat_cum[i] for i, s in enumerate(structures)]),
+        pj_a=np.concatenate([s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)]),
+        rij_a=np.concatenate([s["rij_ang"] for s in structures]),
+    )
+    n_struct, N_atoms = len(structures), int(nat_cum[-1])
+    c["energy_ref"] = np.array(
+        [s["energy"] if s.get("energy") is not None else np.nan
+         for s in structures], dtype=np.float64)
+    forces_ref = np.full((N_atoms, 3), np.nan, dtype=np.float64)
+    for i, s in enumerate(structures):
+        f = s.get("forces")
+        if f is not None:
+            forces_ref[nat_cum[i]:nat_cum[i + 1]] = np.asarray(f).reshape(-1, 3)
+    c["forces_ref"] = forces_ref
+    # Per-atom reference virial, GPUMD 6-vector (xx yy zz xy yz zx). The
+    # off-diagonal pick matches _virial9_to_6 so both columns share one
+    # definition; frames without a virial carry the -1e6 sentinel.
+    virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
+    for i, s in enumerate(structures):
+        v = s.get("virial")
+        if v is None:
+            continue
+        v = np.asarray(v).flatten()
+        inv_n = 1.0 / float(s["natoms"])
+        if v.size == 9:
+            virial_ref[i] = [v[0] * inv_n, v[4] * inv_n, v[8] * inv_n,
+                             v[1] * inv_n, v[5] * inv_n, v[6] * inv_n]
+        elif v.size >= 6:
+            virial_ref[i] = v[:6] * inv_n
+    c["virial_ref"] = virial_ref
+    return c
+
+
+def _auto_batch_size(calc, dt, chunk, n_struct, log):
+    """Bound the per-batch device footprint by a fraction of the free GPU
+    memory, from the chunk's average per-frame pair counts and a conservative
+    bytes-per-pair model of the batch tensors plus the kernels' intermediates
+    (the safety factor absorbs backend differences). CPU/other devices: 1000."""
+    try:
+        free_b, _ = torch.cuda.mem_get_info()
+    except Exception:
+        return 1000
+    esize = 8 if dt == torch.float64 else 4
+    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
+    num_lm, nmax_a = calc.num_lm, calc.n_max_angular
+    avg_nrad = max(1.0, float(chunk["nrad"].mean()))
+    avg_nang = max(1.0, float(chunk["nang"].mean()))
+    avg_nat = max(1.0, float(chunk["natoms"].mean()))
+    # dominant term: the analytical-force angular intermediates hold
+    # ~(n_max_a+1) x num_lm floats per angular pair, a few times over.
+    per_frame = (avg_nrad * (esize * (2 * (basis_r + 1) + 8) + 16)
+                 + avg_nang * (esize * (3 * (nmax_a + 1) * num_lm
+                                        + 2 * (basis_a + 1) + 2 * num_lm
+                                        + 12) + 16)
+                 + avg_nat * esize * 4 * calc.dim)
+    bs = int(0.25 * free_b / (3.0 * per_frame))
+    # Throughput is flat beyond a few thousand frames per batch (measured on
+    # V100/MI250X), so cap the auto choice — larger batches only inflate the
+    # memory peak.
+    bs = max(16, min(bs, n_struct, 16384))
+    log(f"  batch_size:  auto -> {bs} (free {free_b/2**30:.1f} GiB, "
+        f"~{per_frame/1024:.0f} KiB/frame est.)")
+    return bs
+
+
+def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
+                   output_descriptor, log, progress=None):
+    """Batched compute over one chunk. Returns (e_pred, f_pred, v_pred,
+    d_pred, batch_size) — batch_size may have shrunk after an OOM retry."""
+    n_struct = len(chunk["natoms"]); N_atoms = int(chunk["nat_cum"][-1])
+    nat_cum, nrad_cum, nang_cum = chunk["nat_cum"], chunk["nrad_cum"], chunk["nang_cum"]
+    natoms_arr = chunk["natoms"]
+    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
+    # Host-resident staging: only each batch's slice is shipped to the device
+    # inside the loop, so GPU memory scales with batch_size, not chunk size.
+    at_cpu = torch.from_numpy(chunk["at"])
+    pi_r_cpu, pj_r_cpu = torch.from_numpy(chunk["pi_r"]), torch.from_numpy(chunk["pj_r"])
+    rij_r_cpu = torch.from_numpy(chunk["rij_r"])
+    pi_a_cpu, pj_a_cpu = torch.from_numpy(chunk["pi_a"]), torch.from_numpy(chunk["pj_a"])
+    rij_a_cpu = torch.from_numpy(chunk["rij_a"])
+    natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
+
+    e_pred = np.empty(n_struct, dtype=np.float64)
+    f_pred = np.empty((N_atoms, 3), dtype=np.float64)
+    v_pred = np.empty((n_struct, 6), dtype=np.float64)
+    d_pred = None
+    if output_descriptor == 1:
+        d_pred = np.empty((n_struct, calc.dim), dtype=np.float64)
+    elif output_descriptor == 2:
+        d_pred = np.empty((N_atoms, calc.dim), dtype=np.float64)
+
+    with torch.no_grad():
+        start = 0
+        while start < n_struct:
+            end = min(start + batch_size, n_struct)
+            B = end - start
+            try:
+                a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
+                r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
+                g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
+                N = a_hi - a_lo
+                atom_types = at_cpu[a_lo:a_hi].to(device)
+                pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
+                pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
+                rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
+                pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
+                pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
+                rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
+                struct_idx = torch.repeat_interleave(
+                    torch.arange(B, device=device, dtype=torch.long),
+                    natoms_gpu[start:end])
+
+                dr = torch.norm(rij_r, dim=-1)
+                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+                d12inv_r = 1.0 / dr.clamp(min=1e-10)
+                if rij_a.shape[0] > 0:
+                    da = torch.norm(rij_a, dim=-1)
+                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+                    d12inv_a = 1.0 / da.clamp(min=1e-10)
+                    blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
+                                            rij_a[:, 1] * d12inv_a,
+                                            rij_a[:, 2] * d12inv_a,
+                                            calc.l_max_3b)
+                else:
+                    fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    d12inv_a = torch.zeros(0, dtype=dt, device=device)
+                    blm = torch.zeros(0, calc.num_lm, dtype=dt, device=device)
+
+                batch = {
+                    "N": N, "num_structures": B,
+                    "atom_types": atom_types, "struct_idx": struct_idx,
+                    "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
+                    "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
+                    "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
+                    "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
+                    "blm": blm,
+                }
+                result = calc.compute_batch(batch, backend=backend)
+
+                v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
+                v_per_frame.scatter_add_(
+                    0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
+                nat_slice = natoms_arr[start:end].astype(np.float64)
+                e_pred[start:end] = result["Etot"].cpu().numpy() / nat_slice
+                v_pred[start:end] = _virial9_to_6(v_per_frame.cpu().numpy()) / nat_slice[:, None]
+                f_pred[a_lo:a_hi] = result["forces"].cpu().numpy()
+                if output_descriptor:
+                    # ``compute_batch`` already returns ``q * q_scaler``.
+                    desc_np = result["descriptor"].cpu().numpy()
+                    if output_descriptor == 2:
+                        d_pred[a_lo:a_hi] = desc_np
+                    else:
+                        sums = np.zeros((B, calc.dim), dtype=np.float64)
+                        np.add.at(sums, struct_idx.cpu().numpy(), desc_np)
+                        d_pred[start:end] = sums / nat_slice[:, None]
+            except torch.OutOfMemoryError:
+                # Adaptive backoff: free the pool, halve the batch and redo
+                # this batch — robust across models/hardware where any static
+                # memory estimate can be off.
+                if batch_size <= 16:
+                    raise
+                torch.cuda.empty_cache()
+                batch_size = max(16, batch_size // 2)
+                (progress.write if progress is not None else log)(
+                    f"  OOM at batch of {B} frames -> retrying with batch_size={batch_size}")
+                continue
+            if progress is not None:
+                progress.update(B)
+            start = end
+    return e_pred, f_pred, v_pred, d_pred, batch_size
+
+
 def predict_dataset(
     model_file: str,
     xyz_file: str,
@@ -94,13 +353,25 @@ def predict_dataset(
     verbose: bool = True,
     energy_key: str = "energy",
     output_descriptor: int = 0,
+    chunk_atoms: int = None,
 ):
-    """Run batched prediction on a full dataset and save GPUMD-format outputs.
+    """Run streamed, batched prediction on a full dataset and save GPUMD-format
+    outputs.
+
+    The file is first indexed (byte offsets + atom counts, one I/O pass, no
+    parsing), then processed in consecutive **chunks** of roughly
+    ``chunk_atoms`` atoms: each chunk is read, neighbor-listed (multi-process),
+    predicted in device-sized batches and appended to the output files before
+    the next chunk is touched. Host memory is therefore bounded by the chunk
+    size and device memory by the batch size — any dataset finishes on any
+    machine, only the wall time differs. Outputs are identical to the former
+    whole-dataset path.
 
     Outputs (per-atom for energy and virial; per-atom raw for forces):
       - energy_train.out:  e_pred  e_target              (eV/atom, per frame)
       - force_train.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
       - virial_train.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
+      - stress_train.out:  same layout in GPa (GPUMD sign convention)
       - descriptor.out (only when ``output_descriptor != 0``):
           mode 1 — per-frame averaged scaled descriptor, one row per frame
           mode 2 — per-atom scaled descriptor, one row per atom
@@ -114,8 +385,13 @@ def predict_dataset(
     ----------
     batch_size : int or None
         Frames per compute batch. ``None`` (default) sizes the batch
-        automatically from the device's free memory and the dataset's
-        average pair counts (CUDA/ROCm; other devices fall back to 1000).
+        automatically from the device's free memory and the first chunk's
+        average pair counts (CUDA/ROCm; other devices fall back to 1000),
+        with an OOM-halving retry.
+    chunk_atoms : int or None
+        Atoms per streamed chunk (host-memory bound; ~1 GB per 200k atoms of
+        dense metal at cutoff 6/5). ``None`` -> ``TORCHNEP_PREDICT_CHUNK_ATOMS``
+        env var, else 200000.
     output_descriptor : int
         0 — disabled (default).
         1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
@@ -124,7 +400,8 @@ def predict_dataset(
     The contraction backend is chosen automatically (see
     ``torchnep.ops.resolve_backend``).
     """
-    from .train import _default_alloc_conf
+    from .train import _default_alloc_conf, preprocess_structures, make_preproc_pool
+    from .data import index_xyz, read_xyz_at
     _default_alloc_conf()
     if device is None:
         # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
@@ -136,9 +413,11 @@ def predict_dataset(
             device = "mps"
         else:
             device = "cpu"
-
     dt = torch.float64 if dtype == "float64" else torch.float32
     np_dtype = np.float64 if dtype == "float64" else np.float32
+    if chunk_atoms is None:
+        chunk_atoms = int(os.environ.get("TORCHNEP_PREDICT_CHUNK_ATOMS", 200_000))
+    chunk_atoms = max(1, int(chunk_atoms))
 
     def _log(msg):
         if verbose:
@@ -146,328 +425,109 @@ def predict_dataset(
 
     t_total = time.time()
     calc = NEPCalculator(model_file, dtype=dt, device=device)
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
-    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
-    l_max_3b = calc.l_max_3b
-    num_lm = calc.num_lm
-
-    # Resolve the backend now that num_types and the device are known.
     backend = ops.resolve_backend("auto", num_types=calc.num_types,
                                   device_type=torch.device(device).type)
+    pp_config = {"cutoff_radial": calc.rc_radial,
+                 "cutoff_angular": calc.rc_angular,
+                 "type_names": calc.type_names}
 
-    # 1) Read xyz
+    # 1) Index the file (offsets + atom counts only; no parsing, O(n_frames) memory)
     t0 = time.time()
-    frames = read_xyz(xyz_file, energy_key=energy_key)
-    n_struct = len(frames)
-    _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames, "
-         f"energy label: {energy_key})")
+    offsets, natoms_all = index_xyz(xyz_file)
+    n_struct = len(offsets)
+    bounds = _chunk_bounds(natoms_all, chunk_atoms, max_frames=50_000)
+    _log(f"  index_xyz:   {time.time() - t0:5.1f}s   ({n_struct} frames, "
+         f"{int(natoms_all.sum())} atoms, {len(bounds)} chunk(s) of "
+         f"~{chunk_atoms} atoms, energy label: {energy_key})")
 
-    # 2) Multi-process neighbor-list construction
-    from .train import preprocess_structures  # local import: avoid cycle
-
-    t0 = time.time()
-    pp_config = {
-        "cutoff_radial": rc_rad,
-        "cutoff_angular": rc_ang,
-        "type_names": calc.type_names,
-    }
-    structures = preprocess_structures(frames, pp_config, np_dtype)
-    del frames
-    _log(f"  neighbors:   {time.time() - t0:5.1f}s")
-
-    # 3) Concatenate everything once and move raw data to the GPU.
-    t0 = time.time()
-    natoms_arr = np.asarray([s["natoms"] for s in structures], dtype=np.int64)
-    volumes_arr = np.asarray([s.get("volume", 0.0) for s in structures],
-                             dtype=np.float64)
-    nrad_arr = np.asarray([len(s["pair_i_rad"]) for s in structures],
-                          dtype=np.int64)
-    nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
-                          dtype=np.int64)
-    nat_cum = np.concatenate([[0], np.cumsum(natoms_arr)])
-    nrad_cum = np.concatenate([[0], np.cumsum(nrad_arr)])
-    nang_cum = np.concatenate([[0], np.cumsum(nang_arr)])
-    N_atoms_total = int(nat_cum[-1])
-
-    # Pair indices are global (atom positions in the concatenation), so a
-    # per-batch slice only needs to subtract the batch's first-atom offset.
-    all_at = np.concatenate([s["atom_types"] for s in structures])
-    all_pi_r = np.concatenate(
-        [s["pair_i_rad"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_pj_r = np.concatenate(
-        [s["pair_j_rad"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_rij_r = np.concatenate([s["rij_rad"] for s in structures])
-    all_pi_a = np.concatenate(
-        [s["pair_i_ang"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_pj_a = np.concatenate(
-        [s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_rij_a = np.concatenate([s["rij_ang"] for s in structures])
-
-    energy_ref = np.array(
-        [s["energy"] if s.get("energy") is not None else np.nan
-         for s in structures], dtype=np.float64)
-
-    has_forces_global = any(s.get("forces") is not None for s in structures)
-    forces_ref = None
-    if has_forces_global:
-        forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-        for i, s in enumerate(structures):
-            f = s.get("forces")
-            if f is not None:
-                forces_ref[nat_cum[i]:nat_cum[i + 1]] = \
-                    np.asarray(f).reshape(-1, 3)
-
-    has_virial_global = any(s.get("virial") is not None for s in structures)
-    virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
-    if has_virial_global:
-        # Per-atom virial, to match GPUMD's *_train.out columns. Off-diagonal
-        # pairs are picked the same way as the prediction, so the two columns
-        # are computed on the exact same definition.
-        for i, s in enumerate(structures):
-            v = s.get("virial")
-            if v is None:
-                continue
-            v = np.asarray(v).flatten()
-            inv_n = 1.0 / float(s["natoms"])
-            if v.size == 9:
-                # Single-triangular pick to match GPUMD (see _virial9_to_6).
-                # Input XYZ virial is symmetric (DFT), so xy=yx etc., making
-                # this choice numerically equal to averaging.
-                virial_ref[i] = [
-                    v[0] * inv_n,   # xx
-                    v[4] * inv_n,   # yy
-                    v[8] * inv_n,   # zz
-                    v[1] * inv_n,   # xy
-                    v[5] * inv_n,   # yz
-                    v[6] * inv_n,   # zx
-                ]
-            elif v.size >= 6:
-                virial_ref[i] = v[:6] * inv_n
-
-    del structures  # free CPU memory
-
-    # Host-resident staging: the concatenated arrays stay on the CPU and
-    # only each batch's slice is shipped to the device inside the loop —
-    # GPU memory scales with batch_size, not dataset size (a 105k-frame
-    # set is ~15 GB as whole-dataset uploads, far beyond a 16 GB card).
-    at_cpu    = torch.from_numpy(all_at)
-    pi_r_cpu  = torch.from_numpy(all_pi_r)
-    pj_r_cpu  = torch.from_numpy(all_pj_r)
-    rij_r_cpu = torch.from_numpy(all_rij_r)
-    pi_a_cpu  = torch.from_numpy(all_pi_a)
-    pj_a_cpu  = torch.from_numpy(all_pj_a)
-    rij_a_cpu = torch.from_numpy(all_rij_a)
-    natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
-    _log(f"  staging:     {time.time() - t0:5.1f}s")
-
-    # Auto batch size: bound the per-batch device footprint by a fraction of
-    # the free memory, using the dataset's average per-frame pair counts and
-    # a conservative bytes-per-pair model of the batch tensors plus the
-    # kernels' intermediates (safety factor absorbs backend differences).
-    if batch_size is None:
-        batch_size = 1000
-        if torch.device(device).type == "cuda":
-            try:
-                free_b, _ = torch.cuda.mem_get_info()
-                esize = 8 if dt == torch.float64 else 4
-                avg_nrad = max(1.0, float(nrad_arr.mean()))
-                avg_nang = max(1.0, float(nang_arr.mean()))
-                avg_nat = max(1.0, float(natoms_arr.mean()))
-                nmax_a = calc.n_max_angular
-                # dominant term: the analytical-force angular intermediates
-                # hold ~(n_max_a+1) x num_lm floats per angular pair, a few
-                # times over.
-                per_frame = (
-                    avg_nrad * (esize * (2 * (basis_r + 1) + 8) + 16)
-                    + avg_nang * (esize * (3 * (nmax_a + 1) * num_lm
-                                           + 2 * (basis_a + 1) + 2 * num_lm
-                                           + 12) + 16)
-                    + avg_nat * esize * 4 * calc.dim)
-                budget = 0.25 * free_b
-                batch_size = int(budget / (3.0 * per_frame))
-                # Throughput is flat beyond a few thousand frames per batch
-                # (measured on V100/MI250X), so cap the auto choice — larger
-                # batches only inflate the memory peak.
-                batch_size = max(16, min(batch_size, n_struct, 16384))
-                _log(f"  batch_size:  auto -> {batch_size} "
-                     f"(free {free_b/2**30:.1f} GiB, "
-                     f"~{per_frame/1024:.0f} KiB/frame est.)")
-            except Exception:
-                pass
-
-    # 4) Batched compute loop ------------------------------------------------
-    e_pred_arr = np.empty(n_struct, dtype=np.float64)
-    f_pred_arr = (np.empty((N_atoms_total, 3), dtype=np.float64)
-                  if has_forces_global else None)
-    v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
-
-    # Descriptor buffer (only allocated when requested).
-    #   mode 1 -> (n_struct, dim)         per-frame averaged scaled descriptor
-    #   mode 2 -> (N_atoms_total, dim)    per-atom scaled descriptor
-    d_pred_arr = None
-    if output_descriptor == 1:
-        d_pred_arr = np.empty((n_struct, calc.dim), dtype=np.float64)
-    elif output_descriptor == 2:
-        d_pred_arr = np.empty((N_atoms_total, calc.dim), dtype=np.float64)
-
-    t0 = time.time()
-    with torch.no_grad():
-        start = 0
-        while start < n_struct:
-            end = min(start + batch_size, n_struct)
-            B = end - start
-            try:
-                a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
-                r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
-                g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
-                N = a_hi - a_lo
-
-                atom_types = at_cpu[a_lo:a_hi].to(device)
-                pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
-                pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
-                rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
-                pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
-                pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
-                rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
-
-                struct_idx = torch.repeat_interleave(
-                    torch.arange(B, device=device, dtype=torch.long),
-                    natoms_gpu[start:end])
-
-                dr = torch.norm(rij_r, dim=-1)
-                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
-                d12inv_r = 1.0 / dr.clamp(min=1e-10)
-
-                if rij_a.shape[0] > 0:
-                    da = torch.norm(rij_a, dim=-1)
-                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
-                        da, rc_ang, basis_a)
-                    d12inv_a = 1.0 / da.clamp(min=1e-10)
-                    blm = ops.angular_basis(
-                        rij_a[:, 0] * d12inv_a,
-                        rij_a[:, 1] * d12inv_a,
-                        rij_a[:, 2] * d12inv_a,
-                        l_max_3b)
-                else:
-                    fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                    fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                    d12inv_a = torch.zeros(0, dtype=dt, device=device)
-                    blm = torch.zeros(0, num_lm, dtype=dt, device=device)
-
-                batch = {
-                    "N": N, "num_structures": B,
-                    "atom_types": atom_types, "struct_idx": struct_idx,
-                    "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
-                    "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
-                    "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-                    "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
-                    "blm": blm,
-                }
-                result = calc.compute_batch(batch, backend=backend)
-
-                Etot = result["Etot"]
-                v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
-                v_per_frame.scatter_add_(
-                    0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
-
-                # Single H2D copy per batch for the per-frame outputs
-                Etot_np = Etot.cpu().numpy()
-                v_np = v_per_frame.cpu().numpy()
-                nat_slice = natoms_arr[start:end].astype(np.float64)
-                e_pred_arr[start:end] = Etot_np / nat_slice
-                v_pred = _virial9_to_6(v_np) / nat_slice[:, None]
-                v_pred_arr[start:end] = v_pred
-
-                if f_pred_arr is not None:
-                    f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
-
-                if output_descriptor:
-                    # ``compute_batch`` already returns ``q * q_scaler``.
-                    desc_np = result["descriptor"].cpu().numpy()
-                    if output_descriptor == 2:
-                        d_pred_arr[a_lo:a_hi] = desc_np
-                    else:
-                        # Per-frame mean: scatter-sum onto frame index then /Na.
-                        sums = np.zeros((B, calc.dim), dtype=np.float64)
-                        si_np = struct_idx.cpu().numpy()
-                        np.add.at(sums, si_np, desc_np)
-                        d_pred_arr[start:end] = sums / natoms_arr[start:end][:, None]
-            except torch.OutOfMemoryError:
-                # Adaptive backoff: free the pool, halve the batch and
-                # redo this chunk — robust across models/hardware where
-                # any static memory estimate can be off.
-                if batch_size <= 16:
-                    raise
-                torch.cuda.empty_cache()
-                batch_size = max(16, batch_size // 2)
-                _log(f"  OOM at batch of {B} frames -> "
-                     f"retrying with batch_size={batch_size}")
-                continue
-            start = end
-
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    _log(f"  compute:     {time.time() - t0:5.1f}s")
-
-    # 5) Vectorised text output --------------------------------------------
-    t0 = time.time()
+    # 2) Output files are appended chunk by chunk (same layout as before).
     os.makedirs(output_dir, exist_ok=True)
+    fh = {name: open(os.path.join(output_dir, name), "w")
+          for name in ("energy_train.out", "force_train.out",
+                       "virial_train.out", "stress_train.out")}
+    if output_descriptor:
+        fh["descriptor.out"] = open(os.path.join(output_dir, "descriptor.out"), "w")
 
-    e_ref_pa = energy_ref / natoms_arr.astype(np.float64)
-    np.savetxt(os.path.join(output_dir, "energy_train.out"),
-               np.column_stack([e_pred_arr, e_ref_pa]), fmt="%.10g")
+    # running sums for the metrics summary
+    acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
 
-    if forces_ref is None:
-        forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-    if f_pred_arr is None:
-        f_pred_arr = np.zeros((N_atoms_total, 3), dtype=np.float64)
-    np.savetxt(os.path.join(output_dir, "force_train.out"),
-               np.column_stack([f_pred_arr, forces_ref]), fmt="%.10g")
+    def _accum(key, d):
+        d = d[np.isfinite(d)]
+        if d.size:
+            acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
+            acc[key][2] += int(d.size)
 
-    np.savetxt(os.path.join(output_dir, "virial_train.out"),
-               np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
+    t_read = t_nl = t_comp = t_write = 0.0
+    # one neighbor-list worker pool for all chunks (fork; workers never touch CUDA)
+    pool = make_preproc_pool() if n_struct >= 64 else None
+    progress = _Progress(n_struct, verbose)
+    for ci, (lo, hi) in enumerate(bounds):
+        t0 = time.time()
+        frames = read_xyz_at(xyz_file, offsets[lo:hi], energy_key=energy_key)
+        t_read += time.time() - t0
+        # 3) Multi-process neighbor-list construction for this chunk only
+        t0 = time.time()
+        structures = preprocess_structures(frames, pp_config, np_dtype, pool=pool)
+        del frames
+        chunk = _chunk_arrays(structures, np_dtype)
+        del structures
+        t_nl += time.time() - t0
+        if batch_size is None:
+            batch_size = _auto_batch_size(calc, dt, chunk, n_struct, progress.write) \
+                if torch.device(device).type == "cuda" else 1000
+        # 4) Batched compute
+        t0 = time.time()
+        e_pred, f_pred, v_pred, d_pred, batch_size = _predict_chunk(
+            calc, chunk, batch_size, device, dt, backend, output_descriptor, _log, progress)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        t_comp += time.time() - t0
+        # 5) Append this chunk's rows
+        t0 = time.time()
+        nat = chunk["natoms"].astype(np.float64)
+        e_ref_pa = chunk["energy_ref"] / nat
+        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
+        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.10g")
+        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.10g")
+        # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
+        # convention so stress and virial carry the same sign (see
+        # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
+        nat_col, vol_col = nat[:, None], chunk["volumes"][:, None]
+        np.savetxt(fh["stress_train.out"], np.column_stack([
+            _stress_from_virial(v_pred, nat_col, vol_col, keep_missing=False),
+            _stress_from_virial(chunk["virial_ref"], nat_col, vol_col, keep_missing=True)]),
+            fmt="%.10g")
+        if d_pred is not None:
+            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.10g")
+        _accum("e", e_pred - e_ref_pa)
+        _accum("f", (f_pred - chunk["forces_ref"]).ravel())
+        vmask = chunk["virial_ref"][:, 0] > _MISSING_VIRIAL / 2
+        _accum("v", (v_pred[vmask] - chunk["virial_ref"][vmask]).ravel())
+        t_write += time.time() - t0
+        del chunk, e_pred, f_pred, v_pred, d_pred
+    progress.close()
+    for h in fh.values():
+        h.close()
+    if pool is not None:
+        pool.close(); pool.join()
 
-    # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
-    # convention so stress and virial carry the same sign (see
-    # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
-    nat_col = natoms_arr.astype(np.float64)[:, None]
-    vol_col = volumes_arr[:, None]
-    stress_pred = _stress_from_virial(v_pred_arr, nat_col, vol_col,
-                                      keep_missing=False)
-    stress_ref = _stress_from_virial(virial_ref, nat_col, vol_col,
-                                     keep_missing=True)
-    np.savetxt(os.path.join(output_dir, "stress_train.out"),
-               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
-
-    if d_pred_arr is not None:
-        np.savetxt(os.path.join(output_dir, "descriptor.out"),
-                   d_pred_arr, fmt="%.10g")
-    _log(f"  write:       {time.time() - t0:5.1f}s")
-
+    _log(f"  read:        {t_read:5.1f}s")
+    _log(f"  neighbors:   {t_nl:5.1f}s")
+    _log(f"  compute:     {t_comp:5.1f}s")
+    _log(f"  write:       {t_write:5.1f}s")
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_train.out")
 
     # ---- Metrics summary vs available reference labels ---------------------
     if verbose:
         rows = []
-        de = e_pred_arr - e_ref_pa
-        de = de[np.isfinite(de)]
-        if de.size:
-            rows.append(("Energy (eV/atom)",
-                         np.sqrt(np.mean(de ** 2)), np.mean(np.abs(de)),
-                         f"{de.size} frames"))
-        df = (f_pred_arr - forces_ref).ravel()
-        df = df[np.isfinite(df)]
-        if df.size:
-            rows.append(("Force  (eV/A)",
-                         np.sqrt(np.mean(df ** 2)), np.mean(np.abs(df)),
-                         f"{df.size // 3} atoms"))
-        vmask = virial_ref[:, 0] > _MISSING_VIRIAL / 2
-        dv = (v_pred_arr[vmask] - virial_ref[vmask]).ravel()
-        if dv.size:
-            rows.append(("Virial (eV/atom)",
-                         np.sqrt(np.mean(dv ** 2)), np.mean(np.abs(dv)),
-                         f"{int(vmask.sum())} frames"))
+        for key, label, per in (("e", "Energy (eV/atom)", "frames"),
+                                ("f", "Force  (eV/A)", "atoms"),
+                                ("v", "Virial (eV/atom)", "frames")):
+            sq, ab, n = acc[key]
+            if n:
+                cov = n // 3 if key == "f" else (n // 6 if key == "v" else n)
+                rows.append((label, np.sqrt(sq / n), ab / n, f"{cov} {per}"))
         if rows:
             _log("  " + "-" * 58)
             _log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")

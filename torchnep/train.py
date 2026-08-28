@@ -588,7 +588,41 @@ def _preprocess_one_frame(args):
     return s
 
 
-def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
+def _preproc_workers(n_workers=None):
+    """Worker count for neighbor-list pools (see preprocess_structures)."""
+    if n_workers is not None:
+        return n_workers
+    # sched_getaffinity respects cgroup/slurm CPU limits;
+    # os.cpu_count() reports the whole node and oversubscribes the
+    # allocation (e.g. 80 workers fighting over a 24-core cgroup).
+    try:
+        cpu_total = len(os.sched_getaffinity(0))
+    except AttributeError:          # non-Linux
+        cpu_total = os.cpu_count() or 1
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+    n_workers = max(1, cpu_total // local_world)
+    return int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
+
+
+def make_preproc_pool(n_workers=None):
+    """A reusable neighbor-list worker pool (fork by default, see
+    preprocess_structures), or None when pooling is disabled. Callers that
+    preprocess many small chunks (streamed prediction) create it once instead
+    of paying the pool start-up per chunk."""
+    n_workers = _preproc_workers(n_workers)
+    if n_workers <= 1:
+        return None
+    import multiprocessing as mp
+    method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
+    try:
+        ctx = mp.get_context(method)
+    except ValueError:
+        ctx = mp.get_context("spawn")
+    return ctx.Pool(n_workers)
+
+
+def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
+                          pool=None):
     """Build neighbor lists for all frames, parallelized across CPU cores.
 
     Per-frame work is embarrassingly parallel. Worker behavior:
@@ -605,27 +639,25 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
       behaves pathologically (rare).
 
     Disable pooling entirely with ``n_workers=1`` (useful for debugging).
+    ``pool``: an existing pool from :func:`make_preproc_pool` to reuse (the
+    caller owns it); otherwise a pool is created and closed per call.
     """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
+    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
 
-    if n_workers is None:
-        # sched_getaffinity respects cgroup/slurm CPU limits;
-        # os.cpu_count() reports the whole node and oversubscribes the
-        # allocation (e.g. 80 workers fighting over a 24-core cgroup).
-        try:
-            cpu_total = len(os.sched_getaffinity(0))
-        except AttributeError:          # non-Linux
-            cpu_total = os.cpu_count() or 1
-        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-        n_workers = max(1, cpu_total // local_world)
-        n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
+    if pool is not None:
+        if len(frames) < 64:
+            return [_preprocess_one_frame(a) for a in args]
+        n_workers = getattr(pool, "_processes", 1) or 1
+        return pool.map(_preprocess_one_frame, args,
+                        chunksize=max(1, len(frames) // (n_workers * 4)))
 
+    n_workers = _preproc_workers(n_workers)
     if n_workers <= 1 or len(frames) < 64:
-        return [_preprocess_one_frame((f, rc_rad, rc_ang, max_rc, type_names, dtype))
-                for f in frames]
+        return [_preprocess_one_frame(a) for a in args]
 
     import multiprocessing as mp
     method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
@@ -633,8 +665,6 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
         ctx = mp.get_context(method)
     except ValueError:
         ctx = mp.get_context("spawn")
-
-    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
     chunksize = max(1, len(frames) // (n_workers * 4))
     with ctx.Pool(n_workers) as pool:
         return pool.map(_preprocess_one_frame, args, chunksize=chunksize)

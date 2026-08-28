@@ -352,7 +352,11 @@ print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 
 ### Full-dataset prediction
 
-Runs batched GPU inference on an entire `.xyz` file and writes GPUMD-compatible output files.
+Runs streamed, batched inference on an entire `.xyz` file and writes GPUMD-compatible output files.
+The file is indexed once, then processed chunk by chunk (~`chunk_atoms` atoms each: read → neighbor
+lists → device-sized batches → rows appended to the outputs), so host memory is bounded by the chunk and
+device memory by the batch — a dataset of any size finishes on any machine, only the wall time differs.
+A progress bar (tqdm if installed) shows frames done.
 
 ```python
 from torchnep import predict_dataset
@@ -362,6 +366,8 @@ predict_dataset(
     "test.xyz",
     output_dir="results",
     output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
+    batch_size=None,       # auto from free GPU memory (OOM-halving retry); or an int
+    chunk_atoms=None,      # atoms per streamed chunk, default 200000 (env TORCHNEP_PREDICT_CHUNK_ATOMS)
 )
 # writes energy_train.out, force_train.out, virial_train.out,
 # stress_train.out, and (when output_descriptor != 0) descriptor.out
@@ -381,7 +387,7 @@ The `torchnep/` package is organised as follows:
 | `model.py` | Trainable NEP4 model (`NEPModel`) as an `nn.Module`, per-type fitting nets, ZBL, and `slim_model` |
 | `ops.py` | Core differentiable kernels — Chebyshev/angular basis, descriptors, ANN evaluation, ZBL; pure-PyTorch `loop`/`bmm`/`mulsum` backends |
 | `nep.py` | `NEPCalculator` — loads a `nep.txt` and computes energy/forces/virial/descriptors for single structures |
-| `predict.py` | Batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
+| `predict.py` | Streamed, batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
 | `train.py` | Single-GPU/CPU training (`train_nep`): host-resident streaming data store (`StreamDataStore` + prefetching `iter_collated`), two-stage loop, schedulers, checkpoint/restart, periodic predict |
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
 | `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |

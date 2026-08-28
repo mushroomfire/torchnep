@@ -1,5 +1,15 @@
 # Release Notes
 
+## 1.0.3a2
+
+- **Streamed `predict_dataset`**: the xyz is indexed once and processed in
+  chunks of ~`chunk_atoms` atoms (default 200k, env
+  `TORCHNEP_PREDICT_CHUNK_ATOMS`) — read → neighbor lists → batches → rows
+  appended — so host memory is bounded by the chunk and device memory by
+  the batch; any dataset finishes on any machine. Outputs unchanged.
+- Progress bar (tqdm when installed, plain otherwise) and a per-stage
+  timing summary; one neighbor-list worker pool reused across chunks.
+
 ## 1.0.3a1
 
 - **Streamed shard loading** (`train_nep_sharded`): each rank reads only
