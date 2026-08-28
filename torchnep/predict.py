@@ -343,6 +343,117 @@ def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
     return e_pred, f_pred, v_pred, d_pred, batch_size
 
 
+def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
+                    device, backend, batch_size, chunk_atoms, energy_key,
+                    output_descriptor, progress, log):
+    """Streamed core shared by predict_dataset and predict_dataset_sharded:
+    predict the frames at ``offsets`` (byte offsets from index_xyz, with their
+    ``natoms``) chunk by chunk and append the rows to the ``*_train.out`` files
+    in ``output_dir``. Returns (metric sums, timings, batch_size)."""
+    from .train import preprocess_structures, make_preproc_pool
+    from .data import read_xyz_at
+    n_struct = len(offsets)
+    bounds = _chunk_bounds(natoms, chunk_atoms, max_frames=50_000)
+    pp_config = {"cutoff_radial": calc.rc_radial,
+                 "cutoff_angular": calc.rc_angular,
+                 "type_names": calc.type_names}
+    os.makedirs(output_dir, exist_ok=True)
+    fh = {name: open(os.path.join(output_dir, name), "w")
+          for name in ("energy_train.out", "force_train.out",
+                       "virial_train.out", "stress_train.out")}
+    if output_descriptor:
+        fh["descriptor.out"] = open(os.path.join(output_dir, "descriptor.out"), "w")
+    acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
+
+    def _accum(key, d):
+        d = d[np.isfinite(d)]
+        if d.size:
+            acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
+            acc[key][2] += int(d.size)
+
+    tm = {"read": 0.0, "neighbors": 0.0, "compute": 0.0, "write": 0.0}
+    # one neighbor-list worker pool for all chunks (fork; workers never touch CUDA)
+    pool = make_preproc_pool() if n_struct >= 64 else None
+    for lo, hi in bounds:
+        t0 = time.time()
+        frames = read_xyz_at(xyz_file, offsets[lo:hi], energy_key=energy_key)
+        tm["read"] += time.time() - t0
+        t0 = time.time()
+        structures = preprocess_structures(frames, pp_config, np_dtype, pool=pool)
+        del frames
+        chunk = _chunk_arrays(structures, np_dtype)
+        del structures
+        tm["neighbors"] += time.time() - t0
+        if batch_size is None:
+            batch_size = _auto_batch_size(calc, dt, chunk, n_struct, progress.write) \
+                if torch.device(device).type == "cuda" else 1000
+        t0 = time.time()
+        e_pred, f_pred, v_pred, d_pred, batch_size = _predict_chunk(
+            calc, chunk, batch_size, device, dt, backend, output_descriptor, log, progress)
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize()
+        tm["compute"] += time.time() - t0
+        if "first_chunk" not in tm:
+            tm["first_chunk"] = time.time() - t0     # includes kernel warm-up of this process
+        t0 = time.time()
+        nat = chunk["natoms"].astype(np.float64)
+        e_ref_pa = chunk["energy_ref"] / nat
+        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
+        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.10g")
+        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.10g")
+        # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
+        # convention so stress and virial carry the same sign (see
+        # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
+        nat_col, vol_col = nat[:, None], chunk["volumes"][:, None]
+        np.savetxt(fh["stress_train.out"], np.column_stack([
+            _stress_from_virial(v_pred, nat_col, vol_col, keep_missing=False),
+            _stress_from_virial(chunk["virial_ref"], nat_col, vol_col, keep_missing=True)]),
+            fmt="%.10g")
+        if d_pred is not None:
+            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.10g")
+        _accum("e", e_pred - e_ref_pa)
+        _accum("f", (f_pred - chunk["forces_ref"]).ravel())
+        vmask = chunk["virial_ref"][:, 0] > _MISSING_VIRIAL / 2
+        _accum("v", (v_pred[vmask] - chunk["virial_ref"][vmask]).ravel())
+        tm["write"] += time.time() - t0
+        del chunk, e_pred, f_pred, v_pred, d_pred
+    for h in fh.values():
+        h.close()
+    if pool is not None:
+        pool.close(); pool.join()
+    return acc, tm, batch_size
+
+
+def _metrics_table(acc, log):
+    rows = []
+    for key, label, per in (("e", "Energy (eV/atom)", "frames"),
+                            ("f", "Force  (eV/A)", "atoms"),
+                            ("v", "Virial (eV/atom)", "frames")):
+        sq, ab, n = acc[key]
+        if n:
+            cov = n // 3 if key == "f" else (n // 6 if key == "v" else n)
+            rows.append((label, np.sqrt(sq / n), ab / n, f"{cov} {per}"))
+    if rows:
+        log("  " + "-" * 58)
+        log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")
+        for label, rmse, mae, cov in rows:
+            log(f"  {label:18s} {rmse:12.6f} {mae:12.6f}   ({cov})")
+        log("  " + "-" * 58)
+
+
+def _pick_device(device):
+    if device is not None:
+        return device
+    # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def predict_dataset(
     model_file: str,
     xyz_file: str,
@@ -400,19 +511,10 @@ def predict_dataset(
     The contraction backend is chosen automatically (see
     ``torchnep.ops.resolve_backend``).
     """
-    from .train import _default_alloc_conf, preprocess_structures, make_preproc_pool
-    from .data import index_xyz, read_xyz_at
+    from .train import _default_alloc_conf
+    from .data import index_xyz
     _default_alloc_conf()
-    if device is None:
-        # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = "xpu"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    device = _pick_device(device)
     dt = torch.float64 if dtype == "float64" else torch.float32
     np_dtype = np.float64 if dtype == "float64" else np.float32
     if chunk_atoms is None:
@@ -427,113 +529,169 @@ def predict_dataset(
     calc = NEPCalculator(model_file, dtype=dt, device=device)
     backend = ops.resolve_backend("auto", num_types=calc.num_types,
                                   device_type=torch.device(device).type)
-    pp_config = {"cutoff_radial": calc.rc_radial,
-                 "cutoff_angular": calc.rc_angular,
-                 "type_names": calc.type_names}
-
     # 1) Index the file (offsets + atom counts only; no parsing, O(n_frames) memory)
     t0 = time.time()
     offsets, natoms_all = index_xyz(xyz_file)
     n_struct = len(offsets)
-    bounds = _chunk_bounds(natoms_all, chunk_atoms, max_frames=50_000)
+    n_chunks = len(_chunk_bounds(natoms_all, chunk_atoms, max_frames=50_000))
     _log(f"  index_xyz:   {time.time() - t0:5.1f}s   ({n_struct} frames, "
-         f"{int(natoms_all.sum())} atoms, {len(bounds)} chunk(s) of "
+         f"{int(natoms_all.sum())} atoms, {n_chunks} chunk(s) of "
          f"~{chunk_atoms} atoms, energy label: {energy_key})")
-
-    # 2) Output files are appended chunk by chunk (same layout as before).
-    os.makedirs(output_dir, exist_ok=True)
-    fh = {name: open(os.path.join(output_dir, name), "w")
-          for name in ("energy_train.out", "force_train.out",
-                       "virial_train.out", "stress_train.out")}
-    if output_descriptor:
-        fh["descriptor.out"] = open(os.path.join(output_dir, "descriptor.out"), "w")
-
-    # running sums for the metrics summary
-    acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
-
-    def _accum(key, d):
-        d = d[np.isfinite(d)]
-        if d.size:
-            acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
-            acc[key][2] += int(d.size)
-
-    t_read = t_nl = t_comp = t_write = 0.0
-    # one neighbor-list worker pool for all chunks (fork; workers never touch CUDA)
-    pool = make_preproc_pool() if n_struct >= 64 else None
+    # 2-5) streamed chunks -> rows appended to the output files
     progress = _Progress(n_struct, verbose)
-    for ci, (lo, hi) in enumerate(bounds):
-        t0 = time.time()
-        frames = read_xyz_at(xyz_file, offsets[lo:hi], energy_key=energy_key)
-        t_read += time.time() - t0
-        # 3) Multi-process neighbor-list construction for this chunk only
-        t0 = time.time()
-        structures = preprocess_structures(frames, pp_config, np_dtype, pool=pool)
-        del frames
-        chunk = _chunk_arrays(structures, np_dtype)
-        del structures
-        t_nl += time.time() - t0
-        if batch_size is None:
-            batch_size = _auto_batch_size(calc, dt, chunk, n_struct, progress.write) \
-                if torch.device(device).type == "cuda" else 1000
-        # 4) Batched compute
-        t0 = time.time()
-        e_pred, f_pred, v_pred, d_pred, batch_size = _predict_chunk(
-            calc, chunk, batch_size, device, dt, backend, output_descriptor, _log, progress)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        t_comp += time.time() - t0
-        # 5) Append this chunk's rows
-        t0 = time.time()
-        nat = chunk["natoms"].astype(np.float64)
-        e_ref_pa = chunk["energy_ref"] / nat
-        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
-        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.10g")
-        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.10g")
-        # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
-        # convention so stress and virial carry the same sign (see
-        # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
-        nat_col, vol_col = nat[:, None], chunk["volumes"][:, None]
-        np.savetxt(fh["stress_train.out"], np.column_stack([
-            _stress_from_virial(v_pred, nat_col, vol_col, keep_missing=False),
-            _stress_from_virial(chunk["virial_ref"], nat_col, vol_col, keep_missing=True)]),
-            fmt="%.10g")
-        if d_pred is not None:
-            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.10g")
-        _accum("e", e_pred - e_ref_pa)
-        _accum("f", (f_pred - chunk["forces_ref"]).ravel())
-        vmask = chunk["virial_ref"][:, 0] > _MISSING_VIRIAL / 2
-        _accum("v", (v_pred[vmask] - chunk["virial_ref"][vmask]).ravel())
-        t_write += time.time() - t0
-        del chunk, e_pred, f_pred, v_pred, d_pred
+    acc, tm, _ = _predict_frames(calc, xyz_file, offsets, natoms_all, output_dir, dt, np_dtype,
+                                 device, backend, batch_size, chunk_atoms, energy_key,
+                                 output_descriptor, progress, _log)
     progress.close()
-    for h in fh.values():
-        h.close()
-    if pool is not None:
-        pool.close(); pool.join()
-
-    _log(f"  read:        {t_read:5.1f}s")
-    _log(f"  neighbors:   {t_nl:5.1f}s")
-    _log(f"  compute:     {t_comp:5.1f}s")
-    _log(f"  write:       {t_write:5.1f}s")
+    for k in ("read", "neighbors", "compute", "write"):
+        _log(f"  {k + ':':12s} {tm[k]:5.1f}s" + (f"   (first chunk incl. warm-up {tm['first_chunk']:.1f}s)" if k == "compute" and "first_chunk" in tm else ""))
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_train.out")
-
-    # ---- Metrics summary vs available reference labels ---------------------
     if verbose:
-        rows = []
-        for key, label, per in (("e", "Energy (eV/atom)", "frames"),
-                                ("f", "Force  (eV/A)", "atoms"),
-                                ("v", "Virial (eV/atom)", "frames")):
-            sq, ab, n = acc[key]
-            if n:
-                cov = n // 3 if key == "f" else (n // 6 if key == "v" else n)
-                rows.append((label, np.sqrt(sq / n), ab / n, f"{cov} {per}"))
-        if rows:
-            _log("  " + "-" * 58)
-            _log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")
-            for label, rmse, mae, cov in rows:
-                _log(f"  {label:18s} {rmse:12.6f} {mae:12.6f}   ({cov})")
-            _log("  " + "-" * 58)
+        _metrics_table(acc, _log)
+
+
+def predict_dataset_sharded(
+    model_file: str,
+    xyz_file: str,
+    output_dir: str = ".",
+    dtype: str = "float32",
+    batch_size: int = None,
+    verbose: bool = True,
+    energy_key: str = "energy",
+    output_descriptor: int = 0,
+    chunk_atoms: int = None,
+):
+    """Multi-rank (multi-GPU / multi-node) version of :func:`predict_dataset`.
+
+    Launch one process per GPU with ``torchrun`` or ``srun`` (the launcher
+    sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). Rank 0
+    indexes the file once and broadcasts the frame index; the frames are then
+    split into WORLD_SIZE **contiguous** ranges balanced by atom count, every
+    rank streams its own range exactly like ``predict_dataset`` (same chunking,
+    auto batch size and OOM retry, bounded memory) into a per-rank part
+    directory, and rank 0 finally concatenates the parts in rank order into
+    the usual ``*_train.out`` files and prints the global E/F/V RMSE/MAE
+    table. The output is identical to a single-process ``predict_dataset``.
+    Rank 0 shows the progress of its own share; the other ranks are silent.
+    With WORLD_SIZE == 1 (or no launcher) this is plain ``predict_dataset``.
+    """
+    import torch.distributed as dist
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1:
+        return predict_dataset(model_file, xyz_file, output_dir=output_dir, dtype=dtype,
+                               batch_size=batch_size, verbose=verbose, energy_key=energy_key,
+                               output_descriptor=output_descriptor, chunk_atoms=chunk_atoms)
+    from .train import _default_alloc_conf
+    from .train_sharded import _register_pg_atexit
+    from .data import index_xyz
+    _default_alloc_conf()
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    # ---- distributed init (same rules as train_nep_sharded) ----
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    cuda_available = torch.cuda.is_available()
+    n_gpus = torch.cuda.device_count() if cuda_available else 0
+    if cuda_available:
+        gpu_id = local_rank % max(1, n_gpus)
+        torch.cuda.set_device(gpu_id)
+        device = f"cuda:{gpu_id}"
+    else:
+        device = "cpu"
+    if not dist.is_initialized():
+        local_world_env = int(os.environ.get("LOCAL_WORLD_SIZE",
+                              os.environ.get("SLURM_NTASKS_PER_NODE", world_size)))
+        pg_backend = "nccl" if cuda_available and local_world_env <= n_gpus else "gloo"
+        dist.init_process_group(backend=pg_backend,
+                                device_id=torch.device(device) if cuda_available else None)
+        _register_pg_atexit()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    is_main = rank == 0
+    bcast_dev = torch.device(device) if dist.get_backend() == "nccl" else torch.device("cpu")
+
+    def _log(msg):
+        if verbose and is_main:
+            print(msg, flush=True)
+
+    dt = torch.float64 if dtype == "float64" else torch.float32
+    np_dtype = np.float64 if dtype == "float64" else np.float32
+    if chunk_atoms is None:
+        chunk_atoms = int(os.environ.get("TORCHNEP_PREDICT_CHUNK_ATOMS", 200_000))
+    chunk_atoms = max(1, int(chunk_atoms))
+    t_total = time.time()
+
+    # ---- rank 0 indexes, everyone gets (offsets, natoms) ----
+    t0 = time.time()
+    if is_main:
+        offs_np, nat_np = index_xyz(xyz_file)
+        n_all_t = torch.tensor([len(offs_np)], dtype=torch.long, device=bcast_dev)
+    else:
+        n_all_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+    dist.broadcast(n_all_t, 0)
+    n_all = int(n_all_t.item())
+    idx_t = torch.empty(2, n_all, dtype=torch.long, device=bcast_dev)
+    if is_main:
+        idx_t[0].copy_(torch.from_numpy(offs_np).to(bcast_dev))
+        idx_t[1].copy_(torch.from_numpy(nat_np).to(bcast_dev))
+    dist.broadcast(idx_t, 0)
+    offsets, natoms_all = idx_t[0].cpu().numpy(), idx_t[1].cpu().numpy()
+    del idx_t
+    # contiguous ranges balanced by atoms (each rank reads one sequential byte range)
+    cum = np.concatenate([[0], np.cumsum(natoms_all)])
+    edges = np.searchsorted(cum, cum[-1] * np.arange(world_size + 1) / world_size)
+    edges[0], edges[-1] = 0, n_all
+    lo, hi = int(edges[rank]), int(edges[rank + 1])
+    _log(f"  index_xyz:   {time.time() - t0:5.1f}s   ({n_all} frames, {int(cum[-1])} atoms; "
+         f"{world_size} ranks, ~{int(cum[-1]) // world_size} atoms each, "
+         f"chunks of ~{chunk_atoms} atoms, energy label: {energy_key})")
+
+    calc = NEPCalculator(model_file, dtype=dt, device=device)
+    backend = ops.resolve_backend("auto", num_types=calc.num_types,
+                                  device_type=torch.device(device).type)
+    t_setup = time.time() - t_total          # dist init + index broadcast + model load
+    part_dir = os.path.join(output_dir, ".parts", f"rank{rank:04d}")
+    progress = _Progress(hi - lo, verbose and is_main)
+    acc, tm, _ = _predict_frames(calc, xyz_file, offsets[lo:hi], natoms_all[lo:hi], part_dir,
+                                 dt, np_dtype, device, backend, batch_size, chunk_atoms,
+                                 energy_key, output_descriptor, progress, _log)
+    progress.close()
+    t_pred = time.time() - t_total
+    if verbose or os.environ.get("TORCHNEP_PREDICT_RANK_TIMING") == "1":
+        print(f"  [rank {rank}/{world_size}] frames {lo}-{hi - 1} ({int(cum[hi] - cum[lo])} atoms): "
+              f"setup {t_setup:.1f}s read {tm['read']:.1f}s neighbors {tm['neighbors']:.1f}s "
+              f"compute {tm['compute']:.1f}s (first chunk {tm.get('first_chunk', 0.0):.1f}s) "
+              f"write {tm['write']:.1f}s total {t_pred:.1f}s", flush=True)
+
+    # ---- global metrics (sum of squares / abs / counts) ----
+    vec = torch.tensor([v for k in ("e", "f", "v") for v in acc[k]], dtype=torch.float64,
+                       device=bcast_dev)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    g = vec.cpu().numpy()
+    acc_g = {k: [float(g[3 * i]), float(g[3 * i + 1]), int(g[3 * i + 2])]
+             for i, k in enumerate(("e", "f", "v"))}
+    dist.barrier()
+    # ---- rank 0 concatenates the parts in rank order ----
+    if is_main:
+        import shutil
+        t0 = time.time()
+        names = ["energy_train.out", "force_train.out", "virial_train.out", "stress_train.out"]
+        if output_descriptor:
+            names.append("descriptor.out")
+        for name in names:
+            with open(os.path.join(output_dir, name), "w") as dst:
+                for r in range(world_size):
+                    src = os.path.join(output_dir, ".parts", f"rank{r:04d}", name)
+                    if os.path.exists(src):
+                        with open(src) as s:
+                            shutil.copyfileobj(s, dst, 1 << 22)
+        shutil.rmtree(os.path.join(output_dir, ".parts"), ignore_errors=True)
+        _log(f"  rank 0 share: read {tm['read']:.1f}s neighbors {tm['neighbors']:.1f}s "
+             f"compute {tm['compute']:.1f}s write {tm['write']:.1f}s; "
+             f"all ranks done in {t_pred:.1f}s; merge {time.time() - t0:.1f}s")
+        _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
+             f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+        if verbose:
+            _metrics_table(acc_g, _log)
+    dist.barrier()
 
 
 # ---------------------------------------------------------------------------

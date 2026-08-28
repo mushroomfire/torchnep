@@ -373,6 +373,17 @@ predict_dataset(
 # stress_train.out, and (when output_descriptor != 0) descriptor.out
 ```
 
+### Multi-GPU / multi-node prediction
+
+`predict_dataset_sharded` has the same arguments and writes the same files, but is launched with one
+process per GPU (`torchrun --nproc_per_node=8 script.py`, or `srun` under Slurm).
+
+
+```python
+from torchnep import predict_dataset_sharded
+predict_dataset_sharded("nep.txt", "huge.xyz", output_dir="results")
+```
+
 ---
 
 ## 🗂️ Source layout
@@ -381,7 +392,7 @@ The `torchnep/` package is organised as follows:
 
 | File | Role |
 |------|------|
-| `__init__.py` | Public API — re-exports the three entry points `train_nep`, `train_nep_sharded`, `predict_dataset` |
+| `__init__.py` | Public API — re-exports the entry points `train_nep`, `train_nep_sharded`, `predict_dataset`, `predict_dataset_sharded` |
 | `data.py` | I/O and parsing — reads extended-XYZ frames and `nep.in`, plus the NumPy brute-force neighbor builder used for training |
 | `neighbor.py` | PyTorch linked-cell (cell-list) neighbor search, O(N) for the large structures of an ASE-driven MD run |
 | `model.py` | Trainable NEP4 model (`NEPModel`) as an `nn.Module`, per-type fitting nets, ZBL, and `slim_model` |

@@ -9,6 +9,11 @@
   the batch; any dataset finishes on any machine. Outputs unchanged.
 - Progress bar (tqdm when installed, plain otherwise) and a per-stage
   timing summary; one neighbor-list worker pool reused across chunks.
+- **`predict_dataset_sharded`**: multi-GPU / multi-node prediction
+  (torchrun / srun, one process per GPU): rank 0 indexes and broadcasts the
+  frame index, contiguous atom-balanced ranges per rank, each rank streams
+  its range, rank 0 merges the parts in order — identical files to the
+  single-process call.
 
 ## 1.0.3a1
 

@@ -378,3 +378,37 @@ def test_output_parity_with_gpumd(device, tmp_path):
     assert np.all(t_str[1, 6:] == -1e6)
     # Explicit sign check: predicted stress shares the predicted virial's sign.
     assert np.array_equal(np.sign(t_str[:, :6]), np.sign(t_vir[:, :6]))
+
+
+_SHARDED_PREDICT_RUNNER = """
+import sys
+from torchnep import predict_dataset_sharded
+predict_dataset_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3], dtype="float64", verbose=False)
+"""
+
+
+def test_predict_dataset_sharded_matches_single(tmp_path):
+    """2-rank predict_dataset_sharded (CPU/gloo via torchrun) writes the same
+    *_train.out files as predict_dataset. Opt-in like the DDP training test:
+    TORCHNEP_TEST_DDP=1 pytest tests/test_gpumd_parity.py -k sharded"""
+    import os, shutil, subprocess
+    if os.environ.get("TORCHNEP_TEST_DDP") != "1":
+        pytest.skip("multi-process test is local-only (set TORCHNEP_TEST_DDP=1)")
+    torchrun = shutil.which("torchrun")
+    if torchrun is None:
+        pytest.skip("torchrun not on PATH")
+    frames = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))
+    xyz = tmp_path / "virial_mix.xyz"
+    write_virial_mix_xyz(frames, xyz)
+    model = str(DATA_DIR / "nep_CrCoNi.txt")
+    predict_dataset(model, str(xyz), output_dir=str(tmp_path / "single"), dtype="float64",
+                    device="cpu", verbose=False, chunk_atoms=1)   # one frame per chunk
+    runner = tmp_path / "runner.py"; runner.write_text(_SHARDED_PREDICT_RUNNER)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=str(DATA_DIR.parent.parent) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    r = subprocess.run([torchrun, "--standalone", "--nproc_per_node=2", str(runner), model, str(xyz),
+                        str(tmp_path / "sharded")], capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    for name in ("energy_train.out", "force_train.out", "virial_train.out", "stress_train.out"):
+        a = np.loadtxt(tmp_path / "single" / name); b = np.loadtxt(tmp_path / "sharded" / name)
+        assert a.shape == b.shape and np.allclose(a, b, rtol=1e-6, atol=1e-6), name
