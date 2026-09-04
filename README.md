@@ -9,6 +9,8 @@
 
 A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (Neuroevolution Potential) training framework.
 
+Many ready-to-use examples (the training inputs and trained models of the TorchNEP paper) are available at [TorchNEP_models](https://github.com/mushroomfire/TorchNEP_models).
+
 ## ✨ Features
 
 - 🔄 **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
