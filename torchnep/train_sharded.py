@@ -499,17 +499,20 @@ def train_nep_sharded(
 
         shuffle_g = torch.Generator()
         shuffle_g.manual_seed(0)
-        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        # numpy, not a Python list: a list of 13M ints costs ~0.5 GB/rank
+        global_perm = torch.randperm(n_total, generator=shuffle_g).numpy()
         n_local = (n_total + world_size - 1) // world_size  # ceil
         pad = n_local * world_size - n_total
         if pad:
-            global_perm = global_perm + global_perm[:pad]
+            global_perm = np.concatenate([global_perm, global_perm[:pad]])
         local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        del global_perm
         t0 = time.time()
         frames = None
         local_frames = read_xyz_at(
-            data_file, train_offs[np.asarray(local_global_idx)],
+            data_file, train_offs[local_global_idx],
             energy_key=energy_key)
+        del train_offs
         _log(f"  parsed local shard ({len(local_frames)} frames) in "
              f"{time.time() - t0:.1f}s")
 
@@ -532,6 +535,7 @@ def train_nep_sharded(
             _stream_valid_local = read_xyz_at(
                 data_file, voffs[np.asarray(valid_local_global_idx)],
                 energy_key=energy_key)
+        del offs_all
 
         if slim_types:
             # Global species union from the local shards (bitmask MAX).
@@ -572,9 +576,45 @@ def train_nep_sharded(
     if not streamed:
         valid_frames = None
     if valid_file is not None:
-        valid_frames = read_xyz(valid_file, energy_key=energy_key)
-        _log(f"  read {len(valid_frames)} validation structures "
-             f"from {valid_file}")
+        # Rank 0 indexes the validation file once (byte offsets, no
+        # parsing), broadcasts the offsets, and every rank seek-reads only
+        # its padded-perm shard — the same scheme as the streamed training
+        # shard. Previously every rank parsed the whole file (a 1 GiB file
+        # costs several GiB of transient host memory per rank, times the
+        # number of ranks in file-system traffic).
+        from .data import index_xyz, read_xyz_at
+        bcast_dev = dev if dist.get_backend() == "nccl" else torch.device("cpu")
+        if is_main:
+            t0 = time.time()
+            voffs_np, _ = index_xyz(valid_file)
+            nv_t = torch.tensor([len(voffs_np)], dtype=torch.long,
+                                device=bcast_dev)
+        else:
+            nv_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+        dist.broadcast(nv_t, 0)
+        n_valid_total = int(nv_t.item())
+        voffs_t = torch.empty(n_valid_total, dtype=torch.long, device=bcast_dev)
+        if is_main:
+            voffs_t.copy_(torch.from_numpy(voffs_np).to(bcast_dev))
+        dist.broadcast(voffs_t, 0)
+        voffs = voffs_t.cpu().numpy()
+        del voffs_t
+        vsh_g = torch.Generator()
+        vsh_g.manual_seed(0)
+        vperm_sh = torch.randperm(n_valid_total, generator=vsh_g).numpy()
+        n_vlocal = (n_valid_total + world_size - 1) // world_size  # ceil
+        vpad = n_vlocal * world_size - n_valid_total
+        if vpad:
+            vperm_sh = np.concatenate([vperm_sh, vperm_sh[:vpad]])
+        valid_local_global_idx = vperm_sh[rank * n_vlocal:(rank + 1) * n_vlocal]
+        del vperm_sh
+        _stream_valid_local = read_xyz_at(
+            valid_file, voffs[valid_local_global_idx], energy_key=energy_key)
+        del voffs
+        valid_frames = None
+        _log(f"  validation file {valid_file}: {n_valid_total} structures, "
+             f"sharded across {world_size} ranks "
+             f"({len(_stream_valid_local)} per rank)")
     elif not streamed and valid_ratio is not None:
         # Same draw as export_valid_split / train_nep (see data.py).
         if valid_strategy == "stratified":
@@ -669,6 +709,8 @@ def train_nep_sharded(
     del est_frames
     structures = preprocess_structures(local_frames, config, np_dtype,
                                        mode=nmode)
+    del local_frames                # parsed frames are not needed any more
+    frames = None
     _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s"
          if nmode != "on_the_fly" else
          f"  prepared geometry (local shard) in {time.time() - t0:.1f}s")
@@ -682,7 +724,7 @@ def train_nep_sharded(
     # both numerator and denominator of the all-reduced sums — loss-fair,
     # same argument as the training shards).
     structures_v = None
-    if not streamed or valid_frames is not None:
+    if valid_frames is None and _stream_valid_local is None:
         valid_local_global_idx = None
         n_valid_total = 0
     if _stream_valid_local is not None:

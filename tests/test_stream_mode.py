@@ -19,6 +19,7 @@ independently from the raw per-frame structures (concatenation + index
 offsets + the Chebyshev/angular basis evaluated directly with the ops
 functions on the batch's rij).
 """
+import copy
 import numpy as np
 import pytest
 import torch
@@ -90,7 +91,7 @@ def test_collate_matches_reference(tmp_path, device):
     cfg = _config(tmp_path)
     frames = read_xyz(str(PBTE))[:20]
     structs = preprocess_structures(frames, cfg, np.float32)
-    store = StreamDataStore(structs, dev, dtype, config=cfg)
+    store = StreamDataStore(copy.deepcopy(structs), dev, dtype, config=cfg)
 
     rng = np.random.default_rng(3)
     for idx in ([0], list(range(8)), rng.permutation(20)[:8].tolist(),

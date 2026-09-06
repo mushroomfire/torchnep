@@ -234,6 +234,13 @@ class StreamDataStore:
     def __init__(self, structures: List[Dict], device: torch.device,
                  dtype: torch.dtype, config: dict = None,
                  neighbor_mode: str = "cached"):
+        """Build the store from preprocessed ``structures``.
+
+        The per-frame pair / geometry arrays are MOVED into the store's
+        concatenated tensors (popped from the dicts one frame at a time),
+        so the peak host memory is one copy of the data, not two. Callers
+        that still need those per-frame arrays must pass a copy.
+        """
         if config is None:
             raise ValueError("StreamDataStore requires config (it computes "
                              "the cached basis per batch)")
@@ -350,6 +357,27 @@ class StreamDataStore:
         return t.to(self.device)
 
     # ---- per-mode storage --------------------------------------------------
+    @staticmethod
+    def _gather_free(structures, key, total, np_dtype=None, drop=()):
+        """Concatenate ``structures[i][key]`` into one preallocated array,
+        releasing each frame's array as soon as it is copied (``drop`` names
+        further keys to release alongside, e.g. views of the same array).
+        Peak host memory is then 1x the field instead of the 2x that a
+        concatenate-then-discard would need — the difference between fitting
+        and OOM on a single node with a many-million-frame shard."""
+        first = structures[0][key]
+        np_dtype = np_dtype or first.dtype
+        out = np.empty((total,) + tuple(first.shape[1:]), dtype=np_dtype)
+        pos = 0
+        for s in structures:
+            a = s.pop(key)
+            n = len(a)
+            out[pos:pos + n] = a
+            pos += n
+            for k in drop:
+                s.pop(k, None)
+        return torch.from_numpy(out)
+
     def _init_pairs_cached(self, structures):
         """Full radial + angular pair lists with displacement vectors."""
         self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
@@ -358,28 +386,24 @@ class StreamDataStore:
                                 dtype=np.int64)
         self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
         self._nang_cum = np.concatenate([[0], np.cumsum(self._nang)])
-        dtype = self.dtype
-        self._pi_r_all = torch.from_numpy(
-            np.concatenate([s["pair_i_rad"] for s in structures]))
-        self._pj_r_all = torch.from_numpy(
-            np.concatenate([s["pair_j_rad"] for s in structures]))
-        self._rij_r_all = torch.from_numpy(
-            np.concatenate([s["rij_rad"] for s in structures])).to(dtype)
-        self._pi_a_all = torch.from_numpy(
-            np.concatenate([s["pair_i_ang"] for s in structures]))
-        self._pj_a_all = torch.from_numpy(
-            np.concatenate([s["pair_j_ang"] for s in structures]))
-        self._rij_a_all = torch.from_numpy(
-            np.concatenate([s["rij_ang"] for s in structures])).to(dtype)
+        np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
+        nr, na = int(self._nrad.sum()), int(self._nang.sum())
+        g = self._gather_free
+        self._pi_r_all = g(structures, "pair_i_rad", nr, np.int64)
+        self._pj_r_all = g(structures, "pair_j_rad", nr, np.int64)
+        self._rij_r_all = g(structures, "rij_rad", nr, np_dtype)
+        self._pi_a_all = g(structures, "pair_i_ang", na, np.int64)
+        self._pj_a_all = g(structures, "pair_j_ang", na, np.int64)
+        self._rij_a_all = g(structures, "rij_ang", na, np_dtype)
 
     def _init_geometry(self, structures):
         """Wrapped positions (per atom) and cells (per frame) — the inputs of
         the device-side displacement / neighbor computation."""
         np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
-        self._pos_all = torch.from_numpy(np.concatenate(
-            [np.asarray(s["positions"], dtype=np_dtype) for s in structures]))
+        self._pos_all = self._gather_free(structures, "positions",
+                                          int(self._nat.sum()), np_dtype)
         self._cell_all = torch.from_numpy(np.stack(
-            [np.asarray(s["cell"], dtype=np_dtype) for s in structures]))
+            [np.asarray(s.pop("cell"), dtype=np_dtype) for s in structures]))
 
     def _init_pairs_compact(self, structures):
         """One int32 pair list per frame (angular pairs first) + int8 image
@@ -389,12 +413,13 @@ class StreamDataStore:
         self._nang = np.asarray([int(s["n_ang"]) for s in structures],
                                 dtype=np.int64)
         self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
-        self._pi_all = torch.from_numpy(
-            np.concatenate([s["pair_i_rad"] for s in structures]))
-        self._pj_all = torch.from_numpy(
-            np.concatenate([s["pair_j_rad"] for s in structures]))
-        self._sh_all = torch.from_numpy(
-            np.concatenate([s["shift_rad"] for s in structures]))
+        nr = int(self._nrad.sum())
+        g = self._gather_free
+        # pair_i_ang is a view of pair_i_rad: drop it with its base array
+        self._pi_all = g(structures, "pair_i_rad", nr, np.int32,
+                         drop=("pair_i_ang",))
+        self._pj_all = g(structures, "pair_j_rad", nr, np.int32)
+        self._sh_all = g(structures, "shift_rad", nr, np.int8)
 
     def memory_bytes(self) -> int:
         """Host bytes held by the pair / geometry tensors of this store."""
@@ -928,14 +953,23 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
         return [_preprocess_one_frame(a) for a in args]
 
     import multiprocessing as mp
+    import gc
     method = os.environ.get("TORCHNEP_MP_START_METHOD", "fork")
     try:
         ctx = mp.get_context(method)
     except ValueError:
         ctx = mp.get_context("spawn")
     chunksize = max(1, len(frames) // (n_workers * 4))
-    with ctx.Pool(n_workers) as pool:
-        return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
+    # Forked workers share the parent's pages copy-on-write; a garbage
+    # collection in a worker would touch every parent object's refcount and
+    # copy the whole parsed-frames heap into each worker. Freezing the
+    # parent's objects before the fork keeps them out of the workers' GC.
+    gc.freeze()
+    try:
+        with ctx.Pool(n_workers) as pool:
+            return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
+    finally:
+        gc.unfreeze()
 
 
 def estimate_store_bytes(frames, config, itemsize=4):
@@ -1896,6 +1930,7 @@ def train_nep(
          f" / on_the_fly {_fmt_gb(est['on_the_fly'])}"
          + (f", budget {_fmt_gb(budget)})" if budget else ")"))
     structures = preprocess_structures(frames, config, np_dtype, mode=nmode)
+    del frames                      # parsed frames are not needed any more
     _log(f"  built neighbor lists in {time.time() - t0:.1f}s"
          if nmode != "on_the_fly" else
          f"  prepared geometry in {time.time() - t0:.1f}s")
