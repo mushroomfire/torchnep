@@ -451,50 +451,73 @@ def parse_nep_in(filename: str) -> Dict:
 # Neighbor list construction (numpy, CPU — shared by training and prediction)
 # ---------------------------------------------------------------------------
 
-def build_neighbor_list_np(positions, cell, cutoff):
-    """Build neighbor list using numpy (for preprocessing). Returns arrays.
+def wrap_positions(positions, cell):
+    """Wrap ``positions`` into the primary cell (fractional coords in [0, 1)).
 
-    Cell is stored with lattice vectors as ROWS. The perpendicular distance
-    between planes spanned by (b,c), (a,c), (a,b) is V/|b*c|, V/|a*c|,
-    V/|a*b|; these are ``1/|inv_cell[:,i]|`` (columns of inv_cell are the
-    reciprocal vectors). Using rows silently undercounts image replicas for
-    heavily skewed triclinic cells and drops real neighbors — bug fixed 2025.
-
-    Input positions may lie outside the primary cell. Under full PBC, physics
-    is translation-invariant, so we wrap fractional coordinates into [0, 1)
-    before computing ``n_rep``; otherwise atoms far outside the box would
-    miss periodic images that the (inside-box) ``n_rep`` estimate doesn't
-    cover.
+    Under full PBC the physics is translation-invariant, so every neighbor
+    builder works on wrapped coordinates; the wrapped array is also what the
+    compact / on-the-fly data stores keep, so their displacement vectors
+    are computed from exactly the coordinates the numpy builder used.
     """
-    N = positions.shape[0]
     inv_cell = np.linalg.inv(cell)
-
     frac = positions @ inv_cell
     frac -= np.floor(frac)
-    positions = frac @ cell
+    return frac @ cell, inv_cell
 
-    n_rep = [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i]))) for i in range(3)]
+
+def image_repeats(inv_cell, cutoff):
+    """Periodic image repeats per lattice direction needed to cover ``cutoff``.
+
+    The perpendicular distance between planes spanned by (b,c), (a,c), (a,b)
+    is ``1/|inv_cell[:, i]|`` (columns of inv_cell are the reciprocal
+    vectors). Using the cell ROWS instead silently undercounts image replicas
+    for heavily skewed triclinic cells and drops real neighbors — bug fixed
+    2025.
+    """
+    return [int(np.ceil(cutoff * np.linalg.norm(inv_cell[:, i])))
+            for i in range(3)]
+
+
+def build_neighbor_list_np_ex(positions, cell, cutoff):
+    """Numpy neighbor list that also reports the periodic image of each pair.
+
+    Returns ``(idx_i, idx_j, rij, shift_frac, positions_wrapped)``:
+    ``shift_frac`` is the (P, 3) integer lattice translation of the neighbor
+    image (``rij = pos_w[j] + shift_frac @ cell - pos_w[i]``), so a pair list
+    can be stored without its displacement vectors (7 bytes per pair instead
+    of 28) and ``rij`` recomputed on the device from the wrapped positions.
+    :func:`build_neighbor_list_np` is this function minus the extras and is
+    numerically identical to it (same arithmetic, same pair order).
+
+    Cell is stored with lattice vectors as ROWS. Input positions may lie
+    outside the primary cell; they are wrapped first (see
+    :func:`wrap_positions`) so the image estimate covers every neighbor.
+    """
+    N = positions.shape[0]
+    positions, inv_cell = wrap_positions(positions, cell)
+    n_rep = image_repeats(inv_cell, cutoff)
 
     a_r = np.arange(-n_rep[0], n_rep[0] + 1)
     b_r = np.arange(-n_rep[1], n_rep[1] + 1)
     c_r = np.arange(-n_rep[2], n_rep[2] + 1)
-    shifts_frac = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"), axis=-1)
-    shifts_frac = shifts_frac.reshape(-1, 3).astype(positions.dtype)
+    shifts_int = np.stack(np.meshgrid(a_r, b_r, c_r, indexing="ij"),
+                          axis=-1).reshape(-1, 3)
+    shifts_frac = shifts_int.astype(positions.dtype)
     shifts_cart = shifts_frac @ cell
     S = shifts_cart.shape[0]
+    zero_shift = np.all(shifts_int == 0, axis=1)
 
     if N * N * S < 8_000_000:
         disp = (positions[None, :, None, :] + shifts_cart[None, None, :, :]
                 - positions[:, None, None, :])
         dist = np.linalg.norm(disp, axis=-1)
-        zero_shift = np.all(shifts_frac == 0, axis=1)
         self_mask = np.eye(N, dtype=bool)[:, :, None] & zero_shift[None, None, :]
         valid = (dist < cutoff) & (dist > 1e-10) & ~self_mask
         idx_i, idx_j, idx_s = np.where(valid)
-        return idx_i.astype(np.int64), idx_j.astype(np.int64), disp[idx_i, idx_j, idx_s]
+        return (idx_i.astype(np.int64), idx_j.astype(np.int64),
+                disp[idx_i, idx_j, idx_s], shifts_int[idx_s], positions)
 
-    zero_shift = np.all(shifts_frac == 0, axis=1)
-    all_i, all_j, all_rij = [], [], []
+    all_i, all_j, all_s, all_rij = [], [], [], []
     for si in range(S):
         shifted = positions + shifts_cart[si]
         disp = shifted[None, :, :] - positions[:, None, :]
@@ -506,13 +529,23 @@ def build_neighbor_list_np(positions, cell, cutoff):
         if len(ii) > 0:
             all_i.append(ii)
             all_j.append(jj)
+            all_s.append(np.full(len(ii), si, dtype=np.int64))
             all_rij.append(disp[ii, jj])
     if not all_i:
         return (np.zeros(0, np.int64), np.zeros(0, np.int64),
-                np.zeros((0, 3), positions.dtype))
+                np.zeros((0, 3), positions.dtype),
+                np.zeros((0, 3), np.int64), positions)
     return (np.concatenate(all_i).astype(np.int64),
             np.concatenate(all_j).astype(np.int64),
-            np.concatenate(all_rij))
+            np.concatenate(all_rij),
+            shifts_int[np.concatenate(all_s)], positions)
+
+
+def build_neighbor_list_np(positions, cell, cutoff):
+    """Build neighbor list using numpy (for preprocessing). Returns
+    ``(idx_i, idx_j, rij)`` — see :func:`build_neighbor_list_np_ex`."""
+    idx_i, idx_j, rij, _, _ = build_neighbor_list_np_ex(positions, cell, cutoff)
+    return idx_i, idx_j, rij
 
 
 def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):

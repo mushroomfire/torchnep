@@ -42,7 +42,8 @@ from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
-                   stratified_split_indices, build_neighbor_list_np)
+                   stratified_split_indices, build_neighbor_list_np,
+                   build_neighbor_list_np_ex, wrap_positions, image_repeats)
 from . import ops
 from . import __version__
 from .predict import predict_from_store
@@ -231,15 +232,20 @@ class StreamDataStore:
     """
 
     def __init__(self, structures: List[Dict], device: torch.device,
-                 dtype: torch.dtype, config: dict = None):
+                 dtype: torch.dtype, config: dict = None,
+                 neighbor_mode: str = "cached"):
         if config is None:
             raise ValueError("StreamDataStore requires config (it computes "
                              "the cached basis per batch)")
+        if neighbor_mode not in NEIGHBOR_MODES:
+            raise ValueError(f"neighbor_mode {neighbor_mode!r} not in "
+                             f"{NEIGHBOR_MODES}")
         self.device = device
         self.dtype = dtype
         self.n = len(structures)
         self.has_cached_basis = True
         self._pin = device.type == "cuda"
+        self.neighbor_mode = neighbor_mode
 
         # Basis parameters (needed at collate time).
         self._rc_r = config["cutoff_radial"]
@@ -253,30 +259,23 @@ class StreamDataStore:
 
         self.natoms = [int(s["natoms"]) for s in structures]
         self._nat = np.asarray(self.natoms, dtype=np.int64)
-        self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
-                                dtype=np.int64)
-        self._nang = np.asarray([len(s["pair_i_ang"]) for s in structures],
-                                dtype=np.int64)
         self._nat_cum = np.concatenate([[0], np.cumsum(self._nat)])
-        self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
-        self._nang_cum = np.concatenate([[0], np.cumsum(self._nang)])
 
         # One concatenated CPU tensor per field (frame order); collate
         # slices them via the cumulative offsets above.
         self._at_all = torch.from_numpy(
             np.concatenate([s["atom_types"] for s in structures]))
-        self._pi_r_all = torch.from_numpy(
-            np.concatenate([s["pair_i_rad"] for s in structures]))
-        self._pj_r_all = torch.from_numpy(
-            np.concatenate([s["pair_j_rad"] for s in structures]))
-        self._rij_r_all = torch.from_numpy(
-            np.concatenate([s["rij_rad"] for s in structures])).to(dtype)
-        self._pi_a_all = torch.from_numpy(
-            np.concatenate([s["pair_i_ang"] for s in structures]))
-        self._pj_a_all = torch.from_numpy(
-            np.concatenate([s["pair_j_ang"] for s in structures]))
-        self._rij_a_all = torch.from_numpy(
-            np.concatenate([s["rij_ang"] for s in structures])).to(dtype)
+        if neighbor_mode == "cached":
+            self._init_pairs_cached(structures)
+        else:
+            self._init_geometry(structures)
+            if neighbor_mode == "compact":
+                self._init_pairs_compact(structures)
+            else:
+                # Neighbor counts are only known once the device search
+                # has run (scan_max_neighbors); until then they are
+                # reported as 0 so callers can fold them in later.
+                self._max_nn = None
 
         self.energy = [float(s["energy"]) if "energy" in s else 0.0
                        for s in structures]
@@ -350,6 +349,175 @@ class StreamDataStore:
             return t.pin_memory().to(self.device, non_blocking=True)
         return t.to(self.device)
 
+    # ---- per-mode storage --------------------------------------------------
+    def _init_pairs_cached(self, structures):
+        """Full radial + angular pair lists with displacement vectors."""
+        self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
+                                dtype=np.int64)
+        self._nang = np.asarray([len(s["pair_i_ang"]) for s in structures],
+                                dtype=np.int64)
+        self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
+        self._nang_cum = np.concatenate([[0], np.cumsum(self._nang)])
+        dtype = self.dtype
+        self._pi_r_all = torch.from_numpy(
+            np.concatenate([s["pair_i_rad"] for s in structures]))
+        self._pj_r_all = torch.from_numpy(
+            np.concatenate([s["pair_j_rad"] for s in structures]))
+        self._rij_r_all = torch.from_numpy(
+            np.concatenate([s["rij_rad"] for s in structures])).to(dtype)
+        self._pi_a_all = torch.from_numpy(
+            np.concatenate([s["pair_i_ang"] for s in structures]))
+        self._pj_a_all = torch.from_numpy(
+            np.concatenate([s["pair_j_ang"] for s in structures]))
+        self._rij_a_all = torch.from_numpy(
+            np.concatenate([s["rij_ang"] for s in structures])).to(dtype)
+
+    def _init_geometry(self, structures):
+        """Wrapped positions (per atom) and cells (per frame) — the inputs of
+        the device-side displacement / neighbor computation."""
+        np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
+        self._pos_all = torch.from_numpy(np.concatenate(
+            [np.asarray(s["positions"], dtype=np_dtype) for s in structures]))
+        self._cell_all = torch.from_numpy(np.stack(
+            [np.asarray(s["cell"], dtype=np_dtype) for s in structures]))
+
+    def _init_pairs_compact(self, structures):
+        """One int32 pair list per frame (angular pairs first) + int8 image
+        shifts; ``rij`` is rebuilt on the device from the geometry."""
+        self._nrad = np.asarray([len(s["pair_i_rad"]) for s in structures],
+                                dtype=np.int64)
+        self._nang = np.asarray([int(s["n_ang"]) for s in structures],
+                                dtype=np.int64)
+        self._nrad_cum = np.concatenate([[0], np.cumsum(self._nrad)])
+        self._pi_all = torch.from_numpy(
+            np.concatenate([s["pair_i_rad"] for s in structures]))
+        self._pj_all = torch.from_numpy(
+            np.concatenate([s["pair_j_rad"] for s in structures]))
+        self._sh_all = torch.from_numpy(
+            np.concatenate([s["shift_rad"] for s in structures]))
+
+    def memory_bytes(self) -> int:
+        """Host bytes held by the pair / geometry tensors of this store."""
+        names = {"cached": ("_pi_r_all", "_pj_r_all", "_rij_r_all",
+                            "_pi_a_all", "_pj_a_all", "_rij_a_all"),
+                 "compact": ("_pi_all", "_pj_all", "_sh_all", "_pos_all",
+                             "_cell_all"),
+                 "on_the_fly": ("_pos_all", "_cell_all")}[self.neighbor_mode]
+        return sum(getattr(self, n).numel() * getattr(self, n).element_size()
+                   for n in names)
+
+    # ---- device-side geometry ---------------------------------------------
+    def _rij_from_shifts(self, pos, pi, pj, shift, cell_b, struct_idx):
+        """``rij = pos[j] + shift @ cell[frame] - pos[i]`` for a batch
+        (same association order as the numpy builder)."""
+        cell_p = cell_b[struct_idx[pi]]                         # (P, 3, 3)
+        sc = torch.einsum("pk,pkl->pl", shift.to(self.dtype), cell_p)
+        return (pos[pj] + sc) - pos[pi]
+
+    def _search_device(self, pos, cell_b, nat, off):
+        """Batched brute-force neighbor search on the device (the numpy
+        builder's algorithm, vectorised over frames).
+
+        ``pos`` (Ntot, 3) wrapped positions of the batch, ``cell_b`` (B, 3, 3),
+        ``nat`` / ``off`` per-frame atom counts / offsets (host ints).
+        Frames are grouped by size (padding waste bounded by a memory
+        budget); the pair order returned is frame-major, then (i, j, image)
+        — identical to the cached path's order. Returns
+        ``(pair_i, pair_j, rij, d)`` for all pairs within ``max(rc)``.
+        """
+        dev = pos.device
+        rc = max(self._rc_r, self._rc_a)
+        B = len(nat)
+        inv = torch.linalg.inv(cell_b)                                # (B, 3, 3)
+        # image repeats per frame and direction (as image_repeats(): the
+        # perpendicular plane distance is 1/|inv[:, i]|)
+        nrep = torch.ceil(rc * torch.linalg.norm(inv, dim=1)).to(torch.long)   # (B, 3)
+        nrep_h = nrep.cpu().numpy()
+        nat_a = np.asarray(nat); off_a = np.asarray(off)
+        order = np.argsort(nat_a, kind="stable")
+        budget = 16_000_000 if dev.type != "cpu" else 2_000_000
+        pis, pjs, rijs, fids = [], [], [], []
+        k = 0
+        while k < B:
+            # group of consecutive (size-sorted) frames within the budget
+            g = [order[k]]; k += 1
+            while k < B:
+                cand = g + [order[k]]
+                nmax = int(nat_a[cand].max())
+                srep = (2 * nrep_h[cand].max(axis=0) + 1).prod()
+                if len(cand) * nmax * nmax * srep > budget:
+                    break
+                g = cand; k += 1
+            g = np.asarray(g)
+            G = len(g); nmax = int(nat_a[g].max())
+            rmax = nrep_h[g].max(axis=0)
+            ranges = [torch.arange(-int(r), int(r) + 1, device=dev) for r in rmax]
+            shifts_int = torch.stack(torch.meshgrid(*ranges, indexing="ij"),
+                                     dim=-1).reshape(-1, 3)             # (S, 3)
+            S = shifts_int.shape[0]
+            zero_shift = (shifts_int == 0).all(dim=1)
+            g_t = torch.as_tensor(g, device=dev)
+            cells = cell_b[g_t]                                          # (G, 3, 3)
+            sc = torch.matmul(shifts_int.to(self.dtype), cells)          # (G, S, 3)
+            # padded positions (G, nmax, 3)
+            ar = torch.arange(nmax, device=dev)
+            nat_g = torch.as_tensor(nat_a[g], device=dev)
+            off_g = torch.as_tensor(off_a[g], device=dev)
+            amask = ar.unsqueeze(0) < nat_g.unsqueeze(1)                 # (G, nmax)
+            gidx = (off_g.unsqueeze(1) + ar.unsqueeze(0)).clamp_(max=pos.shape[0] - 1)
+            gidx = torch.where(amask, gidx, torch.zeros_like(gidx))
+            pp = pos[gidx]                                               # (G, nmax, 3)
+            disp = (pp[:, None, :, None, :] + sc[:, None, None, :, :]
+                    - pp[:, :, None, None, :])                           # (G, N, N, S, 3)
+            dist = torch.linalg.norm(disp, dim=-1)
+            valid = (dist < rc) & (dist > 1e-10)
+            valid &= amask[:, :, None, None] & amask[:, None, :, None]
+            self_pair = torch.eye(nmax, dtype=torch.bool, device=dev)[None, :, :, None] \
+                & zero_shift[None, None, None, :]
+            valid &= ~self_pair
+            nz = valid.nonzero()                                         # (P, 4): g, i, j, s
+            if nz.shape[0] == 0:
+                continue
+            gg, ii, jj, ss = nz.unbind(1)
+            pis.append(off_g[gg] + ii); pjs.append(off_g[gg] + jj)
+            rijs.append(disp[gg, ii, jj, ss]); fids.append(g_t[gg])
+        if not pis:
+            z = torch.zeros(0, dtype=torch.long, device=dev)
+            return z, z.clone(), torch.zeros(0, 3, dtype=self.dtype, device=dev), \
+                torch.zeros(0, dtype=self.dtype, device=dev)
+        pi = torch.cat(pis); pj = torch.cat(pjs); rij = torch.cat(rijs)
+        fid = torch.cat(fids)
+        # restore batch frame order (pairs were produced size-sorted)
+        _, perm = torch.sort(fid, stable=True)
+        pi, pj, rij = pi[perm], pj[perm], rij[perm]
+        return pi, pj, rij, torch.linalg.norm(rij, dim=-1)
+
+    def scan_max_neighbors(self, batch_size: int = 256):
+        """``on_the_fly`` only: run the device search over the whole shard
+        once and return (max_NN_radial, max_NN_angular) — nep.txt needs
+        them for GPUMD's buffer sizing. Cached for repeated calls."""
+        if self.neighbor_mode != "on_the_fly":
+            raise RuntimeError("scan_max_neighbors is for on_the_fly stores")
+        if self._max_nn is not None:
+            return self._max_nn
+        max_r = max_a = 0
+        for st in range(0, self.n, batch_size):
+            idx = list(range(st, min(self.n, st + batch_size)))
+            staged = self._assemble_cpu(idx)
+            pos = self._to_dev(staged["positions"])
+            cell_b = self._to_dev(staged["cells"])
+            pi, pj, rij, d = self._search_device(pos, cell_b, staged["nat"],
+                                                 staged["off"])
+            if pi.numel() == 0:
+                continue
+            n_atoms = staged["N"]
+            cr = torch.bincount(pi[d < self._rc_r], minlength=n_atoms)
+            ca = torch.bincount(pi[d < self._rc_a], minlength=n_atoms)
+            max_r = max(max_r, int(cr.max()))
+            max_a = max(max_a, int(ca.max()))
+        self._max_nn = (max_r, max_a)
+        return self._max_nn
+
     def _assemble_cpu(self, indices: List[int]) -> Dict:
         """CPU half of collate: gather the frames' arrays into contiguous
         (pinned) host tensors. Runs entirely on the CPU, so a background
@@ -357,20 +525,11 @@ class StreamDataStore:
         (see ``iter_collated``)."""
         idx = np.asarray(indices, dtype=np.int64)
         nat = self._nat[idx]
-        nr = self._nrad[idx]
-        na = self._nang[idx]
         offsets = np.concatenate([[0], np.cumsum(nat)])
 
         idx_t = torch.from_numpy(idx)
         nat_t = torch.from_numpy(nat)
-        nr_t = torch.from_numpy(nr)
-        na_t = torch.from_numpy(na)
         off_t = torch.from_numpy(offsets[:-1])
-
-        # Pair indices are frame-local in storage; shift each frame's pairs
-        # by its atom offset within the batch.
-        off_rep_r = torch.repeat_interleave(off_t, nr_t)
-        off_rep_a = torch.repeat_interleave(off_t, na_t)
 
         pin = self._pin
         def _stage(t):
@@ -382,16 +541,55 @@ class StreamDataStore:
             "atom_types": _stage(self._cat(self._at_all, idx, self._nat_cum)),
             "struct_idx": _stage(torch.repeat_interleave(
                 torch.arange(len(indices), dtype=torch.long), nat_t)),
-            "pair_i_rad": _stage(
-                self._cat(self._pi_r_all, idx, self._nrad_cum) + off_rep_r),
-            "pair_j_rad": _stage(
-                self._cat(self._pj_r_all, idx, self._nrad_cum) + off_rep_r),
-            "rij_rad": _stage(self._cat(self._rij_r_all, idx, self._nrad_cum)),
-            "pair_i_ang": _stage(
-                self._cat(self._pi_a_all, idx, self._nang_cum) + off_rep_a),
-            "pair_j_ang": _stage(
-                self._cat(self._pj_a_all, idx, self._nang_cum) + off_rep_a),
-            "rij_ang": _stage(self._cat(self._rij_a_all, idx, self._nang_cum)),
+        }
+        mode = self.neighbor_mode
+        if mode == "cached":
+            nr = self._nrad[idx]; na = self._nang[idx]
+            nr_t = torch.from_numpy(nr); na_t = torch.from_numpy(na)
+            # Pair indices are frame-local in storage; shift each frame's
+            # pairs by its atom offset within the batch.
+            off_rep_r = torch.repeat_interleave(off_t, nr_t)
+            off_rep_a = torch.repeat_interleave(off_t, na_t)
+            out.update({
+                "pair_i_rad": _stage(
+                    self._cat(self._pi_r_all, idx, self._nrad_cum) + off_rep_r),
+                "pair_j_rad": _stage(
+                    self._cat(self._pj_r_all, idx, self._nrad_cum) + off_rep_r),
+                "rij_rad": _stage(self._cat(self._rij_r_all, idx, self._nrad_cum)),
+                "pair_i_ang": _stage(
+                    self._cat(self._pi_a_all, idx, self._nang_cum) + off_rep_a),
+                "pair_j_ang": _stage(
+                    self._cat(self._pj_a_all, idx, self._nang_cum) + off_rep_a),
+                "rij_ang": _stage(self._cat(self._rij_a_all, idx, self._nang_cum)),
+            })
+        else:
+            out["positions"] = _stage(self._cat(self._pos_all, idx, self._nat_cum))
+            out["cells"] = _stage(self._cell_all[idx_t])
+            if mode == "compact":
+                nr = self._nrad[idx]; na = self._nang[idx]
+                nr_t = torch.from_numpy(nr); na_t = torch.from_numpy(na)
+                off_rep_r = torch.repeat_interleave(off_t, nr_t)
+                off_rep_a = torch.repeat_interleave(off_t, na_t)
+                cum = self._nrad_cum
+                # angular pairs = the first n_ang pairs of each frame's list
+                def _cat_ang(t):
+                    return torch.cat([t[cum[i]:cum[i] + na[k]]
+                                      for k, i in enumerate(idx)])
+                out.update({
+                    "pair_i_rad": _stage(
+                        self._cat(self._pi_all, idx, cum).to(torch.long) + off_rep_r),
+                    "pair_j_rad": _stage(
+                        self._cat(self._pj_all, idx, cum).to(torch.long) + off_rep_r),
+                    "shift_rad": _stage(self._cat(self._sh_all, idx, cum)),
+                    "pair_i_ang": _stage(
+                        _cat_ang(self._pi_all).to(torch.long) + off_rep_a),
+                    "pair_j_ang": _stage(
+                        _cat_ang(self._pj_all).to(torch.long) + off_rep_a),
+                    "shift_ang": _stage(_cat_ang(self._sh_all)),
+                })
+            else:
+                out["nat"] = nat; out["off"] = offsets[:-1]
+        out.update({
             "energy": _stage(self._energy_t[idx_t]),
             "natoms": _stage(self._nat_t[idx_t].to(self.dtype)),
             "energy_mask": _stage(self._e_flag_t[idx_t]),
@@ -408,13 +606,19 @@ class StreamDataStore:
             "has_e": bool(self._e_flag_t[idx_t].any()),
             "has_f": bool(self._f_flag_t[idx_t].any()),
             "has_v": bool(self._v_flag_t[idx_t].any()),
-        }
+        })
         return out
 
-    _DEVICE_KEYS = ("atom_types", "struct_idx", "pair_i_rad", "pair_j_rad",
-                    "rij_rad", "pair_i_ang", "pair_j_ang", "rij_ang",
-                    "energy", "natoms", "energy_mask", "forces",
-                    "force_mask", "virial", "virial_mask", "volumes")
+    _COMMON_KEYS = ("atom_types", "struct_idx", "energy", "natoms",
+                    "energy_mask", "forces", "force_mask", "virial",
+                    "virial_mask", "volumes")
+    _MODE_KEYS = {
+        "cached": ("pair_i_rad", "pair_j_rad", "rij_rad",
+                   "pair_i_ang", "pair_j_ang", "rij_ang"),
+        "compact": ("positions", "cells", "pair_i_rad", "pair_j_rad",
+                    "shift_rad", "pair_i_ang", "pair_j_ang", "shift_ang"),
+        "on_the_fly": ("positions", "cells"),
+    }
 
     def _basis_impl(self, rij_r, rij_a):
         """Per-batch Chebyshev/angular basis.
@@ -454,10 +658,29 @@ class StreamDataStore:
         batch = {"N": staged["N"], "num_structures": staged["num_structures"],
                  "has_e": staged["has_e"], "has_f": staged["has_f"],
                  "has_v": staged["has_v"]}
-        for key in self._DEVICE_KEYS:
+        mode = self.neighbor_mode
+        for key in self._COMMON_KEYS + self._MODE_KEYS[mode]:
             t = staged[key]
             batch[key] = (t.to(dev, non_blocking=True) if self._pin
                           else t.to(dev))
+        if mode == "compact":
+            # displacement vectors from wrapped positions + image shifts
+            pos, cells, sidx = batch["positions"], batch["cells"], batch["struct_idx"]
+            batch["rij_rad"] = self._rij_from_shifts(
+                pos, batch["pair_i_rad"], batch["pair_j_rad"],
+                batch.pop("shift_rad"), cells, sidx)
+            batch["rij_ang"] = self._rij_from_shifts(
+                pos, batch["pair_i_ang"], batch["pair_j_ang"],
+                batch.pop("shift_ang"), cells, sidx)
+        elif mode == "on_the_fly":
+            pi, pj, rij, d = self._search_device(
+                batch["positions"], batch["cells"], staged["nat"], staged["off"])
+            m_r = d < self._rc_r
+            m_a = d < self._rc_a
+            batch["pair_i_rad"], batch["pair_j_rad"], batch["rij_rad"] = \
+                pi[m_r], pj[m_r], rij[m_r]
+            batch["pair_i_ang"], batch["pair_j_ang"], batch["rij_ang"] = \
+                pi[m_a], pj[m_a], rij[m_a]
         (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
          batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
          batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"])
@@ -559,26 +782,65 @@ def iter_collated(data_store, index_lists):
 # Preprocessing
 # ---------------------------------------------------------------------------
 
+NEIGHBOR_MODES = ("cached", "compact", "on_the_fly")
+
+
 def _preprocess_one_frame(args):
-    """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
-    frame, rc_rad, rc_ang, max_rc, type_names, dtype = args
+    """Worker: build neighbor lists for a single frame. Picklable for mp.Pool.
+
+    ``mode`` selects what the structure carries (see ``StreamDataStore``):
+
+    - ``cached``: full radial + angular pair lists with displacement vectors
+      (the original layout, 28 bytes per pair per list);
+    - ``compact``: one pair list (angular pairs first, ``n_ang`` of them)
+      as int32 indices + int8 image shifts (11 bytes per pair) plus the
+      wrapped positions and cell — ``rij`` is recomputed on the device;
+    - ``on_the_fly``: wrapped positions and cell only; the neighbor search
+      itself runs on the device per batch.
+    """
+    frame, rc_rad, rc_ang, max_rc, type_names, dtype, mode = args
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
                           dtype=np.int64)
-    pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
-    dij = np.linalg.norm(rij, axis=1)
-    rad_mask = dij < rc_rad
-    ang_mask = dij < rc_ang
     s = {
         "natoms": frame["natoms"],
         "atom_types": atom_types,
         "volume": float(abs(np.linalg.det(cell))),   # A**3, used for stress RMSE
-        "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
-        "rij_rad": rij[rad_mask].astype(dtype),
-        "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
-        "rij_ang": rij[ang_mask].astype(dtype),
     }
+    if mode == "on_the_fly":
+        s["positions"], _ = wrap_positions(positions, cell)
+        s["positions"] = s["positions"].astype(dtype, copy=False)
+        s["cell"] = cell
+    else:
+        pair_i, pair_j, rij, shift, pos_w = build_neighbor_list_np_ex(
+            positions, cell, max_rc)
+        dij = np.linalg.norm(rij, axis=1)
+        rad_mask = dij < rc_rad
+        ang_mask = dij < rc_ang
+        if mode == "cached":
+            s.update({
+                "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
+                "rij_rad": rij[rad_mask].astype(dtype),
+                "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
+                "rij_ang": rij[ang_mask].astype(dtype),
+            })
+        else:   # compact: radial list with the angular pairs first
+            # rc_ang <= rc_rad in NEP, so ang pairs are a subset of the
+            # radial pairs; a stable partition keeps the builder's order
+            # inside each group.
+            order = np.concatenate([np.nonzero(rad_mask & ang_mask)[0],
+                                    np.nonzero(rad_mask & ~ang_mask)[0]])
+            n_ang = int((rad_mask & ang_mask).sum())
+            s.update({
+                "pair_i_rad": pair_i[order].astype(np.int32),
+                "pair_j_rad": pair_j[order].astype(np.int32),
+                "shift_rad": shift[order].astype(np.int8),
+                "n_ang": n_ang,
+                "positions": pos_w.astype(dtype, copy=False),
+                "cell": cell,
+            })
+            s["pair_i_ang"] = s["pair_i_rad"][:n_ang]      # views, no copy
     if "energy" in frame:
         s["energy"] = frame["energy"]
     if "forces" in frame:
@@ -622,8 +884,11 @@ def make_preproc_pool(n_workers=None):
 
 
 def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
-                          pool=None):
+                          pool=None, mode="cached"):
     """Build neighbor lists for all frames, parallelized across CPU cores.
+
+    ``mode`` (``cached`` / ``compact`` / ``on_the_fly``) selects the
+    per-structure layout, see :func:`_preprocess_one_frame`.
 
     Per-frame work is embarrassingly parallel. Worker behavior:
 
@@ -646,7 +911,10 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
-    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
+    if mode not in NEIGHBOR_MODES:
+        raise ValueError(f"neighbor mode {mode!r} not in {NEIGHBOR_MODES}")
+    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype, mode)
+            for f in frames]
 
     if pool is not None:
         if len(frames) < 64:
@@ -670,11 +938,93 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
         return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
 
 
+def estimate_store_bytes(frames, config, itemsize=4):
+    """Rough host-memory need of the three ``StreamDataStore`` layouts for
+    ``frames`` (dicts with ``natoms`` and ``cell``), in bytes.
+
+    Directed pairs per frame ~ N * (N / V) * 4/3 pi rc^3 (uniform density);
+    the angular list is the radial one scaled by (rc_ang / rc_rad)^3.
+    Returns ``{"cached": b, "compact": b, "on_the_fly": b}``; the cached
+    figure is ~2x conservative for the temporary per-frame lists that exist
+    while the store is being concatenated.
+    """
+    rc_r = float(config["cutoff_radial"]); rc_a = float(config["cutoff_angular"])
+    sphere = 4.0 / 3.0 * np.pi * rc_r ** 3
+    ang_ratio = (rc_a / rc_r) ** 3
+    nat = np.asarray([f["natoms"] for f in frames], dtype=np.float64)
+    vol = np.asarray([abs(np.linalg.det(np.asarray(f["cell"], dtype=np.float64)))
+                      for f in frames])
+    vol = np.maximum(vol, 1.0)
+    pairs = float((nat * nat / vol * sphere).sum())
+    atoms = float(nat.sum())
+    cached = pairs * (8 + 8 + 3 * itemsize) * (1.0 + ang_ratio)
+    compact = pairs * (4 + 4 + 3) + atoms * 3 * itemsize + len(frames) * 9 * itemsize
+    geometry = atoms * 3 * itemsize + len(frames) * 9 * itemsize
+    labels = atoms * 3 * itemsize + atoms * 8            # forces + types
+    return {"cached": 2.0 * cached + labels, "compact": 2.0 * compact + labels,
+            "on_the_fly": 2.0 * geometry + labels}
+
+
+def host_memory_budget():
+    """Host bytes this process may use: min(cgroup limit, physical RAM)
+    divided by the number of ranks sharing the node (LOCAL_WORLD_SIZE /
+    SLURM_NTASKS_PER_NODE). None when it cannot be determined."""
+    limits = []
+    for p in ("/sys/fs/cgroup/memory.max",
+              "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(p).read().strip()
+            if v.isdigit() and int(v) < 1 << 60:
+                limits.append(int(v))
+        except OSError:
+            pass
+    try:
+        limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    if not limits:
+        return None
+    local = int(os.environ.get("LOCAL_WORLD_SIZE",
+                               os.environ.get("SLURM_NTASKS_PER_NODE", 1)))
+    return min(limits) / max(1, local)
+
+
+def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
+                         fraction=0.5, log=print):
+    """Resolve ``requested`` (``auto`` or an explicit mode) to a mode.
+
+    ``auto`` takes the first layout, in the order cached -> compact ->
+    on_the_fly, whose estimated host need fits in ``fraction`` of this
+    rank's memory budget. Returns ``(mode, estimate_dict, budget)``."""
+    est = estimate_store_bytes(frames, config, itemsize)
+    budget = host_memory_budget()
+    if requested != "auto":
+        if requested not in NEIGHBOR_MODES:
+            raise ValueError(f"neighbor_mode {requested!r} not in "
+                             f"('auto',) + {NEIGHBOR_MODES}")
+        return requested, est, budget
+    if budget is None:
+        return "cached", est, budget
+    for m in NEIGHBOR_MODES:
+        if est[m] <= fraction * budget:
+            return m, est, budget
+    return "on_the_fly", est, budget
+
+
+def _fmt_gb(b):
+    return f"{b / 2**30:.1f} GiB"
+
+
 def compute_max_neighbors(structures):
-    """Return (max_NN_radial, max_NN_angular) over all structures."""
+    """Return (max_NN_radial, max_NN_angular) over all structures.
+
+    Structures without pair lists (``on_the_fly`` mode) contribute 0; the
+    store's :meth:`StreamDataStore.scan_max_neighbors` covers them."""
     max_rad = max_ang = 0
     for s in structures:
         n = s["natoms"]
+        if "pair_i_rad" not in s:
+            continue
         if len(s["pair_i_rad"]) > 0:
             counts = np.bincount(s["pair_i_rad"], minlength=n)
             max_rad = max(max_rad, int(counts.max()))
@@ -1271,8 +1621,17 @@ def train_nep(
     valid_file: str = None,
     valid_ratio: float = None,
     valid_strategy: str = "stratified",
+    neighbor_mode: str = "auto",
 ):
     """Train a NEP model on a single device (GPU / CPU / MPS).
+
+    ``neighbor_mode``: how the training data is held in host memory —
+    ``cached`` (full neighbor lists with displacement vectors, fastest),
+    ``compact`` (int32 indices + int8 image shifts, ~4x smaller, ``rij``
+    rebuilt on the device per batch), ``on_the_fly`` (positions + cells
+    only, the neighbor search runs on the device per batch — fits any
+    dataset). ``auto`` (default) takes the first of these whose estimated
+    footprint fits in half of this process's memory budget.
 
     Hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / …) come
     from ``config_file`` only. See README for the full nep.in reference.
@@ -1529,17 +1888,30 @@ def train_nep(
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
-    structures = preprocess_structures(frames, config, np_dtype)
-    _log(f"  built neighbor lists in {time.time() - t0:.1f}s")
+    nmode, est, budget = choose_neighbor_mode(
+        frames + (valid_frames or []), config, neighbor_mode,
+        itemsize=np.dtype(np_dtype).itemsize)
+    _log(f"  neighbor_mode: {nmode} (requested {neighbor_mode}; estimate "
+         f"cached {_fmt_gb(est['cached'])} / compact {_fmt_gb(est['compact'])}"
+         f" / on_the_fly {_fmt_gb(est['on_the_fly'])}"
+         + (f", budget {_fmt_gb(budget)})" if budget else ")"))
+    structures = preprocess_structures(frames, config, np_dtype, mode=nmode)
+    _log(f"  built neighbor lists in {time.time() - t0:.1f}s"
+         if nmode != "on_the_fly" else
+         f"  prepared geometry in {time.time() - t0:.1f}s")
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
 
     t0 = time.time()
-    data_store = StreamDataStore(structures, dev, dtype, config=config)
+    data_store = StreamDataStore(structures, dev, dtype, config=config,
+                                 neighbor_mode=nmode)
     del structures
+    if nmode == "on_the_fly":
+        max_NN_rad, max_NN_ang = data_store.scan_max_neighbors()
     if dev.type == "cuda":
         torch.cuda.synchronize()
-    _log(f"  data store ready: dataset in host memory, batches streamed "
+    _log(f"  data store ready ({nmode}, {_fmt_gb(data_store.memory_bytes())} "
+         f"of pair/geometry data): dataset in host memory, batches streamed "
          f"to {dev} ({time.time() - t0:.1f}s)")
     _log(f"  coverage: {data_store.n_energy} E / "
          f"{data_store.n_forces} F / {data_store.n_virial} V")
@@ -1547,14 +1919,18 @@ def train_nep(
     valid_store = None
     if valid_frames is not None:
         t0 = time.time()
-        structures_v = preprocess_structures(valid_frames, config, np_dtype)
+        structures_v = preprocess_structures(valid_frames, config, np_dtype,
+                                             mode=nmode)
         # nep.txt records max neighbor counts for MD buffer sizing — cover
         # the validation frames too (in ratio mode they came from data_file,
         # so this matches what a no-valid run would have written).
         vNN_rad, vNN_ang = compute_max_neighbors(structures_v)
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config,
+                                      neighbor_mode=nmode)
+        if nmode == "on_the_fly":
+            vNN_rad, vNN_ang = valid_store.scan_max_neighbors()
         max_NN_rad = max(max_NN_rad, vNN_rad)
         max_NN_ang = max(max_NN_ang, vNN_ang)
-        valid_store = StreamDataStore(structures_v, dev, dtype, config=config)
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "

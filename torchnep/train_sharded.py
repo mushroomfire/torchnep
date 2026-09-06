@@ -146,7 +146,8 @@ from .train import (
     _BANNER, _AUTHOR,
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
-    preprocess_structures,
+    preprocess_structures, compute_max_neighbors,
+    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
     _save_checkpoint, _load_checkpoint,
     _trim_loss_log, _accumulate_true_loss_sums,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
@@ -241,6 +242,7 @@ def train_nep_sharded(
     valid_file: str = None,
     valid_ratio: float = None,
     valid_strategy: str = "stratified",
+    neighbor_mode: str = "auto",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -648,21 +650,31 @@ def train_nep_sharded(
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
-    structures = preprocess_structures(local_frames, config, np_dtype)
-    _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s")
+    # Neighbor layout: every rank estimates its own shard; the most
+    # memory-saving choice wins globally (all-reduce MAX) so all ranks share
+    # one layout (identical numerics / pair ordering across the job).
+    est_frames = list(local_frames) + list(valid_frames or [])
+    if _stream_valid_local is not None:
+        est_frames += list(_stream_valid_local)
+    nmode, est, budget = choose_neighbor_mode(
+        est_frames, config, neighbor_mode, itemsize=np.dtype(np_dtype).itemsize)
+    mode_t = torch.tensor([NEIGHBOR_MODES.index(nmode)], dtype=torch.long,
+                          device=dev)
+    dist.all_reduce(mode_t, op=dist.ReduceOp.MAX)
+    nmode = NEIGHBOR_MODES[int(mode_t.item())]
+    _log(f"  neighbor_mode: {nmode} (requested {neighbor_mode}; rank-0 shard "
+         f"estimate cached {_fmt_gb(est['cached'])} / compact "
+         f"{_fmt_gb(est['compact'])} / on_the_fly {_fmt_gb(est['on_the_fly'])}"
+         + (f", budget {_fmt_gb(budget)} per rank)" if budget else ")"))
+    del est_frames
+    structures = preprocess_structures(local_frames, config, np_dtype,
+                                       mode=nmode)
+    _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s"
+         if nmode != "on_the_fly" else
+         f"  prepared geometry (local shard) in {time.time() - t0:.1f}s")
 
     # max_NN: local max then all-reduce so rank-0 has the global value
-    def _compute_max_neighbors_local(structures):
-        max_rad = max_ang = 0
-        for s in structures:
-            n = s["natoms"]
-            if len(s["pair_i_rad"]) > 0:
-                counts = np.bincount(s["pair_i_rad"], minlength=n)
-                max_rad = max(max_rad, int(counts.max()))
-            if len(s["pair_i_ang"]) > 0:
-                counts = np.bincount(s["pair_i_ang"], minlength=n)
-                max_ang = max(max_ang, int(counts.max()))
-        return max_rad, max_ang
+    _compute_max_neighbors_local = compute_max_neighbors
 
     # Validation frames: sharded across ranks with the same padded-perm
     # scheme as the training frames (equal shard sizes keep the per-epoch
@@ -675,7 +687,7 @@ def train_nep_sharded(
         n_valid_total = 0
     if _stream_valid_local is not None:
         structures_v = preprocess_structures(_stream_valid_local, config,
-                                             np_dtype)
+                                             np_dtype, mode=nmode)
         del _stream_valid_local
     if valid_frames is not None:
         n_valid_total = len(valid_frames)
@@ -690,7 +702,7 @@ def train_nep_sharded(
             vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
         structures_v = preprocess_structures(
             [valid_frames[i] for i in valid_local_global_idx],
-            config, np_dtype)
+            config, np_dtype, mode=nmode)
         del valid_frames
 
     local_max_rad, local_max_ang = _compute_max_neighbors_local(structures)
@@ -700,22 +712,33 @@ def train_nep_sharded(
         v_max_rad, v_max_ang = _compute_max_neighbors_local(structures_v)
         local_max_rad = max(local_max_rad, v_max_rad)
         local_max_ang = max(local_max_ang, v_max_ang)
+
+    t0 = time.time()
+    data_store = StreamDataStore(structures, dev, dtype, config=config,
+                                 neighbor_mode=nmode)
+    del structures
+    valid_store = None
+    if structures_v is not None:
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config,
+                                      neighbor_mode=nmode)
+        del structures_v
+    if nmode == "on_the_fly":
+        # no host pair lists: one device pass over the shard gives the
+        # neighbor counts nep.txt needs
+        local_max_rad, local_max_ang = data_store.scan_max_neighbors()
+        if valid_store is not None:
+            v_max_rad, v_max_ang = valid_store.scan_max_neighbors()
+            local_max_rad = max(local_max_rad, v_max_rad)
+            local_max_ang = max(local_max_ang, v_max_ang)
     nn_t = torch.tensor([local_max_rad, local_max_ang], dtype=torch.long,
                         device=dev)
     dist.all_reduce(nn_t, op=dist.ReduceOp.MAX)
     max_NN_rad, max_NN_ang = int(nn_t[0].item()), int(nn_t[1].item())
-
-    t0 = time.time()
-    data_store = StreamDataStore(structures, dev, dtype, config=config)
-    del structures
-    valid_store = None
-    if structures_v is not None:
-        valid_store = StreamDataStore(structures_v, dev, dtype, config=config)
-        del structures_v
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  data store ready: shard in host memory, batches streamed "
-         f"to {dev} ({time.time() - t0:.1f}s)")
+    _log(f"  data store ready ({nmode}, {_fmt_gb(data_store.memory_bytes())} "
+         f"of pair/geometry data per rank): shard in host memory, batches "
+         f"streamed to {dev} ({time.time() - t0:.1f}s)")
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
