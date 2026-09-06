@@ -908,12 +908,19 @@ def _write_predictions(output_dir: str, n_total_frames: int,
     already in global input-xyz order (frame 0 first)."""
     os.makedirs(output_dir, exist_ok=True)
 
-    np.savetxt(os.path.join(output_dir, f"energy_{suffix}.out"),
-               np.column_stack([e_pred, e_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
-               np.column_stack([f_pred, f_ref]), fmt="%.10g")
-    np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
-               np.column_stack([v_pred, v_ref]), fmt="%.10g")
+    def _save(name, cols, block=1_000_000):
+        """np.savetxt in row blocks: a single call formats the whole table
+        into one Python string first (~2x the text size — 12 GiB for the
+        force file of a 13M-frame set); blocks bound that at ~100 MB."""
+        n = len(cols[0])
+        with open(os.path.join(output_dir, name), "w") as fh:
+            for st in range(0, n, block):
+                np.savetxt(fh, np.column_stack([c[st:st + block] for c in cols]),
+                           fmt="%.10g")
+
+    _save(f"energy_{suffix}.out", [e_pred, e_ref])
+    _save(f"force_{suffix}.out", [f_pred, f_ref])
+    _save(f"virial_{suffix}.out", [v_pred, v_ref])
 
     # Stress (GPa), GPUMD sign (+virial/V); missing refs keep -1e6 unscaled.
     nat_col = natoms.astype(np.float64)[:, None]
@@ -922,8 +929,7 @@ def _write_predictions(output_dir: str, n_total_frames: int,
                                       keep_missing=False)
     stress_ref = _stress_from_virial(v_ref, nat_col, vol_col,
                                      keep_missing=True)
-    np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
-               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+    _save(f"stress_{suffix}.out", [stress_pred, stress_ref])
 
 
 def predict_from_store_sharded(model, data_store, local_global_idx,

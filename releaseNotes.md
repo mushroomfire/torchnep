@@ -8,6 +8,27 @@
   per-step collective was latency-bound and took up to 80% of an epoch at
   256 ranks; epoch time on 64 LUMI nodes (512 GCDs) drops from 77 s to
   11 s on a 13M-frame set. Loss and results are bit-identical.
+- **`neighbor_mode`** (`train_nep`, `train_nep_sharded`; default `auto`):
+  how the training shard is held in host memory. `cached` keeps full
+  neighbor lists with displacement vectors (as before); `compact` keeps
+  int32 pairs + int8 image shifts and rebuilds `rij` on the device (4x
+  less host memory, same speed within a few %); `on_the_fly` keeps only
+  positions and cells and runs the neighbor search on the device per
+  batch (no pair memory at all, ~10-20% slower). `auto` measures the pair
+  count on a sample of frames and takes the first layout that fits half
+  of the process's memory budget (cgroup / RAM / ranks per node), so a
+  13M-frame set now trains on one 8-GCD node instead of running out of
+  memory. Pair sets are identical across layouts.
+- **Host memory** of sharded training cut further: the end-of-training
+  prediction gathers to rank 0 one rank at a time instead of giving every
+  rank the whole dataset's predictions (~10 GiB/rank on 13M frames); the
+  validation file is indexed once and read per shard; the store is built
+  by moving the per-frame arrays instead of copying; parsed frames are
+  released after preprocessing. The log now prints host RSS at each data
+  stage (`TORCHNEP_MEMLOG=1` for every epoch).
+- Collective timeout defaults to 3 h (`TORCHNEP_DIST_TIMEOUT_MIN`): rank 0
+  writing large prediction files no longer trips the 10-minute default
+  while the other ranks wait.
 
 ## 1.0.3a2
 
