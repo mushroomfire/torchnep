@@ -960,35 +960,53 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     local["global_idx"] = np.asarray(local_global_idx, dtype=np.int64)
     _log(f"  compute:  {time.time() - t_compute:5.1f}s")
 
-    # Gather per-rank arrays onto rank 0. all_gather_object stays on the
-    # object-pickle path (cheap for our sizes: the per-rank arrays together
-    # are the same size as the full dataset).
+    # Gather per-rank arrays onto rank 0, one rank at a time (point-to-point,
+    # pickled bytes). all_gather_object would give EVERY rank the whole
+    # dataset's predictions — ~10 GiB per rank on a 13M-frame set — which
+    # was the largest host-memory item of a sharded run. Rank 0 folds each
+    # part into the global arrays as it arrives and drops it, so its peak
+    # is the global arrays plus one part; other ranks hold only their own.
     t_gather = time.time()
-    if world_size > 1:
-        gathered = [None] * world_size
-        dist.all_gather_object(gathered, local)
-    else:
-        gathered = [local]
-    if is_main:
-        _log(f"  gather:   {time.time() - t_gather:5.1f}s")
+    comm_dev = (data_store.device if dist.is_initialized()
+                and dist.get_backend() == "nccl" else torch.device("cpu"))
 
-    if not is_main:
-        return
+    def _parts(payload):
+        """Yield the ranks' payloads on rank 0 (rank 0's own first); on the
+        other ranks send and yield nothing."""
+        import pickle
+        if world_size == 1:
+            yield payload
+            return
+        if is_main:
+            yield payload
+            for r in range(1, world_size):
+                n = torch.zeros(1, dtype=torch.long, device=comm_dev)
+                dist.recv(n, src=r)
+                buf = torch.empty(int(n.item()), dtype=torch.uint8, device=comm_dev)
+                dist.recv(buf, src=r)
+                yield pickle.loads(buf.cpu().numpy().tobytes())
+                del buf
+        else:
+            b = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+            t = torch.frombuffer(bytearray(b), dtype=torch.uint8).to(comm_dev)
+            dist.send(torch.tensor([t.numel()], dtype=torch.long, device=comm_dev), dst=0)
+            dist.send(t, dst=0)
+            del t, b
 
-    # Allocate global arrays and scatter each rank's contribution into the
-    # slots given by its global_idx. Padding duplicates (added in
-    # train_nep_sharded so n_total divides evenly across ranks) write the
-    # same value twice into the same slot — harmless. Every input frame
-    # appears in some rank, so the output has no NaN rows.
+    # Round 1 (small): frame-level arrays + natoms, which size the
+    # atom-level arrays. Padding duplicates (added in train_nep_sharded so
+    # n_total divides evenly across ranks) write the same value twice into
+    # the same slot — harmless. Every input frame appears in some rank, so
+    # the output has no NaN rows.
     natoms_g = np.zeros(n_total_frames, dtype=np.int64)
     volumes_g = np.zeros(n_total_frames, dtype=np.float64)
     e_pred_g = np.full(n_total_frames, np.nan)
     e_ref_g  = np.full(n_total_frames, np.nan)
     v_pred_g = np.full((n_total_frames, 6), np.nan)
     v_ref_g  = np.full((n_total_frames, 6), _MISSING_VIRIAL)
-
-    # First pass: frame-level arrays + natoms (to size the atom-level arrays).
-    for part in gathered:
+    small = {k: local[k] for k in ("global_idx", "natoms", "volumes",
+                                   "e_pred", "e_ref", "v_pred", "v_ref")}
+    for part in _parts(small):
         gi = part["global_idx"]
         natoms_g[gi]  = part["natoms"]
         volumes_g[gi] = part["volumes"]
@@ -996,24 +1014,35 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
         e_ref_g[gi]   = part["e_ref"]
         v_pred_g[gi]  = part["v_pred"]
         v_ref_g[gi]   = part["v_ref"]
+    del small
 
     # Global per-atom offsets are determined by input-xyz order so they match
     # what predict_dataset / predict_from_store would emit.
-    nat_cum_g = np.concatenate([[0], np.cumsum(natoms_g)])
-    N_atoms_global = int(nat_cum_g[-1])
-    f_pred_g = np.full((N_atoms_global, 3), np.nan)
-    f_ref_g  = np.full((N_atoms_global, 3), np.nan)
+    if is_main:
+        nat_cum_g = np.concatenate([[0], np.cumsum(natoms_g)])
+        N_atoms_global = int(nat_cum_g[-1])
+        f_pred_g = np.full((N_atoms_global, 3), np.nan)
+        f_ref_g  = np.full((N_atoms_global, 3), np.nan)
 
-    for part in gathered:
+    # Round 2 (large): per-atom forces, one rank at a time.
+    big = {k: local[k] for k in ("global_idx", "natoms", "f_pred", "f_ref")}
+    del local
+    for part in _parts(big):
         gi = part["global_idx"]
-        # Local atom offsets in the rank's concatenated arrays:
-        nat_part = part["natoms"]
+        nat_part = np.asarray(part["natoms"], dtype=np.int64)
         part_cum = np.concatenate([[0], np.cumsum(nat_part)])
-        for li, gidx in enumerate(gi):
-            la, lb = int(part_cum[li]),  int(part_cum[li + 1])
-            ga, gb = int(nat_cum_g[gidx]), int(nat_cum_g[gidx + 1])
-            f_pred_g[ga:gb] = part["f_pred"][la:lb]
-            f_ref_g[ga:gb]  = part["f_ref"][la:lb]
+        # vectorised scatter: destination atom index for every local atom
+        ga = np.repeat(nat_cum_g[gi], nat_part)
+        la = np.repeat(part_cum[:-1], nat_part)
+        dst = ga + (np.arange(int(part_cum[-1])) - la)
+        f_pred_g[dst] = part["f_pred"]
+        f_ref_g[dst]  = part["f_ref"]
+        del part
+    del big
+    if is_main:
+        _log(f"  gather:   {time.time() - t_gather:5.1f}s")
+    if not is_main:
+        return
 
     t_write = time.time()
     _write_predictions(output_dir, n_total_frames,

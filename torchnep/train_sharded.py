@@ -147,7 +147,7 @@ from .train import (
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
-    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
+    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb, host_mem_line,
     _save_checkpoint, _load_checkpoint,
     _trim_loss_log, _accumulate_true_loss_sums,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
@@ -322,7 +322,14 @@ def train_nep_sharded(
         # deterministically (silences "Guessing device ID based on global
         # rank" and the collective-context warnings, and prevents hangs on
         # heterogeneous rank->GPU mappings). gloo ignores device_id.
-        dist.init_process_group(backend=ddp_backend,
+        # Collective timeout: rank 0 alone writes the end-of-training
+        # prediction files (minutes for a multi-million-frame set) while the
+        # other ranks already wait in the next collective; the default
+        # 10 min would abort them. Override with TORCHNEP_DIST_TIMEOUT_MIN.
+        from datetime import timedelta
+        _to = timedelta(minutes=float(os.environ.get(
+            "TORCHNEP_DIST_TIMEOUT_MIN", 180)))
+        dist.init_process_group(backend=ddp_backend, timeout=_to,
                                 device_id=dev if cuda_available else None)
         # Tear the group down once, at process exit — NOT at the end of this
         # function. That lets a single script call train_nep_sharded() more than
@@ -515,6 +522,7 @@ def train_nep_sharded(
         del train_offs
         _log(f"  parsed local shard ({len(local_frames)} frames) in "
              f"{time.time() - t0:.1f}s")
+        _log(host_mem_line("after parsing the shard", dist, dev))
 
         valid_frames = None
         n_valid_total = 0
@@ -714,6 +722,7 @@ def train_nep_sharded(
     _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s"
          if nmode != "on_the_fly" else
          f"  prepared geometry (local shard) in {time.time() - t0:.1f}s")
+    _log(host_mem_line("after preprocessing", dist, dev))
 
     # max_NN: local max then all-reduce so rank-0 has the global value
     _compute_max_neighbors_local = compute_max_neighbors
@@ -781,6 +790,7 @@ def train_nep_sharded(
     _log(f"  data store ready ({nmode}, {_fmt_gb(data_store.memory_bytes())} "
          f"of pair/geometry data per rank): shard in host memory, batches "
          f"streamed to {dev} ({time.time() - t0:.1f}s)")
+    _log(host_mem_line("data store built", dist, dev))
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
@@ -1531,6 +1541,9 @@ def train_nep_sharded(
                 else:
                     _out_log_file.write(line + "\n")
                     _out_log_file.flush()
+            if epoch == start_epoch or os.environ.get("TORCHNEP_MEMLOG") == "1":
+                # collective: every rank
+                _log(host_mem_line(f"after epoch {epoch}", dist, dev))
 
             # ---- best-model bookkeeping (COLLECTIVE — outside is_main) ----
             # avg_loss comes from the all-reduced metrics, so every rank
@@ -1684,11 +1697,13 @@ def train_nep_sharded(
     # file round-trip. Each rank predicts its own shard; rank 0 gathers the
     # per-frame arrays via all_gather_object and writes the output files.
     pred_t0 = time.time()
+    _log(host_mem_line("before the end-of-training prediction", dist, dev))
     predict_from_store_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
         batch_size=batch_size, verbose=is_main)
+    _log(host_mem_line("after the training-set prediction", dist, dev))
     if valid_store is not None:
         predict_from_store_sharded(
             raw_model, valid_store, valid_local_global_idx,
@@ -1696,6 +1711,7 @@ def train_nep_sharded(
             output_dir=output_dir,
             batch_size=batch_size, verbose=False,
             suffix="test")
+        _log(host_mem_line("after the validation-set prediction", dist, dev))
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 

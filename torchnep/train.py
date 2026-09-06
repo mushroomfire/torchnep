@@ -283,6 +283,12 @@ class StreamDataStore:
                 # has run (scan_max_neighbors); until then they are
                 # reported as 0 so callers can fold them in later.
                 self._max_nn = None
+        # on_the_fly on CUDA/ROCm: the device search (whose ``nonzero``
+        # must synchronise) runs on a side stream inside the prefetch
+        # thread, so its sync never stalls the training thread's kernel
+        # launches; the main stream waits on an event instead.
+        self._side_stream = (torch.cuda.Stream(device)
+                             if device.type == "cuda" else None)
 
         self.energy = [float(s["energy"]) if "energy" in s else 0.0
                        for s in structures]
@@ -436,7 +442,11 @@ class StreamDataStore:
         """``rij = pos[j] + shift @ cell[frame] - pos[i]`` for a batch
         (same association order as the numpy builder)."""
         cell_p = cell_b[struct_idx[pi]]                         # (P, 3, 3)
-        sc = torch.einsum("pk,pkl->pl", shift.to(self.dtype), cell_p)
+        sh = shift.to(self.dtype)
+        # elementwise (not einsum/bmm: a batch of P tiny 1x3 @ 3x3 products
+        # is a pathological GEMM shape on ROCm)
+        sc = (sh[:, 0:1] * cell_p[:, 0, :] + sh[:, 1:2] * cell_p[:, 1, :]
+              + sh[:, 2:3] * cell_p[:, 2, :])
         return (pos[pj] + sc) - pos[pi]
 
     def _search_device(self, pos, cell_b, nat, off):
@@ -529,15 +539,21 @@ class StreamDataStore:
         for st in range(0, self.n, batch_size):
             idx = list(range(st, min(self.n, st + batch_size)))
             staged = self._assemble_cpu(idx)
-            pos = self._to_dev(staged["positions"])
-            cell_b = self._to_dev(staged["cells"])
-            pi, pj, rij, d = self._search_device(pos, cell_b, staged["nat"],
-                                                 staged["off"])
-            if pi.numel() == 0:
+            if "dev_pairs" in staged:           # searched on the side stream
+                torch.cuda.current_stream(self.device).wait_event(staged["dev_event"])
+                dp = staged["dev_pairs"]
+                pi_r, pi_a = dp["pair_i_rad"], dp["pair_i_ang"]
+            else:
+                pos = self._to_dev(staged["positions"])
+                cell_b = self._to_dev(staged["cells"])
+                pi, pj, rij, d = self._search_device(pos, cell_b, staged["nat"],
+                                                     staged["off"])
+                pi_r, pi_a = pi[d < self._rc_r], pi[d < self._rc_a]
+            if pi_r.numel() == 0:
                 continue
             n_atoms = staged["N"]
-            cr = torch.bincount(pi[d < self._rc_r], minlength=n_atoms)
-            ca = torch.bincount(pi[d < self._rc_a], minlength=n_atoms)
+            cr = torch.bincount(pi_r, minlength=n_atoms)
+            ca = torch.bincount(pi_a, minlength=n_atoms)
             max_r = max(max_r, int(cr.max()))
             max_a = max(max_a, int(ca.max()))
         self._max_nn = (max_r, max_a)
@@ -596,24 +612,40 @@ class StreamDataStore:
                 off_rep_r = torch.repeat_interleave(off_t, nr_t)
                 off_rep_a = torch.repeat_interleave(off_t, na_t)
                 cum = self._nrad_cum
-                # angular pairs = the first n_ang pairs of each frame's list
-                def _cat_ang(t):
-                    return torch.cat([t[cum[i]:cum[i] + na[k]]
-                                      for k, i in enumerate(idx)])
+                # angular pairs = the first n_ang pairs of each frame's
+                # radial list -> one index tensor selects them out of the
+                # batch's radial arrays on the device (no second rij pass)
+                rad_off = np.concatenate([[0], np.cumsum(nr)])[:-1]
+                ang_in_rad = torch.from_numpy(np.concatenate(
+                    [np.arange(o, o + k) for o, k in zip(rad_off, na)]
+                    or [np.zeros(0, np.int64)]))
                 out.update({
                     "pair_i_rad": _stage(
                         self._cat(self._pi_all, idx, cum).to(torch.long) + off_rep_r),
                     "pair_j_rad": _stage(
                         self._cat(self._pj_all, idx, cum).to(torch.long) + off_rep_r),
                     "shift_rad": _stage(self._cat(self._sh_all, idx, cum)),
-                    "pair_i_ang": _stage(
-                        _cat_ang(self._pi_all).to(torch.long) + off_rep_a),
-                    "pair_j_ang": _stage(
-                        _cat_ang(self._pj_all).to(torch.long) + off_rep_a),
-                    "shift_ang": _stage(_cat_ang(self._sh_all)),
+                    "ang_in_rad": _stage(ang_in_rad),
                 })
             else:
                 out["nat"] = nat; out["off"] = offsets[:-1]
+                if self._side_stream is not None:
+                    with torch.cuda.stream(self._side_stream):
+                        pos = out["positions"].to(self.device, non_blocking=True)
+                        cells = out["cells"].to(self.device, non_blocking=True)
+                        pi, pj, rij, d = self._search_device(pos, cells, nat,
+                                                             offsets[:-1])
+                        m_r = d < self._rc_r
+                        m_a = d < self._rc_a
+                        dev_pairs = {"positions": pos, "cells": cells,
+                                     "pair_i_rad": pi[m_r], "pair_j_rad": pj[m_r],
+                                     "rij_rad": rij[m_r],
+                                     "pair_i_ang": pi[m_a], "pair_j_ang": pj[m_a],
+                                     "rij_ang": rij[m_a]}
+                        ev = torch.cuda.Event()
+                        ev.record(self._side_stream)
+                    out["dev_pairs"] = dev_pairs
+                    out["dev_event"] = ev
         out.update({
             "energy": _stage(self._energy_t[idx_t]),
             "natoms": _stage(self._nat_t[idx_t].to(self.dtype)),
@@ -641,7 +673,7 @@ class StreamDataStore:
         "cached": ("pair_i_rad", "pair_j_rad", "rij_rad",
                    "pair_i_ang", "pair_j_ang", "rij_ang"),
         "compact": ("positions", "cells", "pair_i_rad", "pair_j_rad",
-                    "shift_rad", "pair_i_ang", "pair_j_ang", "shift_ang"),
+                    "shift_rad", "ang_in_rad"),
         "on_the_fly": ("positions", "cells"),
     }
 
@@ -684,20 +716,30 @@ class StreamDataStore:
                  "has_e": staged["has_e"], "has_f": staged["has_f"],
                  "has_v": staged["has_v"]}
         mode = self.neighbor_mode
-        for key in self._COMMON_KEYS + self._MODE_KEYS[mode]:
+        keys = self._COMMON_KEYS + self._MODE_KEYS[mode]
+        if "dev_pairs" in staged:               # on_the_fly, searched on the side stream
+            keys = self._COMMON_KEYS
+        for key in keys:
             t = staged[key]
             batch[key] = (t.to(dev, non_blocking=True) if self._pin
                           else t.to(dev))
-        if mode == "compact":
+        if "dev_pairs" in staged:
+            cur = torch.cuda.current_stream(dev)
+            cur.wait_event(staged["dev_event"])
+            for k, t in staged["dev_pairs"].items():
+                t.record_stream(cur)            # allocated on the side stream
+                batch[k] = t
+        elif mode == "compact":
             # displacement vectors from wrapped positions + image shifts
             pos, cells, sidx = batch["positions"], batch["cells"], batch["struct_idx"]
             batch["rij_rad"] = self._rij_from_shifts(
                 pos, batch["pair_i_rad"], batch["pair_j_rad"],
                 batch.pop("shift_rad"), cells, sidx)
-            batch["rij_ang"] = self._rij_from_shifts(
-                pos, batch["pair_i_ang"], batch["pair_j_ang"],
-                batch.pop("shift_ang"), cells, sidx)
-        elif mode == "on_the_fly":
+            sel = batch.pop("ang_in_rad")
+            batch["pair_i_ang"] = batch["pair_i_rad"][sel]
+            batch["pair_j_ang"] = batch["pair_j_rad"][sel]
+            batch["rij_ang"] = batch["rij_rad"][sel]
+        elif mode == "on_the_fly":              # CPU / MPS: search in place
             pi, pj, rij, d = self._search_device(
                 batch["positions"], batch["cells"], staged["nat"], staged["off"])
             m_r = d < self._rc_r
@@ -972,31 +1014,43 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
         gc.unfreeze()
 
 
-def estimate_store_bytes(frames, config, itemsize=4):
-    """Rough host-memory need of the three ``StreamDataStore`` layouts for
-    ``frames`` (dicts with ``natoms`` and ``cell``), in bytes.
+def estimate_store_bytes(frames, config, itemsize=4, sample=512):
+    """Host-memory need of the three ``StreamDataStore`` layouts for
+    ``frames`` (parsed frame dicts), in bytes, as ``{"cached": b,
+    "compact": b, "on_the_fly": b}``.
 
-    Directed pairs per frame ~ N * (N / V) * 4/3 pi rc^3 (uniform density);
-    the angular list is the radial one scaled by (rc_ang / rc_rad)^3.
-    Returns ``{"cached": b, "compact": b, "on_the_fly": b}``; the cached
-    figure is ~2x conservative for the temporary per-frame lists that exist
-    while the store is being concatenated.
+    The pair counts are MEASURED on an evenly spaced sample of up to
+    ``sample`` frames with the numpy builder and scaled by the atom count
+    (a density formula over-estimated a real 13M-frame set 4x). Each figure
+    is the peak while the store is built: the per-frame arrays plus the
+    store's concatenated copy grow/shrink together (~1.2x the data), with
+    the parsed frames (float64 positions / forces + dict overhead) alive
+    during preprocessing on top.
     """
     rc_r = float(config["cutoff_radial"]); rc_a = float(config["cutoff_angular"])
-    sphere = 4.0 / 3.0 * np.pi * rc_r ** 3
-    ang_ratio = (rc_a / rc_r) ** 3
+    max_rc = max(rc_r, rc_a)
+    n = len(frames)
     nat = np.asarray([f["natoms"] for f in frames], dtype=np.float64)
-    vol = np.asarray([abs(np.linalg.det(np.asarray(f["cell"], dtype=np.float64)))
-                      for f in frames])
-    vol = np.maximum(vol, 1.0)
-    pairs = float((nat * nat / vol * sphere).sum())
     atoms = float(nat.sum())
-    cached = pairs * (8 + 8 + 3 * itemsize) * (1.0 + ang_ratio)
-    compact = pairs * (4 + 4 + 3) + atoms * 3 * itemsize + len(frames) * 9 * itemsize
-    geometry = atoms * 3 * itemsize + len(frames) * 9 * itemsize
-    labels = atoms * 3 * itemsize + atoms * 8            # forces + types
-    return {"cached": 2.0 * cached + labels, "compact": 2.0 * compact + labels,
-            "on_the_fly": 2.0 * geometry + labels}
+    idx = np.unique(np.linspace(0, n - 1, min(sample, n)).astype(np.int64)) if n else []
+    pr = pa = 0; atoms_s = 0.0
+    for i in idx:
+        f = frames[i]
+        _, _, rij = build_neighbor_list_np(np.asarray(f["positions"], dtype=np.float64),
+                                           np.asarray(f["cell"], dtype=np.float64), max_rc)
+        d = np.linalg.norm(rij, axis=1)
+        pr += int((d < rc_r).sum()); pa += int((d < rc_a).sum()); atoms_s += f["natoms"]
+    scale = atoms / max(atoms_s, 1.0)
+    pairs_r, pairs_a = pr * scale, pa * scale
+    per_pair = 8 + 8 + 3 * itemsize                      # int64 i, j + rij
+    cached = (pairs_r + pairs_a) * per_pair
+    compact = pairs_r * (4 + 4 + 3) + atoms * 3 * itemsize + n * 9 * itemsize
+    geometry = atoms * 3 * itemsize + n * 9 * itemsize
+    labels = atoms * (3 * itemsize + 8) + n * 300         # forces, types, per-frame scalars
+    parsed = atoms * 48 + n * 1500                        # frame dicts alive while preprocessing
+    return {"cached": 1.2 * cached + labels + parsed,
+            "compact": 1.2 * compact + labels + parsed,
+            "on_the_fly": 1.2 * geometry + labels + parsed}
 
 
 def host_memory_budget():
@@ -1047,6 +1101,41 @@ def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
 
 def _fmt_gb(b):
     return f"{b / 2**30:.1f} GiB"
+
+
+def host_rss():
+    """(current, peak) resident set size of this process in bytes (Linux
+    /proc; peak from getrusage elsewhere). Zeros when unavailable."""
+    cur = peak = 0
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                cur = int(line.split()[1]) * 1024
+            elif line.startswith("VmHWM:"):
+                peak = int(line.split()[1]) * 1024
+    except OSError:
+        try:
+            import resource
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            peak = r * (1 if platform.system() == "Darwin" else 1024)
+            cur = peak
+        except Exception:
+            pass
+    return cur, peak
+
+
+def host_mem_line(tag, dist_mod=None, device=None):
+    """Log line with this process's host RSS (now / peak); with a torch
+    distributed process group the min / max over ranks are folded in."""
+    cur, peak = host_rss()
+    s = f"  host memory [{tag}]: RSS {_fmt_gb(cur)} (peak {_fmt_gb(peak)})"
+    if dist_mod is not None and dist_mod.is_initialized():
+        t = torch.tensor([cur, -cur, peak], dtype=torch.float64,
+                         device=device if device is not None else "cpu")
+        dist_mod.all_reduce(t, op=dist_mod.ReduceOp.MAX)
+        s += (f"; over ranks RSS min {_fmt_gb(-t[1].item())} max "
+              f"{_fmt_gb(t[0].item())}, peak max {_fmt_gb(t[2].item())}")
+    return s
 
 
 def compute_max_neighbors(structures):
