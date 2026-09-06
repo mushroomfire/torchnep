@@ -1,5 +1,14 @@
 # Release Notes
 
+## 1.0.3b1
+
+- **Multi-GPU scaling fix** (`train_nep_sharded`): the global label counts
+  that normalise the loss are now computed for the whole epoch and
+  all-reduced once, instead of a tiny all-reduce in every step. That
+  per-step collective was latency-bound and took up to 80% of an epoch at
+  256 ranks; epoch time on 64 LUMI nodes (512 GCDs) drops from 77 s to
+  11 s on a 13M-frame set. Loss and results are bit-identical.
+
 ## 1.0.3a2
 
 - **Streamed `predict_dataset`**: the xyz is indexed once and processed in

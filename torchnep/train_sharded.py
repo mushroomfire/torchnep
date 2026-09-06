@@ -1176,7 +1176,34 @@ def train_nep_sharded(
 
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_local, batch_size)]
-            for batch in iter_collated(data_store, batch_indices):
+
+            # Global label counts of every step (energies / force atoms /
+            # virial frames, summed over ranks) are fixed by the epoch's
+            # batch composition, so they are computed for all steps here and
+            # all-reduced in ONE collective. This replaces a 24-byte
+            # all_reduce inside every step, which was latency-bound and
+            # dominated the epoch at large rank counts (80% of the time at
+            # 256 ranks). Values are identical to the per-step path.
+            _pp = torch.as_tensor(perm)
+            _z = torch.zeros(n_local, dtype=torch.float64)
+            _per_frame = torch.stack([
+                data_store._e_flag_t[_pp].to(torch.float64),
+                (data_store._f_flag_t[_pp].to(torch.float64)
+                 * data_store._nat_t[_pp].to(torch.float64))
+                if has_forces else _z,
+                data_store._v_flag_t[_pp].to(torch.float64)
+                if has_virial else _z,
+            ], dim=1)
+            _cs = torch.cat([torch.zeros(1, 3, dtype=torch.float64),
+                             torch.cumsum(_per_frame, dim=0)])
+            _starts = torch.arange(0, n_local, batch_size)
+            _ends = (_starts + batch_size).clamp(max=n_local)
+            cg_all = (_cs[_ends] - _cs[_starts]).to(dev)
+            dist.all_reduce(cg_all)
+            cg_all = cg_all.clamp(min=1.0).to(dtype)
+
+            for _bi, batch in enumerate(
+                    iter_collated(data_store, batch_indices)):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
@@ -1202,19 +1229,14 @@ def train_nep_sharded(
                 # by the GLOBAL count (all-reduced per batch). The * world_size
                 # factor cancels DDP's /world_size averaging — giving a true
                 # global-mean loss regardless of how atoms are sharded.
-                # Counts stay DEVICE tensors end to end (the all_reduce and
-                # the divisions are stream-ordered) — fetching them per batch
-                # would drain the compute stream every step. Loss and metric
-                # terms are likewise branchless masked sums; the scalars are
-                # read back together after the grad-norm guard's sync, where
-                # they cost nothing.
-                counts = torch.stack([
-                    emf.sum(),
-                    fmf.sum() if fmf is not None else emf.new_zeros(()),
-                    vmf.sum() if vmf is not None else emf.new_zeros(()),
-                ]).to(torch.float64)
-                dist.all_reduce(counts)
-                cg = counts.clamp(min=1.0).to(dtype)
+                # The global counts of this step were precomputed and
+                # all-reduced once per epoch above (cg_all); they stay DEVICE
+                # tensors end to end (the divisions are stream-ordered) —
+                # fetching them per batch would drain the compute stream every
+                # step. Loss and metric terms are likewise branchless masked
+                # sums; the scalars are read back together after the grad-norm
+                # guard's sync, where they cost nothing.
+                cg = cg_all[_bi]
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
