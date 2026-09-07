@@ -910,8 +910,8 @@ def _write_predictions(output_dir: str, n_total_frames: int,
 
     def _save(name, cols, block=1_000_000):
         """np.savetxt in row blocks: a single call formats the whole table
-        into one Python string first (~2x the text size — 12 GiB for the
-        force file of a 13M-frame set); blocks bound that at ~100 MB."""
+        into one Python string first (~2x the text size, many GiB for a
+        multi-million-frame force file); blocks bound that at ~100 MB."""
         n = len(cols[0])
         with open(os.path.join(output_dir, name), "w") as fh:
             for st in range(0, n, block):
@@ -968,7 +968,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
 
     # Gather per-rank arrays onto rank 0, one rank at a time (point-to-point,
     # pickled bytes). all_gather_object would give EVERY rank the whole
-    # dataset's predictions — ~10 GiB per rank on a 13M-frame set — which
+    # dataset's predictions — many GiB per rank on a large set — which
     # was the largest host-memory item of a sharded run. Rank 0 folds each
     # part into the global arrays as it arrives and drops it, so its peak
     # is the global arrays plus one part; other ranks hold only their own.

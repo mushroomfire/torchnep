@@ -1257,8 +1257,8 @@ def train_nep_sharded(
             # batch composition, so they are computed for all steps here and
             # all-reduced in ONE collective. This replaces a 24-byte
             # all_reduce inside every step, which was latency-bound and
-            # dominated the epoch at large rank counts (80% of the time at
-            # 256 ranks). Values are identical to the per-step path.
+            # dominated the epoch at large rank counts. Values are identical
+            # to the per-step path.
             _pp = torch.as_tensor(perm)
             _z = torch.zeros(n_local, dtype=torch.float64)
             _per_frame = torch.stack([

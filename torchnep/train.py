@@ -1022,7 +1022,7 @@ def estimate_store_bytes(frames, config, itemsize=4, sample=512):
 
     The pair counts are MEASURED on an evenly spaced sample of up to
     ``sample`` frames with the numpy builder and scaled by the atom count
-    (a density formula over-estimated a real 13M-frame set 4x). Each figure
+    (a density formula over-estimates real data sets several-fold). Each figure
     is the peak while the store is built: the per-frame arrays plus the
     store's concatenated copy grow/shrink together (~1.2x the data), with
     the parsed frames (float64 positions / forces + dict overhead) alive
@@ -1049,7 +1049,7 @@ def estimate_store_bytes(frames, config, itemsize=4, sample=512):
     geometry = atoms * 3 * itemsize + n * 9 * itemsize
     labels = atoms * (3 * itemsize + 8) + n * 300         # forces, types, per-frame scalars
     parsed = atoms * 48 + n * 1500                        # frame dicts alive while preprocessing
-    # Calibrated on LUMI (MI250X, 13M-frame set): measured per-rank RSS =
+    # Calibrated against measured multi-node runs: per-rank RSS =
     # ~1.5 x the store data + a fixed ~4.5 GiB (torch + HIP/CUDA runtime,
     # BLAS libraries, RCCL, pinned staging) + the end-of-training
     # prediction, whose global arrays on rank 0 cost ~1 KB per frame.

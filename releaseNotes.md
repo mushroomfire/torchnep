@@ -2,16 +2,13 @@
 
 ## 1.0.3b1
 
-- **Multi-GPU scaling fix**: one all-reduce per epoch instead of one per
-  step. 64 LUMI nodes: 77 s → 11 s per epoch on a 13M-frame set; results
-  bit-identical.
-- **`neighbor_mode`** (`train_nep` / `train_nep_sharded`, default
-  `"auto"`): `"cached"`, `"compact"` (~4x less host memory) or
-  `"on_the_fly"` (neighbor lists built on the GPU per batch, least
-  memory); `"auto"` picks the first that fits. A 13M-frame set now trains
-  on a single 8-GPU node.
-- Lower host memory in sharded training (prediction gather, validation
-  file, store build); host RSS is printed at each data stage.
+- **Multi-GPU scaling fix**: one all-reduce per epoch instead of one per step.
+- **Lower host memory**: new `neighbor_mode` argument (`train_nep` /
+  `train_nep_sharded`, default `"auto"`) — `"cached"`, `"compact"`
+  (~4x less memory) or `"on_the_fly"` (neighbor lists built on the GPU
+  per batch, least memory); `"auto"` picks the first that fits. The
+  sharded data path (validation file, store build, final prediction) also
+  uses less memory, and host RSS is printed at each data stage.
 
 ## 1.0.3a2
 
