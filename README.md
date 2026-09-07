@@ -24,7 +24,7 @@ Many ready-to-use examples (the training inputs and trained models of the TorchN
 <p align="center">
   <img src="assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
   <br>
-  <em>Excellent single-GPU training speed (left) and near-linear multi-node parallel scaling (right).</em>
+  <sub><em>Excellent single-GPU training speed (left) and near-linear multi-node parallel scaling (right).</em></sub>
 </p>
 
 ---
