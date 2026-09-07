@@ -21,6 +21,10 @@ Many ready-to-use examples (the training inputs and trained models of the TorchN
 - 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
 
+![Training speed and scaling](assets/speed_scaling.png)
+
+Fast on a single GPU (**a**, a 10k-frame set on NVIDIA V100 and AMD MI250X, compared with SNES-NEP and GNEP) and near-linear across nodes (**b**, a 13M-frame set from 1 to 32 nodes with 8 GPUs each, above 96% parallel efficiency).
+
 ---
 
 ## 📦 Installation
