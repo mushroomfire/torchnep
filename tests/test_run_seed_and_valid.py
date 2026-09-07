@@ -276,7 +276,9 @@ def test_valid_ratio_outputs_and_split(tmp_path):
     for r in rows:
         expect = (lam_e * float(r[6]) ** 2 + lam_f * float(r[7]) ** 2
                   + lam_v * float(r[8]) ** 2)
-        assert abs(float(r[1]) - expect) < 1e-5
+        # loss.out prints the loss with 7 significant digits (%.6e): allow
+        # its rounding on top of the RMSE columns' 1e-6 resolution
+        assert abs(float(r[1]) - expect) <= 1e-6 * abs(expect) + 1e-5
 
     # references in energy_test.out match the expected holdout frames
     ref = np.loadtxt(out / "energy_test.out")[:, 1]
