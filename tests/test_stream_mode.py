@@ -30,8 +30,8 @@ from torchnep.train import (preprocess_structures, StreamDataStore,
                             iter_collated)
 from _common import DATA_DIR, devices
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
@@ -89,7 +89,7 @@ def test_collate_matches_reference(tmp_path, device):
     dev = torch.device(device)
     dtype = torch.float32
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:20]
+    frames = read_xyz(str(XYZ))[:20]
     structs = preprocess_structures(frames, cfg, np.float32)
     store = StreamDataStore(copy.deepcopy(structs), dev, dtype, config=cfg)
 
@@ -113,7 +113,7 @@ def test_store_metadata_and_masks(tmp_path, device):
     reflect the structures, including missing energy/forces channels."""
     dev = torch.device(device)
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:12]
+    frames = read_xyz(str(XYZ))[:12]
     frames[3].pop("energy", None)
     frames[5].pop("forces", None)
     structs = preprocess_structures(frames, cfg, np.float64)
@@ -145,7 +145,7 @@ def test_iter_collated_prefetch_matches_direct(tmp_path):
     """Prefetched iteration yields exactly the same batches as direct
     collate calls (same order, same tensors)."""
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:16]
+    frames = read_xyz(str(XYZ))[:16]
     structs = preprocess_structures(frames, cfg, np.float64)
     store = StreamDataStore(structs, torch.device("cpu"), torch.float64,
                             config=cfg)
@@ -185,7 +185,7 @@ def test_sharded_run_reproducible(tmp_path):
 
     nepin = tmp_path / "nep.in"
     nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 3\n")
-    raw = PBTE.read_text().splitlines()
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < 16:
         na = int(raw[i].strip())

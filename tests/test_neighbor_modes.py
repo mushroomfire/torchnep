@@ -32,8 +32,8 @@ from torchnep.train import (preprocess_structures, StreamDataStore,
                             choose_neighbor_mode, NEIGHBOR_MODES)
 from _common import DATA_DIR, devices
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
@@ -63,7 +63,7 @@ def _sorted_pairs(batch, suffix):
 
 def test_np_ex_matches_np():
     """The extended numpy builder is the plain one plus shifts."""
-    frames = read_xyz(str(PBTE))[:5]
+    frames = read_xyz(str(XYZ))[:5]
     for f in frames:
         pos = f["positions"].astype(np.float32); cell = f["cell"].astype(np.float32)
         i0, j0, r0 = build_neighbor_list_np(pos, cell, 6.0)
@@ -81,7 +81,7 @@ def test_modes_match_cached(tmp_path, device, mode):
     dev = torch.device(device)
     dtype = torch.float32
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:24]
+    frames = read_xyz(str(XYZ))[:24]
     ref_structs = preprocess_structures(frames, cfg, np.float32, mode="cached")
     structs = preprocess_structures(frames, cfg, np.float32, mode=mode)
     ref = StreamDataStore(ref_structs, dev, dtype, config=cfg)
@@ -127,7 +127,7 @@ def test_modes_match_cached(tmp_path, device, mode):
 def test_on_the_fly_scan_max_neighbors(tmp_path, device):
     dev = torch.device(device)
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:24]
+    frames = read_xyz(str(XYZ))[:24]
     cached = preprocess_structures(frames, cfg, np.float32, mode="cached")
     from torchnep.train import compute_max_neighbors
     exp = compute_max_neighbors(cached)
@@ -140,7 +140,7 @@ def test_on_the_fly_scan_max_neighbors(tmp_path, device):
 
 def test_estimate_and_auto_choice(tmp_path):
     cfg = _config(tmp_path)
-    frames = read_xyz(str(PBTE))[:24]
+    frames = read_xyz(str(XYZ))[:24]
     est = estimate_store_bytes(frames, cfg)
     assert est["cached"] > est["compact"] > est["on_the_fly"] > 0
     for m in NEIGHBOR_MODES:
@@ -159,7 +159,7 @@ def test_train_nep_runs_in_every_mode(tmp_path, mode):
     """End-to-end: a 2-epoch single-device run in each layout finishes and
     the loss trajectories agree (they see identical batches)."""
     from torchnep import train_nep
-    raw = PBTE.read_text().splitlines()
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < 12:
         na = int(raw[i].strip()); out += raw[i:i + na + 2]; i += na + 2; k += 1
@@ -178,7 +178,7 @@ def test_train_nep_runs_in_every_mode(tmp_path, mode):
 
 def test_train_losses_agree_across_modes(tmp_path):
     from torchnep import train_nep
-    raw = PBTE.read_text().splitlines()
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < 12:
         na = int(raw[i].strip()); out += raw[i:i + na + 2]; i += na + 2; k += 1

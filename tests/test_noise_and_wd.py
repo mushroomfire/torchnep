@@ -10,8 +10,8 @@ from torchnep.data import read_xyz, parse_nep_in
 from torchnep.train import preprocess_structures, StreamDataStore, train_nep
 from _common import DATA_DIR
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 20\n")
 
 
@@ -19,7 +19,7 @@ def _store(tmp_path, n=10):
     p = tmp_path / "nep.in"
     p.write_text(NEP_IN)
     cfg = parse_nep_in(str(p))
-    structs = preprocess_structures(read_xyz(str(PBTE))[:n], cfg, np.float64)
+    structs = preprocess_structures(read_xyz(str(XYZ))[:n], cfg, np.float64)
     return StreamDataStore(structs, torch.device("cpu"), torch.float64,
                            config=cfg), cfg
 
@@ -27,9 +27,9 @@ def _store(tmp_path, n=10):
 def _run(tmp_path, out, extra, seed=5):
     nepin = tmp_path / f"nep_{out}.in"
     nepin.write_text(NEP_IN + "epoch 3\nbatch 4\n" + extra)
-    frames = read_xyz(str(PBTE))[:12]
+    frames = read_xyz(str(XYZ))[:12]
     xyz = tmp_path / "train.xyz"
-    raw = PBTE.read_text().splitlines()
+    raw = XYZ.read_text().splitlines()
     keep, i, k = [], 0, 0
     while i < len(raw) and k < 12:
         na = int(raw[i].strip()); keep += raw[i:i + na + 2]
@@ -174,7 +174,7 @@ def test_stratified_fallback_all_tiny():
     (tiny_to_train sends everything to training) — the split must fall
     back to random instead of returning an empty validation set."""
     from torchnep.data import stratified_split_indices
-    metas = [(2, {"Te", "Pb"}) for _ in range(200)]
+    metas = [(2, {"Cr", "Ni"}) for _ in range(200)]
     tr, va, st = stratified_split_indices(metas, 0.1, 0)
     assert st.get("fallback") == "random"
     assert len(va) == 20
@@ -187,8 +187,8 @@ def test_swa_start_window(tmp_path):
     run must produce no nep_average.txt (with the run otherwise fine)."""
     nepin = tmp_path / "nep_swa.in"
     nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n")
-    frames = read_xyz(str(PBTE))[:8]
-    raw = PBTE.read_text().splitlines()
+    frames = read_xyz(str(XYZ))[:8]
+    raw = XYZ.read_text().splitlines()
     keep, i, k = [], 0, 0
     while i < len(raw) and k < 8:
         na = int(raw[i].strip()); keep += raw[i:i + na + 2]

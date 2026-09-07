@@ -618,11 +618,11 @@ def test_backend_equivalence(tmp_path):
     from torchnep.train import preprocess_structures, StreamDataStore
 
     nep = tmp_path / "nep.in"
-    nep.write_text("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+    nep.write_text("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
                    "basis_size 6 6\nl_max 4 2 1\nneuron 20\n")
     cfg = parse_nep_in(str(nep))
-    pbte = DATA_DIR / "PbTe.xyz"
-    structs = preprocess_structures(read_xyz(str(pbte))[:6], cfg, np.float64)
+    xyz_path = DATA_DIR / "CrCoNi_train.xyz"
+    structs = preprocess_structures(read_xyz(str(xyz_path))[:6], cfg, np.float64)
     store = StreamDataStore(structs, torch.device("cpu"), torch.float64,
                             config=cfg)
     batch = store.collate(list(range(6)))

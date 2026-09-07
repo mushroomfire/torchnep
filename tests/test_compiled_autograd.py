@@ -25,8 +25,8 @@ from torchnep.train import StreamDataStore, preprocess_structures
 from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
@@ -40,7 +40,7 @@ def _setup(tmp_path, n_frames=24):
     p = tmp_path / "nep.in"
     p.write_text(NEP_IN)
     cfg = parse_nep_in(str(p))
-    frames = read_xyz(str(PBTE))[:n_frames]
+    frames = read_xyz(str(XYZ))[:n_frames]
     structs = preprocess_structures(frames, cfg, np.float32)
     store = StreamDataStore(structs, dev, dtype, config=cfg)
     torch.manual_seed(11)

@@ -27,8 +27,8 @@ from torchnep.train import (preprocess_structures, StreamDataStore, train_nep)
 from torchnep.model import NEPModel
 from _common import DATA_DIR
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
@@ -36,7 +36,7 @@ def _write_run_files(tmp_path, n_frames=20, epochs=3):
     nepin = tmp_path / "nep.in"
     nepin.write_text(NEP_IN + f"epoch {epochs}\nbatch 8\n")
     xyz = tmp_path / "train.xyz"
-    raw = PBTE.read_text().splitlines()
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < n_frames:
         na = int(raw[i].strip())

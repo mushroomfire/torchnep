@@ -34,14 +34,14 @@ from torchnep.nep import NEPCalculator
 from torchnep.train import preprocess_structures, StreamDataStore, compute_max_neighbors
 from _common import DATA_DIR
 
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\nbasis_size 6 6\nl_max 4 2 1\nneuron 30\n")
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\nbasis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
-def _frames(n=6, scale=0.55):
-    """PbTe frames plus compressed copies (NN ~1.7 A) so the ZBL switching
+def _frames(n=6, scale=0.8):
+    """CrCoNi frames plus compressed copies (NN ~1.2 A) so the ZBL switching
     windows are actually sampled."""
-    fr = read_xyz(str(PBTE))[:n]
+    fr = read_xyz(str(XYZ))[:n]
     out = []
     for f in fr:
         out.append(f)
@@ -97,27 +97,27 @@ def _energy_forces(model, batch, path):
 
 
 def test_parse_zbl_file_and_table(tmp_path):
-    rows = _custom_rows(2, seed=1)
+    rows = _custom_rows(3, seed=1)
     _write_zbl_in(tmp_path / "my_zbl.in", rows)
     (tmp_path / "nep.in").write_text(NEP_IN + "zbl my_zbl.in\n")
     cfg = parse_nep_in(str(tmp_path / "nep.in"))
     assert np.allclose(np.array(cfg["zbl_flexible"]), np.array(rows))
     assert cfg["zbl"] == pytest.approx(max(r[1] for r in rows))
-    assert zbl_pair_index(1, 0, 2) == zbl_pair_index(0, 1, 2) == 1 and zbl_pair_index(1, 1, 2) == 2
+    assert zbl_pair_index(1, 0, 3) == zbl_pair_index(0, 1, 3) == 1 and zbl_pair_index(2, 1, 3) == 4 and zbl_pair_index(2, 2, 3) == 5
     with pytest.raises(ValueError):
-        read_zbl_in(str(tmp_path / "my_zbl.in"), 3)      # wrong number of rows
+        read_zbl_in(str(tmp_path / "my_zbl.in"), 4)      # wrong number of rows
 
 
 @pytest.mark.parametrize("path", ["eager", "cached"])
 def test_universal_file_matches_universal(tmp_path, path):
     frames = _frames()
     cfg_u, m_u, b_u = _model_and_batch(tmp_path, "zbl 2.5", frames)
-    _write_zbl_in(tmp_path / "zbl.in", _universal_rows(2, 2.5))
+    _write_zbl_in(tmp_path / "zbl.in", _universal_rows(3, 2.5))
     cfg_f, m_f, b_f = _model_and_batch(tmp_path, "zbl zbl.in", frames)
     m_f.load_state_dict({k: v for k, v in m_u.state_dict().items() if k != "zbl_flexible"}, strict=False)
     assert m_f.zbl_flexible is not None and m_u.zbl_flexible is None
     for m in (m_u, m_f):
-        assert torch.allclose(m.zbl_phi_pair, torch.tensor(ZBL_PARA, dtype=torch.float64).expand(2, 2, 8))
+        assert torch.allclose(m.zbl_phi_pair, torch.tensor(ZBL_PARA, dtype=torch.float64).expand(3, 3, 8))
     e_u, f_u = _energy_forces(m_u, b_u, path)
     e_f, f_f = _energy_forces(m_f, b_f, path)
     assert torch.equal(e_u, e_f) and torch.equal(f_u, f_f)
@@ -148,7 +148,7 @@ def _numpy_zbl(batch, cfg, rows, atom_numbers):
 @pytest.mark.parametrize("path", ["eager", "cached"])
 def test_custom_table_matches_numpy(tmp_path, path):
     frames = _frames(n=4)
-    rows = _custom_rows(2, seed=3)
+    rows = _custom_rows(3, seed=3)
     _write_zbl_in(tmp_path / "zbl.in", rows)
     cfg, m, b = _model_and_batch(tmp_path, "zbl zbl.in", frames)
     # zero the NN contribution: compare the ZBL part only via (with - without)
@@ -159,14 +159,14 @@ def test_custom_table_matches_numpy(tmp_path, path):
     e_uni, _ = _energy_forces(m0, b0, path)
     Z = [ELEMENTS.index(n) + 1 for n in cfg["type_names"]]
     ref_flex = _numpy_zbl(b, cfg, rows, Z)
-    ref_uni = _numpy_zbl(b0, cfg0, _universal_rows(2, 2.5), Z)
+    ref_uni = _numpy_zbl(b0, cfg0, _universal_rows(3, 2.5), Z)
     assert np.allclose((e_flex - e_uni).numpy(), ref_flex - ref_uni, atol=1e-7, rtol=1e-9)
     assert np.abs(ref_flex - ref_uni).max() > 1e-3      # the test actually exercised ZBL
 
 
 def test_nep_txt_round_trip(tmp_path):
     frames = _frames(n=4)
-    rows = _custom_rows(2, seed=5)
+    rows = _custom_rows(3, seed=5)
     _write_zbl_in(tmp_path / "zbl.in", rows)
     cfg, m, b = _model_and_batch(tmp_path, "zbl zbl.in", frames)
     structs = preprocess_structures(frames, cfg, np.float64)
@@ -175,7 +175,7 @@ def test_nep_txt_round_trip(tmp_path):
     m.save_nep_txt(str(path), nn_r, nn_a)
     lines = path.read_text().splitlines()
     assert lines[1].split() == ["zbl", "0", "0"]
-    tail = np.array([float(x) for x in lines[-30:]]).reshape(3, 10)
+    tail = np.array([float(x) for x in lines[-60:]]).reshape(6, 10)
     assert np.allclose(tail, np.array(rows))
 
     # calculator: same energies / forces as the training model

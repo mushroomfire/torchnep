@@ -30,15 +30,15 @@ from torchnep.train import (preprocess_structures, StreamDataStore,
 from torchnep.model import NEPModel, gpumd_init_parameters
 from _common import DATA_DIR
 
-# PbTe example carries per-frame energy + forces (the CrCoNi fixture has no
+# CrCoNi_train.xyz carries per-frame energy + forces + virial (CrCoNi.xyz has no
 # energy labels, so it can't exercise the energy-offset b1 logic).
-PBTE = DATA_DIR / "PbTe.xyz"
-NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
+XYZ = DATA_DIR / "CrCoNi_train.xyz"
+NEP_IN = ("type 3 Cr Co Ni\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 
 
 def _store(cfg, n=20, dtype=torch.float64):
-    frames = read_xyz(str(PBTE))[:n]
+    frames = read_xyz(str(XYZ))[:n]
     structs = preprocess_structures(frames, cfg, np.float64)
     return StreamDataStore(structs, torch.device("cpu"), dtype, config=cfg)
 
@@ -180,8 +180,8 @@ def _write_run_files(tmp_path, n_frames=20):
     nepin = tmp_path / "nep.in"
     nepin.write_text(NEP_IN + "epoch 3\nbatch 8\n")
     xyz = tmp_path / "train.xyz"
-    # Slice PbTe down to n_frames by re-reading the raw text blocks.
-    raw = PBTE.read_text().splitlines()
+    # Slice the fixture down to n_frames by re-reading the raw text blocks.
+    raw = XYZ.read_text().splitlines()
     out, i, k = [], 0, 0
     while i < len(raw) and k < n_frames:
         na = int(raw[i].strip())
