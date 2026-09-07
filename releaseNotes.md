@@ -15,10 +15,12 @@
   less host memory, same speed within a few %); `on_the_fly` keeps only
   positions and cells and runs the neighbor search on the device per
   batch (no pair memory at all, ~10-20% slower). `auto` measures the pair
-  count on a sample of frames and takes the first layout that fits half
+  count on a sample of frames, estimates the peak host footprint
+  (calibrated on measured runs) and takes the first layout that fits 80%
   of the process's memory budget (cgroup / RAM / ranks per node), so a
   13M-frame set now trains on one 8-GCD node instead of running out of
-  memory. Pair sets are identical across layouts.
+  memory. Pair indices are stored as int32 in every layout. Pair sets are
+  identical across layouts.
 - **Host memory** of sharded training cut further: the end-of-training
   prediction gathers to rank 0 one rank at a time instead of giving every
   rank the whole dataset's predictions (~10 GiB/rank on 13M frames); the

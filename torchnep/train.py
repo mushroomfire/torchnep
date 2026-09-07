@@ -395,11 +395,12 @@ class StreamDataStore:
         np_dtype = np.float32 if self.dtype == torch.float32 else np.float64
         nr, na = int(self._nrad.sum()), int(self._nang.sum())
         g = self._gather_free
-        self._pi_r_all = g(structures, "pair_i_rad", nr, np.int64)
-        self._pj_r_all = g(structures, "pair_j_rad", nr, np.int64)
+        # int32 indices (frame-local, < 2^31); widened to int64 per batch
+        self._pi_r_all = g(structures, "pair_i_rad", nr, np.int32)
+        self._pj_r_all = g(structures, "pair_j_rad", nr, np.int32)
         self._rij_r_all = g(structures, "rij_rad", nr, np_dtype)
-        self._pi_a_all = g(structures, "pair_i_ang", na, np.int64)
-        self._pj_a_all = g(structures, "pair_j_ang", na, np.int64)
+        self._pi_a_all = g(structures, "pair_i_ang", na, np.int32)
+        self._pj_a_all = g(structures, "pair_j_ang", na, np.int32)
         self._rij_a_all = g(structures, "rij_ang", na, np_dtype)
 
     def _init_geometry(self, structures):
@@ -593,14 +594,14 @@ class StreamDataStore:
             off_rep_a = torch.repeat_interleave(off_t, na_t)
             out.update({
                 "pair_i_rad": _stage(
-                    self._cat(self._pi_r_all, idx, self._nrad_cum) + off_rep_r),
+                    self._cat(self._pi_r_all, idx, self._nrad_cum).to(torch.long) + off_rep_r),
                 "pair_j_rad": _stage(
-                    self._cat(self._pj_r_all, idx, self._nrad_cum) + off_rep_r),
+                    self._cat(self._pj_r_all, idx, self._nrad_cum).to(torch.long) + off_rep_r),
                 "rij_rad": _stage(self._cat(self._rij_r_all, idx, self._nrad_cum)),
                 "pair_i_ang": _stage(
-                    self._cat(self._pi_a_all, idx, self._nang_cum) + off_rep_a),
+                    self._cat(self._pi_a_all, idx, self._nang_cum).to(torch.long) + off_rep_a),
                 "pair_j_ang": _stage(
-                    self._cat(self._pj_a_all, idx, self._nang_cum) + off_rep_a),
+                    self._cat(self._pj_a_all, idx, self._nang_cum).to(torch.long) + off_rep_a),
                 "rij_ang": _stage(self._cat(self._rij_a_all, idx, self._nang_cum)),
             })
         else:
@@ -1042,15 +1043,21 @@ def estimate_store_bytes(frames, config, itemsize=4, sample=512):
         pr += int((d < rc_r).sum()); pa += int((d < rc_a).sum()); atoms_s += f["natoms"]
     scale = atoms / max(atoms_s, 1.0)
     pairs_r, pairs_a = pr * scale, pa * scale
-    per_pair = 8 + 8 + 3 * itemsize                      # int64 i, j + rij
+    per_pair = 4 + 4 + 3 * itemsize                      # int32 i, j + rij
     cached = (pairs_r + pairs_a) * per_pair
     compact = pairs_r * (4 + 4 + 3) + atoms * 3 * itemsize + n * 9 * itemsize
     geometry = atoms * 3 * itemsize + n * 9 * itemsize
     labels = atoms * (3 * itemsize + 8) + n * 300         # forces, types, per-frame scalars
     parsed = atoms * 48 + n * 1500                        # frame dicts alive while preprocessing
-    return {"cached": 1.2 * cached + labels + parsed,
-            "compact": 1.2 * compact + labels + parsed,
-            "on_the_fly": 1.2 * geometry + labels + parsed}
+    # Calibrated on LUMI (MI250X, 13M-frame set): measured per-rank RSS =
+    # ~1.5 x the store data + a fixed ~4.5 GiB (torch + HIP/CUDA runtime,
+    # BLAS libraries, RCCL, pinned staging) + the end-of-training
+    # prediction, whose global arrays on rank 0 cost ~1 KB per frame.
+    runtime = 4.5 * 2 ** 30
+    predict = n * 1024.0
+    return {"cached": 1.5 * cached + labels + parsed + runtime + predict,
+            "compact": 1.5 * compact + labels + parsed + runtime + predict,
+            "on_the_fly": 1.5 * geometry + labels + parsed + runtime + predict}
 
 
 def host_memory_budget():
@@ -1078,12 +1085,14 @@ def host_memory_budget():
 
 
 def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
-                         fraction=0.5, log=print):
+                         fraction=0.8, log=print):
     """Resolve ``requested`` (``auto`` or an explicit mode) to a mode.
 
     ``auto`` takes the first layout, in the order cached -> compact ->
     on_the_fly, whose estimated host need fits in ``fraction`` of this
-    rank's memory budget. Returns ``(mode, estimate_dict, budget)``."""
+    rank's memory budget (0.8: the estimate is calibrated to within ~15%
+    of the measured peak, see :func:`estimate_store_bytes`). Returns
+    ``(mode, estimate_dict, budget)``."""
     est = estimate_store_bytes(frames, config, itemsize)
     budget = host_memory_budget()
     if requested != "auto":
@@ -1754,7 +1763,7 @@ def train_nep(
     rebuilt on the device per batch), ``on_the_fly`` (positions + cells
     only, the neighbor search runs on the device per batch — fits any
     dataset). ``auto`` (default) takes the first of these whose estimated
-    footprint fits in half of this process's memory budget.
+    peak footprint fits in 80% of this process's memory budget.
 
     Hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / …) come
     from ``config_file`` only. See README for the full nep.in reference.
