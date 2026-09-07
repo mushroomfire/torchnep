@@ -26,9 +26,10 @@ import numpy as np
 from typing import List
 
 from .constants import (
-    ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS,
+    ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS, ZBL_PARA,
 )
 from . import ops
+from .data import zbl_pair_index
 
 
 class FittingNet(nn.Module):
@@ -99,13 +100,23 @@ class NEPModel(nn.Module):
 
         # ZBL
         self.zbl = config.get("zbl", None)
+        # Flexible ZBL (GPUMD zbl.in): per-element-pair cutoffs + screening
+        # coefficients, (n_pairs, 10) table; None = universal ZBL.
+        self.zbl_flexible = None
         if self.zbl is not None:
             # Real atomic numbers (H=1). ZBL needs physical Z in Z*Z', Z^0.23.
             atomic_numbers = [ELEMENTS.index(n) + 1 for n in self.type_names]
             self.register_buffer("atomic_numbers",
                                  torch.tensor(atomic_numbers, dtype=torch.long))
             tw = config.get("typewise_cutoff_zbl_factor", None)
-            if tw is not None:
+            if config.get("zbl_flexible") is not None:
+                if tw is not None:
+                    warnings.warn("use_typewise_cutoff_zbl is ignored when "
+                                  "zbl points to a zbl.in file (the per-pair "
+                                  "cutoffs of the file are used)", stacklevel=2)
+                tw = None            # GPUMD: flexible parameters win
+                self.set_flexible_zbl(config["zbl_flexible"])
+            elif tw is not None:
                 # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z -> z-1.
                 rc_i = [tw * COVALENT_RADIUS[z - 1] for z in atomic_numbers]
                 self.register_buffer("zbl_rc_inner_per_type", torch.tensor(rc_i))
@@ -145,10 +156,18 @@ class NEPModel(nn.Module):
                                        dtype=torch.float64)
                 rc_i_pair = torch.full(shape, self.zbl_rc_inner,
                                        dtype=torch.float64)
-            self.register_buffer("zbl_rc_inner_pair", rc_i_pair,
-                                 persistent=False)
-            self.register_buffer("zbl_rc_outer_pair", rc_o_pair,
-                                 persistent=False)
+            if self.zbl_flexible is None:
+                self.register_buffer("zbl_rc_inner_pair", rc_i_pair,
+                                     persistent=False)
+                self.register_buffer("zbl_rc_outer_pair", rc_o_pair,
+                                     persistent=False)
+                # universal screening function: the same 8 constants for
+                # every pair (the flexible table replaces them per pair)
+                T = len(atomic_numbers)
+                self.register_buffer(
+                    "zbl_phi_pair",
+                    torch.tensor(ZBL_PARA, dtype=torch.float64).expand(T, T, 8).clone(),
+                    persistent=False)
 
         n_ap1 = self.n_max_angular + 1
         self.dim_radial = self.n_max_radial + 1
@@ -265,7 +284,7 @@ class NEPModel(nn.Module):
                 self.zbl_typewise_factor,
                 getattr(self, "zbl_rc_inner_per_type", None),
                 getattr(self, "zbl_rc_outer_per_type", None),
-                dtype, device)
+                dtype, device, **self._flexible_zbl_kwargs())
 
         Etot = torch.zeros(num_structures, dtype=dtype, device=device)
         Etot.scatter_add_(0, struct_idx, Ei)
@@ -409,7 +428,10 @@ class NEPModel(nn.Module):
                 batch["pair_j_ang"], batch["rij_ang"],
                 self.zbl_zizj_pair, self.zbl_a_inv_pair,
                 self.zbl_rc_inner_pair, self.zbl_rc_outer_pair,
-                need_grad=need_forces)
+                need_grad=need_forces,
+                # universal ZBL keeps the constant coefficients (unchanged
+                # kernel); only the flexible table adds the per-pair gather
+                phi_tab=self.zbl_phi_pair if self.zbl_flexible is not None else None)
             Ei = Ei.scatter_add(0, batch["pair_i_ang"], e_zbl)
 
         forces = None
@@ -545,6 +567,64 @@ class NEPModel(nn.Module):
         # q_scaler (buffer — kept; the weights were trained against it)
         q_scaler = vals[idx:idx + dim]
         self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
+        idx += dim
+
+        # flexible ZBL table at the end of a "zbl 0 0" file: adopt it (a
+        # fine-tune from a flexible model keeps its ZBL unless nep.in gives
+        # its own zbl.in, which was applied at construction)
+        n_pairs = nt * (nt + 1) // 2
+        file_flexible = any(ln.split()[:3] == ["zbl", "0", "0"]
+                            for ln in lines[:header_lines])
+        if file_flexible and self.zbl is not None and self.zbl_flexible is None:
+            if len(vals) < idx + 10 * n_pairs:
+                raise ValueError(f"{path}: 'zbl 0 0' header but the flexible "
+                                 f"ZBL table ({10 * n_pairs} numbers) is missing")
+            self.set_flexible_zbl(vals[idx:idx + 10 * n_pairs].reshape(n_pairs, 10))
+            self.zbl_typewise_factor = None
+
+    # ---- flexible ZBL (GPUMD zbl.in) --------------------------------------
+    def set_flexible_zbl(self, table):
+        """Install per-element-pair ZBL parameters (GPUMD ``zbl.in`` table:
+        ``n_pairs x 10`` rows ``rc_inner rc_outer a1..a8`` in the order
+        1-1, 1-2, ..., n-n). Replaces the universal / typewise cutoffs."""
+        T = self.num_types
+        tab = torch.as_tensor(np.asarray(table, dtype=np.float64)).reshape(-1, 10)
+        if tab.shape[0] != T * (T + 1) // 2:
+            raise ValueError(f"flexible ZBL table has {tab.shape[0]} rows, "
+                             f"{T} types need {T * (T + 1) // 2}")
+        rc_i = torch.zeros(T, T, dtype=torch.float64)
+        rc_o = torch.zeros(T, T, dtype=torch.float64)
+        phi = torch.zeros(T, T, 8, dtype=torch.float64)
+        for t1 in range(T):
+            for t2 in range(T):
+                row = tab[zbl_pair_index(t1, t2, T)]
+                rc_i[t1, t2], rc_o[t1, t2] = row[0], row[1]
+                phi[t1, t2] = row[2:]
+        # float64 tables at construction (the module-level .to(dtype) casts
+        # them with every other buffer); the model dtype/device once built
+        dev = self.b1.device if hasattr(self, "b1") else torch.device("cpu")
+        dt = self.b1.dtype if hasattr(self, "b1") else torch.float64
+        for name, t in (("zbl_flexible", tab), ("zbl_rc_inner_pair", rc_i),
+                        ("zbl_rc_outer_pair", rc_o), ("zbl_phi_pair", phi)):
+            t = t.to(device=dev, dtype=dt)
+            if hasattr(self, name):
+                setattr(self, name, t)
+            else:
+                self.register_buffer(name, t, persistent=(name == "zbl_flexible"))
+        for name in ("zbl_rc_inner_per_type", "zbl_rc_outer_per_type"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.zbl_typewise_factor = None
+        self.zbl_rc_inner = float(rc_i.min())
+        self.zbl_rc_outer = float(rc_o.max())
+        self.zbl = self.zbl_rc_outer
+
+    def _flexible_zbl_kwargs(self):
+        if self.zbl_flexible is None:
+            return {}
+        return dict(rc_inner_pair=self.zbl_rc_inner_pair,
+                    rc_outer_pair=self.zbl_rc_outer_pair,
+                    phi_pair=self.zbl_phi_pair)
 
     def save_nep_txt(self, path: str, max_NN_radial: int,
                      max_NN_angular: int):
@@ -574,7 +654,9 @@ class NEPModel(nn.Module):
             tw = self.zbl_typewise_factor
             rc_inner_out = self.zbl / 2.0
             rc_outer_out = self.zbl
-            if tw is not None:
+            if self.zbl_flexible is not None:
+                lines.append("zbl 0 0")     # GPUMD: flexible ZBL, table at the end
+            elif tw is not None:
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out} {tw}")
             else:
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out}")
@@ -635,6 +717,12 @@ class NEPModel(nn.Module):
 
         for v in self.q_scaler.detach().cpu().numpy():
             lines.append(f"  {v:.10e}")
+
+        # flexible ZBL table (rc_inner rc_outer a1..a8 per element pair, GPUMD
+        # zbl.in order) — GPUMD / NEP_CPU / LAMMPS read it from here
+        if self.zbl_flexible is not None:
+            for v in self.zbl_flexible.detach().cpu().numpy().reshape(-1):
+                lines.append(f"  {v:.10e}")
 
         with open(path, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -707,6 +795,15 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         new_config["zbl"] = model.zbl
         if getattr(model, "zbl_typewise_factor", None) is not None:
             new_config["typewise_cutoff_zbl_factor"] = model.zbl_typewise_factor
+        if model.zbl_flexible is not None:
+            # keep the kept types' rows of the pair table, in zbl.in order
+            T_old = model.num_types
+            old = model.zbl_flexible.detach().cpu().numpy()
+            rows = []
+            for a in range(len(keep_idx)):
+                for b in range(a, len(keep_idx)):
+                    rows.append(old[zbl_pair_index(keep_idx[a], keep_idx[b], T_old)].tolist())
+            new_config["zbl_flexible"] = rows
 
     dev = model.b1.device
     dtype = model.b1.dtype

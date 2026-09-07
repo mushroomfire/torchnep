@@ -487,9 +487,14 @@ def compute_zbl(
     atom_types, pair_i, pair_j, rij, N,
     atomic_numbers_list, rc_inner_default, rc_outer_default,
     typewise_factor, rc_inner_per_type, rc_outer_per_type,
-    dtype, device,
+    dtype, device, rc_inner_pair=None, rc_outer_pair=None, phi_pair=None,
 ) -> torch.Tensor:
     """ZBL repulsive energy with optional typewise cutoffs.
+
+    ``rc_inner_pair`` / ``rc_outer_pair`` ((T, T)) and ``phi_pair``
+    ((T, T, 8), coefficients a1..a8) switch on the flexible ZBL (GPUMD
+    ``zbl.in``): per-element-pair switching window and screening function;
+    they take precedence over the typewise / global cutoffs.
 
     Parameters
     ----------
@@ -513,11 +518,15 @@ def compute_zbl(
              across pairs, scatter-added onto central atoms).
     """
     dij = torch.norm(rij, dim=-1)
-    use_tw = typewise_factor is not None and rc_inner_per_type is not None
+    flexible = phi_pair is not None
+    use_tw = (not flexible and typewise_factor is not None
+              and rc_inner_per_type is not None)
 
     # Coarse cutoff for the initial distance mask. For typewise, the actual
     # per-pair cutoff may be smaller, so we evaluate tighter cutoffs later.
-    if use_tw:
+    if flexible:
+        max_rc = float(rc_outer_pair.max().item())
+    elif use_tw:
         max_rc = min(float(rc_outer_per_type.max().item()), rc_outer_default)
     else:
         max_rc = rc_outer_default
@@ -529,7 +538,19 @@ def compute_zbl(
     pi, pj = pair_i[mask], pair_j[mask]
     d = dij[mask]
 
-    if use_tw:
+    coef = None
+    if flexible:
+        t1 = atom_types[pi]
+        t2 = atom_types[pj]
+        rc_inner = rc_inner_pair[t1, t2].to(dtype)
+        rc_outer = rc_outer_pair[t1, t2].to(dtype)
+        coef = phi_pair[t1, t2].to(dtype)                # (P, 8)
+        fx_mask = d < rc_outer
+        if not fx_mask.all():
+            pi, pj, d = pi[fx_mask], pj[fx_mask], d[fx_mask]
+            rc_inner, rc_outer, coef = (rc_inner[fx_mask], rc_outer[fx_mask],
+                                        coef[fx_mask])
+    elif use_tw:
         # NEP_CPU typewise convention (nep.cpp:1795-1801):
         #   rc_outer_pair = min((cov_i + cov_j) * typewise_factor, rc_outer_default)
         #   rc_inner      = 0
@@ -561,10 +582,16 @@ def compute_zbl(
     a_inv = (zi ** 0.23 + zj ** 0.23) * 2.134563
     zizj = K_C_SP * zi * zj
     x = d * a_inv
-    phi = (ZBL_PARA[0] * torch.exp(-ZBL_PARA[1] * x)
-           + ZBL_PARA[2] * torch.exp(-ZBL_PARA[3] * x)
-           + ZBL_PARA[4] * torch.exp(-ZBL_PARA[5] * x)
-           + ZBL_PARA[6] * torch.exp(-ZBL_PARA[7] * x))
+    if coef is None:
+        phi = (ZBL_PARA[0] * torch.exp(-ZBL_PARA[1] * x)
+               + ZBL_PARA[2] * torch.exp(-ZBL_PARA[3] * x)
+               + ZBL_PARA[4] * torch.exp(-ZBL_PARA[5] * x)
+               + ZBL_PARA[6] * torch.exp(-ZBL_PARA[7] * x))
+    else:
+        phi = (coef[:, 0] * torch.exp(-coef[:, 1] * x)
+               + coef[:, 2] * torch.exp(-coef[:, 3] * x)
+               + coef[:, 4] * torch.exp(-coef[:, 5] * x)
+               + coef[:, 6] * torch.exp(-coef[:, 7] * x))
 
     rc_i = rc_inner  # per-pair tensor in typewise, scalar otherwise
     rc_o = rc_outer
@@ -593,7 +620,7 @@ def compute_zbl(
 
 def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
                      zizj_tab, a_inv_tab, rc_inner_tab, rc_outer_tab,
-                     need_grad: bool):
+                     need_grad: bool, phi_tab=None):
     """Branch-free ZBL over ALL pairs — static shapes, analytic derivative.
 
     Table variant of :func:`compute_zbl` for the compiled cached core: the
@@ -617,6 +644,10 @@ def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
         min((cov_i+cov_j)*factor, rc_outer_default) into rc_outer_tab
         with rc_inner_tab = 0, plain mode fills both with the globals.
     need_grad : bool                 also return the pair gradient.
+    phi_tab : (T, T, 8) float or None
+        Per-type-pair screening-function coefficients a1..a8
+        (phi = sum_k a_{2k-1} exp(-a_{2k} x)); None = the universal ZBL
+        constants. The flexible ZBL (GPUMD ``zbl.in``) fills this table.
 
     Returns
     -------
@@ -634,12 +665,16 @@ def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
 
     d = torch.norm(rij, dim=-1)
     x = d * a_inv
-    e1 = torch.exp(-ZBL_PARA[1] * x)
-    e2 = torch.exp(-ZBL_PARA[3] * x)
-    e3 = torch.exp(-ZBL_PARA[5] * x)
-    e4 = torch.exp(-ZBL_PARA[7] * x)
-    phi = (ZBL_PARA[0] * e1 + ZBL_PARA[2] * e2
-           + ZBL_PARA[4] * e3 + ZBL_PARA[6] * e4)
+    if phi_tab is None:
+        a1, b1, a2, b2, a3, b3, a4, b4 = ZBL_PARA
+    else:
+        c = phi_tab.reshape(-1, 8)[idx]                      # (P, 8)
+        a1, b1, a2, b2, a3, b3, a4, b4 = (c[:, k] for k in range(8))
+    e1 = torch.exp(-b1 * x)
+    e2 = torch.exp(-b2 * x)
+    e3 = torch.exp(-b3 * x)
+    e4 = torch.exp(-b4 * x)
+    phi = a1 * e1 + a2 * e2 + a3 * e3 + a4 * e4
 
     inv_w = 1.0 / (rc_o - rc_i)
     t = torch.clamp((d - rc_i) * inv_w, 0.0, 1.0)
@@ -651,9 +686,7 @@ def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
 
     # d(phi)/dd = d(phi)/dx * a_inv;  d(fc)/dd via the clamped t: sin(pi*t)
     # vanishes at both clamp boundaries, so the formula is exact everywhere.
-    dphi = -(ZBL_PARA[0] * ZBL_PARA[1] * e1 + ZBL_PARA[2] * ZBL_PARA[3] * e2
-             + ZBL_PARA[4] * ZBL_PARA[5] * e3
-             + ZBL_PARA[6] * ZBL_PARA[7] * e4) * a_inv
+    dphi = -(a1 * b1 * e1 + a2 * b2 * e2 + a3 * b3 * e3 + a4 * b4 * e4) * a_inv
     dfc = -0.5 * PI * torch.sin(PI * t) * inv_w
     # e_pair = zizj * phi * fc / d
     de = zizj * (dphi * fc + phi * dfc - phi * fc / d) / d

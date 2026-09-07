@@ -117,6 +117,10 @@ class NEPCalculator:
             self.zbl_rc_inner = float(parts[1])
             self.zbl_rc_outer = float(parts[2])
             self.zbl_typewise_factor = float(parts[3]) if len(parts) > 3 else None
+            # "zbl 0 0": flexible ZBL, per-pair table after the q_scaler
+            self.zbl_flexible = (self.zbl_rc_inner == 0.0 and self.zbl_rc_outer == 0.0)
+            if self.zbl_flexible:
+                self.zbl_typewise_factor = None
             idx += 1
 
             if self.zbl_typewise_factor is not None:
@@ -131,6 +135,7 @@ class NEPCalculator:
             self.zbl_rc_inner = None
             self.zbl_rc_outer = None
             self.zbl_typewise_factor = None
+            self.zbl_flexible = False
 
         # Cutoff
         parts = lines[idx].split()
@@ -229,6 +234,27 @@ class NEPCalculator:
             data[di:di + self.dim], dtype=self.dtype, device=self.device)
         di += self.dim
 
+        # flexible ZBL table (GPUMD zbl.in order: 1-1, 1-2, ..., n-n; each
+        # row rc_inner rc_outer a1..a8) -> per-type-pair tables
+        self._zbl_pair_tables = {}
+        if self.has_zbl and self.zbl_flexible:
+            from .data import zbl_pair_index
+            T = self.num_types
+            n_pairs = T * (T + 1) // 2
+            tab = np.array(data[di:di + 10 * n_pairs]).reshape(n_pairs, 10)
+            di += 10 * n_pairs
+            rc_i = np.zeros((T, T)); rc_o = np.zeros((T, T)); phi = np.zeros((T, T, 8))
+            for t1 in range(T):
+                for t2 in range(T):
+                    row = tab[zbl_pair_index(t1, t2, T)]
+                    rc_i[t1, t2], rc_o[t1, t2], phi[t1, t2] = row[0], row[1], row[2:]
+            self.zbl_table = tab
+            self.zbl_rc_inner, self.zbl_rc_outer = float(rc_i.min()), float(rc_o.max())
+            self._zbl_pair_tables = dict(
+                rc_inner_pair=torch.tensor(rc_i, dtype=self.dtype, device=self.device),
+                rc_outer_pair=torch.tensor(rc_o, dtype=self.dtype, device=self.device),
+                phi_pair=torch.tensor(phi, dtype=self.dtype, device=self.device))
+
         # Pre-build constants
         self._c3b  = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
         self._c4b  = torch.tensor(C4B,  dtype=self.dtype, device=self.device)
@@ -321,7 +347,7 @@ class NEPCalculator:
                 self.zbl_typewise_factor,
                 getattr(self, "zbl_rc_inner_per_type", None),
                 getattr(self, "zbl_rc_outer_per_type", None),
-                self.dtype, self.device,
+                self.dtype, self.device, **self._zbl_pair_tables,
             )
 
         Ei_total = Ei_nep if Ei_zbl is None else Ei_nep + Ei_zbl
@@ -440,7 +466,7 @@ class NEPCalculator:
                     self.zbl_typewise_factor,
                     getattr(self, "zbl_rc_inner_per_type", None),
                     getattr(self, "zbl_rc_outer_per_type", None),
-                    dtype, device,
+                    dtype, device, **self._zbl_pair_tables,
                 )
                 if Ei_zbl.requires_grad:
                     g_zbl = torch.autograd.grad(
@@ -704,7 +730,7 @@ class NEPCalculator:
                         self.zbl_typewise_factor,
                         getattr(self, "zbl_rc_inner_per_type", None),
                         getattr(self, "zbl_rc_outer_per_type", None),
-                        dtype, device)
+                        dtype, device, **self._zbl_pair_tables)
                     g_zbl = (torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
                                                  allow_unused=True)[0]
                              if Ei_zbl.requires_grad else None)

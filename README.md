@@ -99,7 +99,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular)|
 | `l_max` | `4 1 0` | `L_3b q_222 q_1111 q_112 q_123 q_233 q_134` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD) enabling each higher-body invariant|
 | `neuron` | `30` | Neurons in the (single) hidden layer |
-| `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
+| `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion. A file path instead of a number (e.g. `zbl zbl.in`, relative to nep.in) uses GPUMD's flexible ZBL: one line per element pair (1-1, 1-2, …, n-n) with `rc_inner rc_outer a1 … a8`; to change only the cutoffs keep the universal coefficients `0.18175 3.1998 0.50986 0.94229 0.28022 0.4029 0.02817 0.20162`. The table is stored in `nep.txt`, and `use_typewise_cutoff_zbl` is ignored |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
 
 ### Training hyperparameters

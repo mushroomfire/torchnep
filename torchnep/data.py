@@ -17,6 +17,7 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import os
 import numpy as np
 from typing import Dict, List
 
@@ -294,6 +295,45 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
     return frame
 
 
+def zbl_pair_index(t1: int, t2: int, num_types: int) -> int:
+    """Row of the (t1, t2) element pair in a GPUMD zbl.in table (pairs are
+    listed 1-1, 1-2, ..., 1-n, 2-2, ..., n-n; order of t1/t2 irrelevant)."""
+    if t1 > t2:
+        t1, t2 = t2, t1
+    return t1 * num_types - (t1 * (t1 - 1)) // 2 + (t2 - t1)
+
+
+def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
+    """Read a GPUMD ``zbl.in`` (flexible ZBL) file.
+
+    One row per element pair, ``num_types * (num_types + 1) / 2`` rows in
+    the order 1-1, 1-2, ..., 1-n, 2-2, ..., n-n; each row holds
+    ``rc_inner rc_outer a1 a2 a3 a4 a5 a6 a7 a8`` with
+    ``phi(x) = a1 exp(-a2 x) + a3 exp(-a4 x) + a5 exp(-a6 x) + a7 exp(-a8 x)``.
+    Whitespace / line breaks are free (GPUMD reads the numbers as a stream).
+    Returns the table as a list of 10-element rows.
+    """
+    n_pairs = num_types * (num_types + 1) // 2
+    with open(filename) as f:
+        text = f.read()
+    vals = []
+    for tok in text.replace(",", " ").split():
+        if tok.startswith("#"):
+            break
+        vals.append(float(tok))
+    if len(vals) != 10 * n_pairs:
+        raise ValueError(
+            f"{filename}: expected {10 * n_pairs} numbers "
+            f"({n_pairs} element pairs x 10: rc_inner rc_outer a1..a8) for "
+            f"{num_types} types, found {len(vals)}")
+    table = [vals[10 * k:10 * (k + 1)] for k in range(n_pairs)]
+    for k, row in enumerate(table):
+        if not (0.0 <= row[0] < row[1]):
+            raise ValueError(f"{filename}: pair row {k + 1}: need "
+                             f"0 <= rc_inner < rc_outer, got {row[0]} {row[1]}")
+    return table
+
+
 def parse_nep_in(filename: str) -> Dict:
     """Parse nep.in parameter file.
 
@@ -330,7 +370,18 @@ def parse_nep_in(filename: str) -> Dict:
                         f"only implements NEP4 (set 'version 4').")
                 params["version"] = v
             elif key == "zbl":
-                params["zbl"] = float(parts[1])
+                # "zbl <cutoff>"  -> universal ZBL with that outer cutoff;
+                # "zbl <file>"    -> flexible ZBL: per-element-pair cutoffs
+                #                    and phi coefficients read from a GPUMD
+                #                    zbl.in file (path relative to nep.in).
+                try:
+                    params["zbl"] = float(parts[1])
+                except ValueError:
+                    zbl_path = parts[1]
+                    if not os.path.isabs(zbl_path):
+                        zbl_path = os.path.join(
+                            os.path.dirname(os.path.abspath(filename)), zbl_path)
+                    params["zbl_file"] = zbl_path
             elif key == "use_typewise_cutoff_zbl":
                 params["typewise_cutoff_zbl_factor"] = float(parts[1])
             elif key == "cutoff":
@@ -400,6 +451,14 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stage2_scheduler_patience"] = int(parts[1])
             elif key == "stage2_scheduler_factor":
                 params["stage2_scheduler_factor"] = float(parts[1])
+
+    if "zbl_file" in params:
+        if "num_types" not in params:
+            raise ValueError("nep.in: 'zbl <file>' needs the 'type' line")
+        params["zbl_flexible"] = read_zbl_in(params["zbl_file"],
+                                             params["num_types"])
+        # the largest outer cutoff stands in for the universal cutoff value
+        params["zbl"] = max(row[1] for row in params["zbl_flexible"])
 
     # Snapshot the explicit (user-set) keys before applying defaults so the
     # trainer can report which values came from nep.in vs which fell back

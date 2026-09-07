@@ -156,9 +156,13 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('neuron'):10}  neuron       {config['neuron']}")
     if config.get("zbl") is not None:
         zbl_extra = ""
-        if config.get("typewise_cutoff_zbl_factor") is not None:
-            zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
-        lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
+        if config.get("zbl_flexible") is not None:
+            lines.append(f"  {tag('zbl'):10}  zbl          flexible, per-pair "
+                         f"parameters from {config.get('zbl_file', 'zbl.in')}")
+        else:
+            if config.get("typewise_cutoff_zbl_factor") is not None:
+                zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
+            lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")

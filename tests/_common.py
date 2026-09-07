@@ -67,6 +67,24 @@ FIXTURES = [
                  "frames down to NN ~1.18 A that drive the ZBL repulsion "
                  "to/below its inner cutoff (1.25 A).",
     },
+    {
+        "name":  "CrCoNi_unizbl",
+        "nep":   DATA_DIR / "nep_CrCoNi_unizbl.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_unizbl.gpumd.npz",
+        "note":  "Same weights as CrCoNi with the UNIVERSAL ZBL (zbl 1.25 2.5, "
+                 "no typewise factor).",
+    },
+    {
+        "name":  "CrCoNi_flexzbl",
+        "nep":   DATA_DIR / "nep_CrCoNi_flexzbl.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_flexzbl.gpumd.npz",
+        "note":  "Same weights as CrCoNi with the FLEXIBLE ZBL ('zbl 0 0' + a "
+                 "6-row per-pair table at the end, written by torchnep from "
+                 "data/CrCoNi_flexzbl.zbl.in: pair-specific cutoffs and "
+                 "screening coefficients).",
+    },
 ]
 
 
@@ -183,12 +201,15 @@ def parse_nep_header(nep_path: Path) -> dict:
                 out["num_types"] = int(parts[1])
                 out["type_names"] = parts[2:2 + out["num_types"]]
             elif key == "zbl":
-                # "zbl <rc_inner> <rc_outer>" or with typewise factor at end
+                # "zbl <rc_inner> <rc_outer>" or with typewise factor at end;
+                # "zbl 0 0" = flexible ZBL (per-pair table at the file end)
                 if len(parts) == 4:
                     out["zbl_outer"] = float(parts[2])
                     out["zbl_factor"] = float(parts[3])
                 else:
                     out["zbl_outer"] = float(parts[2])
+                if float(parts[1]) == 0.0 and float(parts[2]) == 0.0:
+                    out["zbl_flexible"] = True
             elif key == "cutoff":
                 out["rc_radial"]  = float(parts[1])
                 out["rc_angular"] = float(parts[2])
@@ -224,7 +245,11 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
         f"l_max {' '.join(str(x) for x in (hdr['l_max'] + [0] * 5)[:5])}",
         f"neuron {hdr['neuron']}",
     ]
-    if "zbl_outer" in hdr:
+    if hdr.get("zbl_flexible"):
+        # GPUMD needs a (valid, unused) cutoff on the zbl line and reads the
+        # per-pair parameters from zbl.in in the working directory
+        lines.append("zbl 2")
+    elif "zbl_outer" in hdr:
         lines.append(f"zbl {hdr['zbl_outer']}")
         if "zbl_factor" in hdr:
             lines.append(f"use_typewise_cutoff_zbl {hdr['zbl_factor']}")

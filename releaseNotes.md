@@ -1,5 +1,11 @@
 # Release Notes
 
+## 1.0.3b2
+
+- **Flexible ZBL** (GPUMD `zbl.in`): `zbl <file>` in nep.in reads per-element-pair
+  cutoffs and screening coefficients; they are written into `nep.txt`, so GPUMD,
+  NEP_CPU and LAMMPS use them without the file.
+
 ## 1.0.3b1
 
 - **Multi-GPU scaling fix**: one all-reduce per epoch instead of one per step.

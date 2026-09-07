@@ -294,6 +294,8 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
         config["zbl"] = calc.zbl_rc_outer
         if calc.zbl_typewise_factor is not None:
             config["typewise_cutoff_zbl_factor"] = calc.zbl_typewise_factor
+        if getattr(calc, "zbl_flexible", False):
+            config["zbl_flexible"] = calc.zbl_table.tolist()   # per-pair table from nep.txt
 
     model = NEPModel(config).to(calc.dtype).to(device)
     for t in range(calc.num_types):

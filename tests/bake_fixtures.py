@@ -65,6 +65,15 @@ def bake_one(fixture: dict) -> None:
     try:
         # nep.txt
         shutil.copy(fixture["nep"], workdir / "nep.txt")
+        if hdr.get("zbl_flexible"):
+            # GPUMD's nep (prediction mode) takes the flexible-ZBL parameters
+            # from zbl.in in the working directory: extract the table that
+            # torchnep appended to nep.txt (10 numbers per element pair)
+            n_pairs = hdr["num_types"] * (hdr["num_types"] + 1) // 2
+            body = [ln for ln in Path(fixture["nep"]).read_text().splitlines() if ln.strip()]
+            tail = body[-10 * n_pairs:]
+            rows = [" ".join(tail[10 * k:10 * (k + 1)]) for k in range(n_pairs)]
+            (workdir / "zbl.in").write_text("\n".join(rows) + "\n")
         # train.xyz (inject dummy energy / forces if absent)
         write_gpumd_xyz(frames, workdir / "train.xyz")
         # nep.in (with descriptor mode 2 = per-atom row)
@@ -136,9 +145,13 @@ def main() -> int:
         sys.exit(f"GPUMD nep binary not found: {GPUMD_NEP}")
     print(f"GPUMD nep: {GPUMD_NEP}\n")
 
+    # optional: names on the command line restrict which fixtures are baked
+    wanted = set(sys.argv[1:])
     for fx in FIXTURES:
-        bake_one(fx)
-    bake_virial_mix()
+        if not wanted or fx["name"] in wanted:
+            bake_one(fx)
+    if not wanted or "virial_mix" in wanted:
+        bake_virial_mix()
 
     print("\nAll fixtures regenerated.")
     return 0
