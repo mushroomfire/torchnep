@@ -1085,12 +1085,12 @@ def host_memory_budget():
 
 
 def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
-                         fraction=0.8, log=print):
+                         fraction=0.75, log=print):
     """Resolve ``requested`` (``auto`` or an explicit mode) to a mode.
 
     ``auto`` takes the first layout, in the order cached -> compact ->
     on_the_fly, whose estimated host need fits in ``fraction`` of this
-    rank's memory budget (0.8: the estimate is calibrated to within ~15%
+    rank's memory budget (0.75: the estimate is calibrated to within ~15%
     of the measured peak, see :func:`estimate_store_bytes`). Returns
     ``(mode, estimate_dict, budget)``."""
     est = estimate_store_bytes(frames, config, itemsize)
@@ -1763,7 +1763,7 @@ def train_nep(
     rebuilt on the device per batch), ``on_the_fly`` (positions + cells
     only, the neighbor search runs on the device per batch — fits any
     dataset). ``auto`` (default) takes the first of these whose estimated
-    peak footprint fits in 80% of this process's memory budget.
+    peak footprint fits in 75% of this process's memory budget.
 
     Hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / …) come
     from ``config_file`` only. See README for the full nep.in reference.

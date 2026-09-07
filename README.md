@@ -149,6 +149,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
 | `valid_strategy` | `"stratified"` | `"random"` or `"stratified"` (split within (element combination × cell-size) groups; tiny cells ≤4 atoms and groups < 20 frames stay in training; auto-falls back to `"random"` if the validation set would be starved) |
+| `neighbor_mode` | `"auto"` | how neighbor lists are kept in host memory: `"cached"` (fastest), `"compact"` (~4x less memory), `"on_the_fly"` (built on the GPU per batch, least memory). `"auto"` picks the first that fits |
 
 ---
 
