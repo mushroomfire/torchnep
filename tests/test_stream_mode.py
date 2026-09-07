@@ -30,7 +30,7 @@ from torchnep.train import (preprocess_structures, StreamDataStore,
                             iter_collated)
 from _common import DATA_DIR, devices
 
-PBTE = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
+PBTE = DATA_DIR / "PbTe.xyz"
 NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 

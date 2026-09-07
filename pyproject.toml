@@ -59,4 +59,4 @@ packages = ["torchnep"]
 
 [tool.hatch.build.targets.sdist]
 include = ["torchnep/**/*.py", "README.md", "LICENSE", "pyproject.toml"]
-exclude = [".gitignore", "tests", "example", "my_test", ".github"]
+exclude = [".gitignore", "tests", "my_test", ".github"]

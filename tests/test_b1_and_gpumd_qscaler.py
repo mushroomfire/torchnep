@@ -32,7 +32,7 @@ from _common import DATA_DIR
 
 # PbTe example carries per-frame energy + forces (the CrCoNi fixture has no
 # energy labels, so it can't exercise the energy-offset b1 logic).
-PBTE = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
+PBTE = DATA_DIR / "PbTe.xyz"
 NEP_IN = ("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
           "basis_size 6 6\nl_max 4 2 1\nneuron 30\n")
 

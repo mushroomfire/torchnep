@@ -621,7 +621,7 @@ def test_backend_equivalence(tmp_path):
     nep.write_text("type 2 Te Pb\ncutoff 6 4\nn_max 4 4\n"
                    "basis_size 6 6\nl_max 4 2 1\nneuron 20\n")
     cfg = parse_nep_in(str(nep))
-    pbte = DATA_DIR.parent.parent / "example" / "PbTe" / "train.xyz"
+    pbte = DATA_DIR / "PbTe.xyz"
     structs = preprocess_structures(read_xyz(str(pbte))[:6], cfg, np.float64)
     store = StreamDataStore(structs, torch.device("cpu"), torch.float64,
                             config=cfg)
