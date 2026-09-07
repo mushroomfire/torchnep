@@ -22,7 +22,7 @@ Many ready-to-use examples (the training inputs and trained models of the TorchN
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
 
 <p align="center">
-  <img src="assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
   <br>
   <sub><em>Excellent single-GPU training speed (left) and near-linear multi-node parallel scaling (right).</em></sub>
 </p>

@@ -317,10 +317,9 @@ def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
     with open(filename) as f:
         text = f.read()
     vals = []
-    for tok in text.replace(",", " ").split():
-        if tok.startswith("#"):
-            break
-        vals.append(float(tok))
+    for line in text.splitlines():           # '#' starts a comment (rest of line)
+        for tok in line.split("#")[0].replace(",", " ").split():
+            vals.append(float(tok))
     if len(vals) != 10 * n_pairs:
         raise ValueError(
             f"{filename}: expected {10 * n_pairs} numbers "
