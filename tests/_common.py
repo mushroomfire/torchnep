@@ -256,3 +256,19 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
     if output_descriptor:
         lines.append(f"output_descriptor {output_descriptor}")
     dst.write_text("\n".join(lines) + "\n")
+
+
+def torchrun_cmd(nproc: int = 2) -> List[str]:
+    """torchrun prefix for the opt-in multi-process tests. A static rendezvous on
+    127.0.0.1 with a free port: ``--standalone`` advertises the machine's host
+    name, which does not resolve on some laptops (macOS ``*.local``) and then
+    the workers retry the store connection forever."""
+    import shutil
+    import socket
+    torchrun = shutil.which("torchrun")
+    if torchrun is None:
+        return []
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+    return [torchrun, "--rdzv-backend=static", f"--rdzv-endpoint=127.0.0.1:{port}",
+            "--nnodes=1", f"--nproc-per-node={nproc}"]

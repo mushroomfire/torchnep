@@ -396,8 +396,9 @@ def test_predict_dataset_sharded_matches_single(tmp_path):
     import os, shutil, subprocess
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         pytest.skip("multi-process test is local-only (set TORCHNEP_TEST_DDP=1)")
-    torchrun = shutil.which("torchrun")
-    if torchrun is None:
+    from _common import torchrun_cmd
+    cmd = torchrun_cmd(2)
+    if not cmd:
         pytest.skip("torchrun not on PATH")
     frames = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))
     xyz = tmp_path / "virial_mix.xyz"
@@ -408,8 +409,8 @@ def test_predict_dataset_sharded_matches_single(tmp_path):
     runner = tmp_path / "runner.py"; runner.write_text(_SHARDED_PREDICT_RUNNER)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
                PYTHONPATH=str(DATA_DIR.parent.parent) + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    r = subprocess.run([torchrun, "--standalone", "--nproc_per_node=2", str(runner), model, str(xyz),
-                        str(tmp_path / "sharded")], capture_output=True, text=True, env=env, timeout=600)
+    r = subprocess.run(cmd + [str(runner), model, str(xyz), str(tmp_path / "sharded")],
+                       capture_output=True, text=True, env=env, timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     for name in ("energy_train.out", "force_train.out", "virial_train.out", "stress_train.out"):
         a = np.loadtxt(tmp_path / "single" / name); b = np.loadtxt(tmp_path / "sharded" / name)

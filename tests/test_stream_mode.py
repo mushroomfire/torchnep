@@ -179,8 +179,9 @@ def test_sharded_run_reproducible(tmp_path):
     import subprocess
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
-    torchrun = shutil.which("torchrun")
-    if torchrun is None:
+    from _common import torchrun_cmd
+    cmd = torchrun_cmd(2)
+    if not cmd:
         pytest.skip("torchrun not on PATH")
 
     nepin = tmp_path / "nep.in"
@@ -201,8 +202,7 @@ def test_sharded_run_reproducible(tmp_path):
                PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
     for out_dir in ("out_a", "out_b"):
         r = subprocess.run(
-            [torchrun, "--standalone", "--nproc_per_node=2", str(runner),
-             str(nepin), str(xyz), str(tmp_path / out_dir)],
+            cmd + [str(runner), str(nepin), str(xyz), str(tmp_path / out_dir)],
             capture_output=True, text=True, env=env, timeout=600)
         assert r.returncode == 0, r.stderr[-2000:]
 

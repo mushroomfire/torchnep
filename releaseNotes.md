@@ -1,49 +1,22 @@
 # Release Notes
 
-## 1.0.3b2
+## 1.0.3
 
+- **Multi-node training**: each rank streams only its own part of the xyz file,
+  the NCCL/RCCL backend is chosen per node, and label counts are reduced once per
+  epoch — training scales almost linearly across nodes.
+- **Lower host memory**: new `neighbor_mode` argument (`train_nep` /
+  `train_nep_sharded`, default `"auto"`) — `"cached"` (fastest), `"compact"`
+  (~4x less memory) or `"on_the_fly"` (neighbor lists built on the GPU per batch,
+  least memory); `"auto"` picks the first that fits. The validation file, the data
+  store and the end-of-training prediction also use less memory.
+- **Streamed prediction**: `predict_dataset` processes the xyz in chunks with
+  bounded memory, shows a progress bar and an E/F/V RMSE/MAE table; `dtype`
+  defaults to `float32` and `batch_size=None` auto-sizes from GPU memory. New
+  `predict_dataset_sharded` for multi-GPU / multi-node prediction.
 - **Flexible ZBL** (GPUMD `zbl.in`): `zbl <file>` in nep.in reads per-element-pair
   cutoffs and screening coefficients; they are written into `nep.txt`, so GPUMD,
   NEP_CPU and LAMMPS use them without the file.
-
-## 1.0.3b1
-
-- **Multi-GPU scaling fix**: one all-reduce per epoch instead of one per step.
-- **Lower host memory**: new `neighbor_mode` argument (`train_nep` /
-  `train_nep_sharded`, default `"auto"`) — `"cached"`, `"compact"`
-  (~4x less memory) or `"on_the_fly"` (neighbor lists built on the GPU
-  per batch, least memory); `"auto"` picks the first that fits. The
-  sharded data path (validation file, store build, final prediction) also
-  uses less memory, and host RSS is printed at each data stage.
-
-## 1.0.3a2
-
-- **Streamed `predict_dataset`**: the xyz is indexed once and processed in
-  chunks of ~`chunk_atoms` atoms (default 200k, env
-  `TORCHNEP_PREDICT_CHUNK_ATOMS`) — read → neighbor lists → batches → rows
-  appended — so host memory is bounded by the chunk and device memory by
-  the batch; any dataset finishes on any machine. Outputs unchanged.
-- Progress bar (tqdm when installed, plain otherwise) and a per-stage
-  timing summary; one neighbor-list worker pool reused across chunks.
-- **`predict_dataset_sharded`**: multi-GPU / multi-node prediction
-  (torchrun / srun, one process per GPU): rank 0 indexes and broadcasts the
-  frame index, contiguous atom-balanced ranges per rank, each rank streams
-  its range, rank 0 merges the parts in order — identical files to the
-  single-process call.
-
-## 1.0.3a1
-
-- **Streamed shard loading** (`train_nep_sharded`): each rank reads only
-  its own byte range of the xyz file (auto for files ≥ 2 GiB,
-  `TORCHNEP_STREAM_THRESHOLD` to override). Bit-identical results;
-  stratified validation split falls back to random.
-- **Fix multi-node DDP backend**: the GPU-sharing check now counts ranks
-  per node (`LOCAL_WORLD_SIZE` / `SLURM_NTASKS_PER_NODE`) instead of
-  globally, so multi-node jobs use NCCL/RCCL; gloo stays the CPU /
-  GPU-sharing fallback.
-- **`predict_dataset`**: `dtype` default `float32`; `batch_size=None`
-  auto-sizes from free GPU memory with OOM retry; prints an E/F/V
-  RMSE/MAE table.
 
 ## 1.0.2
 
