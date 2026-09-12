@@ -149,7 +149,7 @@ from .train import (
     preprocess_structures, compute_max_neighbors,
     choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
     _save_checkpoint, _load_checkpoint,
-    _trim_loss_log, _accumulate_true_loss_sums,
+    _trim_loss_log, _accumulate_true_loss_sums, _force_error_sums,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
     _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
@@ -440,6 +440,7 @@ def train_nep_sharded(
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
+    force_delta        = config["force_delta"]
     pref_v             = config["lambda_v"]
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")
@@ -1033,6 +1034,8 @@ def train_nep_sharded(
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
         "stage2_pref_v": stage2_pref_v,
     }
+    if force_delta > 0:
+        cur_loss_weights["force_delta"] = force_delta
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
     # peek); here the full training state is actually restored.
@@ -1175,8 +1178,8 @@ def train_nep_sharded(
 
             # Device-side accumulators, fetched (and all-reduced) once per
             # epoch — see train_nep. Layout:
-            # [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
-            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            # [E, F_objective, F_metric, V, stress, nE, nF, nV, resid]
+            acc = torch.zeros(9, dtype=torch.float64, device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -1312,7 +1315,7 @@ def train_nep_sharded(
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
-                m_le = m_resid = m_lf = m_lv = m_ls = None
+                m_le = m_resid = m_lf_loss = m_lf_metric = m_lv = m_ls = None
 
                 if batch["has_e"]:
                     de = (e_pa_pred - e_pa_ref) * emf
@@ -1323,10 +1326,14 @@ def train_nep_sharded(
                     m_resid = de.sum()
 
                 if fmf is not None and batch["has_f"]:
-                    df = (result["forces"] - batch["forces"]) * fmf
+                    weighted_sse, unweighted_sse = _force_error_sums(
+                        result["forces"], batch["forces"],
+                        batch["force_mask"], force_delta)
                     # 3 components per atom -> divide by (3 * n_f_g)
-                    loss = loss + cur_pref_f * (df ** 2).sum() * ws / (3.0 * cg[1])
-                    m_lf = (df ** 2).sum() / 3.0
+                    loss = (loss + cur_pref_f * weighted_sse * ws
+                            / (3.0 * cg[1]))
+                    m_lf_loss = weighted_sse / 3.0
+                    m_lf_metric = unweighted_sse / 3.0
 
                 if (vmf is not None and batch["has_v"] and "virial" in result
                         and batch["virial"].shape[1] == 9):
@@ -1391,13 +1398,14 @@ def train_nep_sharded(
                 zero64 = acc.new_zeros(())
                 acc += ok_f * torch.stack([
                     m_le.double() if m_le is not None else zero64,
-                    m_lf.double() if m_lf is not None else zero64,
+                    m_lf_loss.double() if m_lf_loss is not None else zero64,
+                    m_lf_metric.double() if m_lf_metric is not None else zero64,
                     m_lv.double() if m_lv is not None else zero64,
                     m_ls.double() if m_ls is not None else zero64,
                     (batch["energy_mask"].sum().double()
                      if m_le is not None else zero64),
                     (batch["force_mask"].sum().double()
-                     if m_lf is not None else zero64),
+                     if m_lf_metric is not None else zero64),
                     (batch["virial_mask"].sum().double()
                      if m_lv is not None else zero64),
                     m_resid.double() if m_resid is not None else zero64,
@@ -1410,7 +1418,7 @@ def train_nep_sharded(
             dist.all_reduce(acc)
             dist.all_reduce(max_gn_t, op=dist.ReduceOp.MAX)
             dist.all_reduce(n_bad_t, op=dist.ReduceOp.MAX)
-            (sum_le, sum_lf, sum_lv, sum_ls,
+            (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, sum_ls,
              sum_e_structs, sum_f_atoms, sum_v_structs,
              sum_e_resid) = acc.tolist()
             max_gn = float(max_gn_t)
@@ -1431,13 +1439,16 @@ def train_nep_sharded(
             # where each MSE_X aggregates over all samples in the epoch.
             from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
-            mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
+            mse_f_loss = (sum_lf_loss / max(sum_f_atoms, 1)
+                          if sum_lf_loss > 0 else 0.0)
+            mse_f_metric = (sum_lf_metric / max(sum_f_atoms, 1)
+                            if sum_lf_metric > 0 else 0.0)
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
-            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
+            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f_loss
                         + cur_pref_v * mse_v)
             rmse_e = np.sqrt(mse_e)                           # eV/atom
-            rmse_f = np.sqrt(mse_f)                           # eV/A
+            rmse_f = np.sqrt(mse_f_metric)                    # eV/A
             rmse_v = np.sqrt(mse_v)                           # eV/atom
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
 
@@ -1454,20 +1465,23 @@ def train_nep_sharded(
                     raw_model.compute_properties, _shim._compute_cached,
                     use_autograd_forces, train_backend,
                     valid_has_forces and cur_pref_f > 0,
-                    valid_has_virial and cur_pref_v > 0, dtype, dev)
+                    valid_has_virial and cur_pref_v > 0, dtype, dev,
+                    force_delta)
                 v_sums_t = torch.tensor(v_sums, device=dev,
                                         dtype=torch.float64)
                 dist.all_reduce(v_sums_t)
-                (v_le, v_lf, v_lv, v_ls,
+                (v_le, v_lf_loss, v_lf_metric, v_lv, v_ls,
                  v_ne, v_nf, v_nv, _) = v_sums_t.tolist()
                 v_mse_e = v_le / max(v_ne, 1.0)
-                v_mse_f = v_lf / max(v_nf, 1.0)
+                v_mse_f_loss = v_lf_loss / max(v_nf, 1.0)
+                v_mse_f_metric = v_lf_metric / max(v_nf, 1.0)
                 v_mse_v = v_lv / max(v_nv, 1.0)
                 v_mse_s = v_ls / max(v_nv, 1.0)
-                valid_loss = (cur_pref_e * v_mse_e + cur_pref_f * v_mse_f
+                valid_loss = (cur_pref_e * v_mse_e
+                              + cur_pref_f * v_mse_f_loss
                               + cur_pref_v * v_mse_v)
                 v_rmse_e = np.sqrt(v_mse_e)
-                v_rmse_f = np.sqrt(v_mse_f)
+                v_rmse_f = np.sqrt(v_mse_f_metric)
                 v_rmse_v = np.sqrt(v_mse_v)
                 v_rmse_s = np.sqrt(v_mse_s) * EV_PER_A3_TO_GPa
             dt = time.time() - t_epoch
@@ -1569,11 +1583,11 @@ def train_nep_sharded(
                     data_store, batch_size, raw_model,
                     raw_model.compute_properties, _shim._compute_cached,
                     use_autograd_forces, train_backend,
-                    has_forces, has_virial, dtype, dev)
+                    has_forces, has_virial, dtype, dev, force_delta)
                 sums_t = torch.tensor(local_sums, device=dev,
                                       dtype=torch.float64)
                 dist.all_reduce(sums_t)
-                (s_le, s_lf, s_lv, _s_ls,
+                (s_le, s_lf_loss, _s_lf_metric, s_lv, _s_ls,
                  n_e, n_f, n_v, s_e_resid) = sums_t.tolist()
                 # Exact optimal b1 for these frozen weights, from the global
                 # (all-reduced) residual — identical on every rank.
@@ -1583,7 +1597,7 @@ def train_nep_sharded(
                         raw_model.b1.add_(delta)
                 mse_e = max(0.0, s_le / max(n_e, 1.0) - delta * delta)
                 t_loss = (cur_pref_e * mse_e
-                          + cur_pref_f * s_lf / max(n_f, 1.0)
+                          + cur_pref_f * s_lf_loss / max(n_f, 1.0)
                           + cur_pref_v * s_lv / max(n_v, 1.0))
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
@@ -1661,7 +1675,7 @@ def train_nep_sharded(
             data_store, batch_size, raw_model,
             raw_model.compute_properties, _shim._compute_cached,
             use_autograd_forces, train_backend, False, False, dtype, dev)
-        b1_t = torch.tensor([b1_sums[7], float(b1_sums[4])], device=dev,
+        b1_t = torch.tensor([b1_sums[8], float(b1_sums[5])], device=dev,
                             dtype=torch.float64)
         dist.all_reduce(b1_t)
         delta = (b1_t[0] / b1_t[1]).item() if b1_t[1] > 0 else 0.0

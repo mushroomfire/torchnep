@@ -177,7 +177,6 @@ def test_nep_txt_round_trip(tmp_path):
     assert lines[1].split() == ["zbl", "0", "0"]
     tail = np.array([float(x) for x in lines[-60:]]).reshape(6, 10)
     assert np.allclose(tail, np.array(rows))
-
     # calculator: same energies / forces as the training model
     calc = NEPCalculator(str(path), dtype=torch.float64)
     assert calc.zbl_flexible
@@ -197,3 +196,26 @@ def test_nep_txt_round_trip(tmp_path):
     assert torch.allclose(m_u.zbl_flexible.double(), torch.tensor(rows, dtype=torch.float64))
     e_l, f_l = _energy_forces(m_u, b, "cached")
     assert torch.allclose(e_l, e_m) and torch.allclose(f_l, f_m)
+
+
+def test_compiled_autograd_raw_path_uses_custom_phi(tmp_path):
+    """The graph source must use flexible, rather than universal, screening."""
+    from torchnep.compiled_autograd import CompiledAutogradForce
+
+    frames = _frames(n=3)
+    rows = _custom_rows(3, seed=7)
+    _write_zbl_in(tmp_path / "zbl.in", rows)
+    _, model, batch = _model_and_batch(tmp_path, "zbl zbl.in", frames)
+    compiled_source = CompiledAutogradForce(model)
+
+    with torch.enable_grad():
+        ei, forces, virial = compiled_source._raw(
+            compiled_source._pvals(), batch["rij_rad"], batch["rij_ang"],
+            batch["pair_i_rad"], batch["pair_j_rad"],
+            batch["pair_i_ang"], batch["pair_j_ang"], batch["atom_types"])
+        reference = model.compute_properties_cached(
+            batch, need_forces=True, need_virial=True, backend="mulsum")
+
+    torch.testing.assert_close(ei, reference["Ei"])
+    torch.testing.assert_close(forces, reference["forces"])
+    torch.testing.assert_close(virial, reference["virial"])

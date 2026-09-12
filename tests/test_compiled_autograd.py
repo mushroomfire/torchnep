@@ -33,12 +33,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="CompiledAutogradForce needs CUDA")
 
 
-def _setup(tmp_path, n_frames=24):
+def _setup(tmp_path, n_frames=24, extra=""):
     from torchnep.compiled_autograd import CompiledAutogradForce
     dev = torch.device("cuda")
     dtype = torch.float32
     p = tmp_path / "nep.in"
-    p.write_text(NEP_IN)
+    p.write_text(NEP_IN + extra)
     cfg = parse_nep_in(str(p))
     frames = read_xyz(str(XYZ))[:n_frames]
     structs = preprocess_structures(frames, cfg, np.float32)
@@ -127,3 +127,23 @@ def test_compiled_energy_only_falls_back(tmp_path):
     torch.testing.assert_close(r["Etot"], r_ref["Etot"],
                                rtol=1e-6, atol=1e-4)
     assert "forces" not in r
+
+
+def test_compiled_flexible_zbl_matches_eager(tmp_path):
+    """Custom pair screening coefficients must survive make_fx tracing."""
+    rows = []
+    for pair in range(6):
+        scale = 0.75 + 0.05 * pair
+        rows.append([0.5, 3.0, 0.1818 * scale, 3.2,
+                     0.5099 * scale, 0.94, 0.2802 * scale, 0.40,
+                     0.02817 * scale, 0.20])
+    zbl = tmp_path / "zbl.in"
+    zbl.write_text("\n".join(" ".join(map(str, row)) for row in rows) + "\n")
+    model, store, caf = _setup(tmp_path, n_frames=8, extra="zbl zbl.in\n")
+    batch = store.collate(list(range(8)))
+
+    eager = _run(model.compute_properties, batch)
+    compiled = _run(caf.compute_properties, batch)
+    for key in ("Ei", "Etot", "forces", "virial"):
+        torch.testing.assert_close(compiled[key], eager[key],
+                                   rtol=1e-4, atol=1e-4)

@@ -230,7 +230,9 @@ class CompiledAutogradForce:
                 atom_types, pi_ang, pj_ang, rij_ang,
                 pd["zbl_zizj_pair"], pd["zbl_a_inv_pair"],
                 pd["zbl_rc_inner_pair"], pd["zbl_rc_outer_pair"],
-                need_grad=True)
+                need_grad=True,
+                phi_tab=(pd["zbl_phi_pair"]
+                         if self.model.zbl_flexible is not None else None))
             Ei = Ei.scatter_add(0, pi_ang, e_zbl)
             ga = ga + g_zbl
         forces, virial = ops.accumulate_forces_virial(
