@@ -17,6 +17,7 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import math
 import os
 import numpy as np
 from typing import Dict, List
@@ -400,6 +401,14 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_e"] = float(parts[1])
             elif key == "lambda_f":
                 params["lambda_f"] = float(parts[1])
+            elif key == "force_delta":
+                if len(parts) != 2:
+                    raise ValueError("force_delta requires exactly one value")
+                force_delta = float(parts[1])
+                if not math.isfinite(force_delta) or force_delta < 0:
+                    raise ValueError(
+                        "force_delta must be a finite non-negative value")
+                params["force_delta"] = force_delta
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
             elif key == "weight_decay":
@@ -487,6 +496,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("max_grad_norm", 10.0)
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
+    params.setdefault("force_delta", 0.0)
     params.setdefault("lambda_v", 0.01)
     params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)

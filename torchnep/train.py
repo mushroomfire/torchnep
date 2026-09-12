@@ -184,6 +184,7 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('max_grad_norm'):10}  max_grad     {config['max_grad_norm']}")
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
+    lines.append(f"  {tag('force_delta'):10}  force_delta {config['force_delta']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
     if config.get("weight_decay", 0.0):
         lines.append(f"  {tag('weight_decay'):10}  weight_decay "
@@ -1495,15 +1496,34 @@ def _trim_loss_log(path, last_epoch):
             f.writelines(kept)
 
 
+def _force_error_sums(pred, ref, mask, force_delta):
+    """Return objective-weighted and ordinary force squared-error sums.
+
+    GPUMD's ``force_delta`` uses one weight per atom,
+    ``delta / (delta + |F_ref|)``, while retaining the usual ``3*N``
+    denominator.  The ordinary sum is kept separately for physical RMSEs.
+    """
+    diff = (pred - ref) * mask.to(pred.dtype).unsqueeze(-1)
+    diff_sq = diff ** 2
+    unweighted_sse = diff_sq.sum()
+    if force_delta <= 0:
+        return unweighted_sse, unweighted_sse
+    weight = 1.0 / (
+        1.0 + torch.linalg.vector_norm(ref, dim=-1) / force_delta)
+    return (diff_sq * weight.unsqueeze(-1)).sum(), unweighted_sse
+
+
 def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                                compute_props, compute_props_cached,
                                use_autograd_forces, backend,
-                               has_forces, has_virial, dtype, dev):
+                               has_forces, has_virial, dtype, dev,
+                               force_delta=0.0):
     """Frozen-weight squared-error sums over the LOCAL data_store.
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
+    Returns (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, sum_ls, n_e, n_f,
+    n_v, sum_e_resid) so
     callers can finish the per-sample averaging themselves — the DDP path
     all-reduces these numbers across ranks first, which makes the aggregated
     loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
@@ -1514,7 +1534,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
     pass: δ = sum_e_resid / n_e, and the offset-corrected energy MSE is
     sum_le/n_e − δ².
     """
-    sum_le = sum_lf = sum_lv = sum_ls = 0.0
+    sum_le = sum_lf_loss = sum_lf_metric = sum_lv = sum_ls = 0.0
     sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
     n_e = n_f = n_v = 0
 
@@ -1555,8 +1575,18 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                 if has_forces:
                     f_mask = batch["force_mask"]
                     if f_mask.any():
-                        f_diff = result["forces"][f_mask] - batch["forces"][f_mask]
-                        sum_lf += (f_diff ** 2).mean(dim=1).sum().item()
+                        f_diff = (result["forces"][f_mask]
+                                  - batch["forces"][f_mask])
+                        metric_sum = (f_diff ** 2).mean(dim=1).sum()
+                        if force_delta > 0:
+                            weighted_sse, _ = _force_error_sums(
+                                result["forces"], batch["forces"], f_mask,
+                                force_delta)
+                            loss_sum = weighted_sse / 3.0
+                        else:
+                            loss_sum = metric_sum
+                        sum_lf_loss += loss_sum.item()
+                        sum_lf_metric += metric_sum.item()
                         n_f += int(f_mask.sum().item())
 
                 if (has_virial and "virial" in result
@@ -1584,13 +1614,15 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
+    return (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, sum_ls,
+            n_e, n_f, n_v, sum_e_resid)
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, backend,
-                        pref_e, pref_f, pref_v, dtype, dev):
+                        pref_e, pref_f, pref_v, dtype, dev,
+                        force_delta=0.0):
     """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
 
     Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
@@ -1606,11 +1638,13 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
+    (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, _sum_ls,
+     n_e, n_f, n_v, sum_e_resid) = \
         _accumulate_true_loss_sums(
             data_store, batch_size, raw_model,
             compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+            use_autograd_forces, backend, has_forces, has_virial, dtype, dev,
+            force_delta)
     # Exact optimal b1 for these frozen weights, solved from this same pass.
     delta = sum_e_resid / n_e if n_e > 0 else 0.0
     if n_e > 0:
@@ -1619,16 +1653,18 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     # Offset-corrected energy MSE = Var(residual) = E[r²] − δ². Clamp tiny
     # negatives from float round-off.
     mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
-    mse_f = sum_lf / max(n_f, 1)
+    mse_f_loss = sum_lf_loss / max(n_f, 1)
+    mse_f_metric = sum_lf_metric / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
-    true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+    true_loss = pref_e * mse_e + pref_f * mse_f_loss + pref_v * mse_v
+    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f_metric), np.sqrt(mse_v)
 
 
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
                          compute_props, compute_props_cached,
                          use_autograd_forces, backend,
-                         pref_e, pref_f, pref_v, dtype, dev):
+                         pref_e, pref_f, pref_v, dtype, dev,
+                         force_delta=0.0):
     """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
 
     Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
@@ -1642,17 +1678,20 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
     from .constants import EV_PER_A3_TO_GPa
     has_forces = valid_store.has_forces and pref_f > 0
     has_virial = valid_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
+    (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, sum_ls,
+     n_e, n_f, n_v, _) = \
         _accumulate_true_loss_sums(
             valid_store, batch_size, raw_model,
             compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+            use_autograd_forces, backend, has_forces, has_virial, dtype, dev,
+            force_delta)
     mse_e = sum_le / max(n_e, 1)
-    mse_f = sum_lf / max(n_f, 1)
+    mse_f_loss = sum_lf_loss / max(n_f, 1)
+    mse_f_metric = sum_lf_metric / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     mse_s = sum_ls / max(n_v, 1)
-    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+    valid_loss = pref_e * mse_e + pref_f * mse_f_loss + pref_v * mse_v
+    return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f_metric), np.sqrt(mse_v),
             np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
 
 
@@ -1901,6 +1940,7 @@ def train_nep(
     max_grad_norm      = config["max_grad_norm"]
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
+    force_delta        = config["force_delta"]
     pref_v             = config["lambda_v"]
     # Optional stage-2 block
     stage2             = config["stage2"]
@@ -2285,6 +2325,8 @@ def train_nep(
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
         "stage2_pref_v": stage2_pref_v,
     }
+    if force_delta > 0:
+        cur_loss_weights["force_delta"] = force_delta
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
     # peek); here the full training state is actually restored.
@@ -2429,8 +2471,8 @@ def train_nep(
             # per epoch — per-step .item() reads would stall the launch
             # pipeline (the CPU must run a full step ahead of the GPU for
             # the streamed collate + kernel launches to hide).
-            # Layout: [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
-            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            # Layout: [E, F_objective, F_metric, V, stress, nE, nF, nV, resid]
+            acc = torch.zeros(9, dtype=torch.float64, device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -2534,7 +2576,7 @@ def train_nep(
                 # AFTER the one unavoidable sync (the grad-norm guard), where
                 # the reads are free. Same math as the old masked-select
                 # form: sum(d^2 * mask) / sum(mask) == mean over selected.
-                m_le = m_resid = m_lf = m_lv = m_ls = None
+                m_le = m_resid = m_lf_loss = m_lf_metric = m_lv = m_ls = None
                 if batch["has_e"]:
                     emf = batch["energy_mask"].to(dtype)
                     ne_b = emf.sum()
@@ -2546,11 +2588,14 @@ def train_nep(
                     m_resid = de.sum()
 
                 if has_forces and batch["has_f"]:
-                    fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
-                    nf_b = fmf.sum()
-                    df = (result["forces"] - batch["forces"]) * fmf
-                    loss = loss + cur_pref_f * ((df ** 2).sum() / (3.0 * nf_b))
-                    m_lf = (df ** 2).sum() / 3.0
+                    f_mask = batch["force_mask"]
+                    nf_b = f_mask.sum().to(dtype)
+                    weighted_sse, unweighted_sse = _force_error_sums(
+                        result["forces"], batch["forces"], f_mask,
+                        force_delta)
+                    loss = loss + cur_pref_f * (weighted_sse / (3.0 * nf_b))
+                    m_lf_loss = weighted_sse / 3.0
+                    m_lf_metric = unweighted_sse / 3.0
 
                 if (has_virial and "virial" in result and batch["has_v"]
                         and batch["virial"].shape[1] == 9):
@@ -2622,13 +2667,14 @@ def train_nep(
                 zero64 = acc.new_zeros(())
                 acc += ok_f * torch.stack([
                     m_le.double() if m_le is not None else zero64,
-                    m_lf.double() if m_lf is not None else zero64,
+                    m_lf_loss.double() if m_lf_loss is not None else zero64,
+                    m_lf_metric.double() if m_lf_metric is not None else zero64,
                     m_lv.double() if m_lv is not None else zero64,
                     m_ls.double() if m_ls is not None else zero64,
                     (batch["energy_mask"].sum().double()
                      if m_le is not None else zero64),
                     (batch["force_mask"].sum().double()
-                     if m_lf is not None else zero64),
+                     if m_lf_metric is not None else zero64),
                     (batch["virial_mask"].sum().double()
                      if m_lv is not None else zero64),
                     m_resid.double() if m_resid is not None else zero64,
@@ -2643,7 +2689,8 @@ def train_nep(
 
             # One epoch-level fetch of every device accumulator (the only
             # metric sync of the epoch).
-            (sum_le, sum_lf, sum_lv, sum_ls, n_e_f, n_f_f, n_v_f,
+            (sum_le, sum_lf_loss, sum_lf_metric, sum_lv, sum_ls,
+             n_e_f, n_f_f, n_v_f,
              sum_e_resid) = acc.tolist()
             sum_e_structs = int(round(n_e_f))
             sum_f_atoms = int(round(n_f_f))
@@ -2668,14 +2715,17 @@ def train_nep(
             # where each MSE_X aggregates over all samples in the epoch.
             from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
-            mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
+            mse_f_loss = (sum_lf_loss / max(sum_f_atoms, 1)
+                          if sum_lf_loss > 0 else 0.0)
+            mse_f_metric = (sum_lf_metric / max(sum_f_atoms, 1)
+                            if sum_lf_metric > 0 else 0.0)
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
-            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
+            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f_loss
                         + cur_pref_v * mse_v)
             # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
-            rmse_f = np.sqrt(mse_f)
+            rmse_f = np.sqrt(mse_f_metric)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
 
@@ -2691,7 +2741,8 @@ def train_nep(
                         valid_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
-                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev,
+                        force_delta)
             if _PROF and dev.type == "cuda":
                 torch.cuda.synchronize()
             _t_valid = time.perf_counter() - _t_v0
@@ -2803,7 +2854,8 @@ def train_nep(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
-                    cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                    cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev,
+                    force_delta)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
