@@ -47,6 +47,10 @@ filterwarnings = [
     "ignore:.*Can't initialize NVML.*:UserWarning",
     # ase.atoms assigns ndarray.shape, deprecated in NumPy 2.5 — ASE's to fix.
     "ignore:Setting the shape on a NumPy array has been deprecated:DeprecationWarning",
+    # matplotlib's mathtext parser (older releases) calls pyparsing's camelCase
+    # API, deprecated in pyparsing 3.3 — matplotlib's to fix.
+    "ignore:.*deprecated - use '.*:Warning",
+    "ignore:.*argument is deprecated, use '.*:Warning",
 ]
 
 [project.urls]
