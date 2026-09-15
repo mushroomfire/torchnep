@@ -86,6 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          ver="${GITHUB_REF_NAME#v}"      # a/b/rc suffix -> pre-release
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" --notes-file notes.md \
-            $([[ "$GITHUB_REF_NAME" == *[a-z]* ]] && echo --prerelease)
+            $([[ "$ver" == *[a-z]* ]] && echo --prerelease || echo --latest)
