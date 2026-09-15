@@ -62,8 +62,14 @@ def test_matches_core_and_gpumd_reference():
     core = NEPCalculator(str(ZBL_FIX["nep"]), dtype=torch.float64)
     cres = core.compute(list(fr["species"]), np.asarray(fr["positions"]),
                         np.asarray(fr["cell"]))
-    assert abs(e - float(cres["energy"].sum())) < 1e-9
-    assert np.abs(f - cres["forces"].numpy()).max() < 1e-9
+    # Same float64 kernels, but the CPU reductions (scatter_add over ~20k
+    # pairs) are threaded, so the summation order — and the last bits of a
+    # ~1e3 eV total — vary with the runner's thread count: compare to
+    # round-off RELATIVE to the magnitude, not to a fixed 1e-9.
+    e_core = float(cres["energy"].sum())
+    assert abs(e - e_core) < 1e-8 * max(1.0, abs(e_core))
+    f_core = cres["forces"].numpy()
+    assert np.abs(f - f_core).max() < 1e-8 * max(1.0, np.abs(f_core).max())
 
     # vs frozen GPUMD reference (eV/atom)
     ref = load_reference(ZBL_FIX["ref"])
