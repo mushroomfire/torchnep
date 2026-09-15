@@ -241,7 +241,7 @@ def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
     n_struct = len(chunk["natoms"]); N_atoms = int(chunk["nat_cum"][-1])
     nat_cum, nrad_cum, nang_cum = chunk["nat_cum"], chunk["nrad_cum"], chunk["nang_cum"]
     natoms_arr = chunk["natoms"]
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    rc_rad, rc_ang = calc.cutoff_args()       # floats or (T, T) pair tables
     basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
     # Host-resident staging: only each batch's slice is shipped to the device
     # inside the loop, so GPU memory scales with batch_size, not chunk size.
@@ -283,11 +283,13 @@ def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
                     natoms_gpu[start:end])
 
                 dr = torch.norm(rij_r, dim=-1)
-                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
+                    dr, ops.pair_cutoff(rc_rad, atom_types, pi_r, pj_r), basis_r)
                 d12inv_r = 1.0 / dr.clamp(min=1e-10)
                 if rij_a.shape[0] > 0:
                     da = torch.norm(rij_a, dim=-1)
-                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
+                        da, ops.pair_cutoff(rc_ang, atom_types, pi_a, pj_a), basis_a)
                     d12inv_a = 1.0 / da.clamp(min=1e-10)
                     blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
                                             rij_a[:, 1] * d12inv_a,
@@ -356,6 +358,8 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
     bounds = _chunk_bounds(natoms, chunk_atoms, max_frames=50_000)
     pp_config = {"cutoff_radial": calc.rc_radial,
                  "cutoff_angular": calc.rc_angular,
+                 "cutoff_radial_per_type": calc.rc_radial_per_type,
+                 "cutoff_angular_per_type": calc.rc_angular_per_type,
                  "type_names": calc.type_names}
     os.makedirs(output_dir, exist_ok=True)
     fh = {name: open(os.path.join(output_dir, name), "w")

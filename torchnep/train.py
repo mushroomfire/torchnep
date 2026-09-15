@@ -43,7 +43,8 @@ from torch.optim.swa_utils import AveragedModel
 from .model import NEPModel, slim_model, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices, build_neighbor_list_np,
-                   build_neighbor_list_np_ex, wrap_positions, image_repeats)
+                   build_neighbor_list_np_ex, wrap_positions, image_repeats,
+                   cutoff_pair_table, pair_cutoff_np)
 from . import ops
 from . import __version__
 from .predict import predict_from_store
@@ -142,8 +143,13 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append("------------------")
     lines.append(f"  {tag('type_names', 'num_types'):10}  types        "
                  f"{config['num_types']}  {' '.join(config['type_names'])}")
-    lines.append(f"  {tag('cutoff_radial', 'cutoff_angular'):10}  cutoff       "
-                 f"{config['cutoff_radial']} {config['cutoff_angular']}")
+    if config.get("cutoff_radial_per_type") is not None:
+        cut = " ".join(f"{r:g} {a:g}" for r, a in zip(config["cutoff_radial_per_type"],
+                                                     config["cutoff_angular_per_type"]))
+        cut += "  (per species: pair cutoff = mean of the two)"
+    else:
+        cut = f"{config['cutoff_radial']} {config['cutoff_angular']}"
+    lines.append(f"  {tag('cutoff_radial', 'cutoff_angular'):10}  cutoff       {cut}")
     lines.append(f"  {tag('n_max_radial', 'n_max_angular'):10}  n_max        "
                  f"{config['n_max_radial']} {config['n_max_angular']}")
     lines.append(f"  {tag('basis_size_radial', 'basis_size_angular'):10}  "
@@ -258,9 +264,19 @@ class StreamDataStore:
         self._pin = device.type == "cuda"
         self.neighbor_mode = neighbor_mode
 
-        # Basis parameters (needed at collate time).
+        # Basis parameters (needed at collate time). _rc_r / _rc_a are the
+        # largest cutoffs (device neighbor search radius); with per-species
+        # cutoffs the (T, T) pair tables give each pair's own value.
         self._rc_r = config["cutoff_radial"]
         self._rc_a = config["cutoff_angular"]
+        self._rc_r_tab = self._rc_a_tab = None
+        if config.get("cutoff_radial_per_type") is not None:
+            self._rc_r_tab = torch.tensor(
+                cutoff_pair_table(config["cutoff_radial_per_type"]),
+                dtype=dtype, device=device)
+            self._rc_a_tab = torch.tensor(
+                cutoff_pair_table(config["cutoff_angular_per_type"]),
+                dtype=dtype, device=device)
         self._bs_r = config["basis_size_radial"]
         self._bs_a = config["basis_size_angular"]
         self._l3 = config["l_max"][0]
@@ -454,6 +470,22 @@ class StreamDataStore:
               + sh[:, 2:3] * cell_p[:, 2, :])
         return (pos[pj] + sc) - pos[pi]
 
+    def _pair_rc(self, atom_types, pi, pj):
+        """Per-pair (radial, angular) cutoffs for a device pair list: the
+        floats for uniform cutoffs, gathered (P,) tensors per species."""
+        if self._rc_r_tab is None:
+            return self._rc_r, self._rc_a
+        return (ops.pair_cutoff(self._rc_r_tab, atom_types, pi, pj),
+                ops.pair_cutoff(self._rc_a_tab, atom_types, pi, pj))
+
+    def _split_pairs(self, atom_types, pi, pj, rij, d):
+        """Radial / angular pair lists from a search within max(rc), each
+        pair filtered by its own cutoff."""
+        rc_r, rc_a = self._pair_rc(atom_types, pi, pj)
+        m_r = d < rc_r
+        m_a = d < rc_a
+        return (pi[m_r], pj[m_r], rij[m_r]), (pi[m_a], pj[m_a], rij[m_a])
+
     def _search_device(self, pos, cell_b, nat, off):
         """Batched brute-force neighbor search on the device (the numpy
         builder's algorithm, vectorised over frames).
@@ -551,9 +583,10 @@ class StreamDataStore:
             else:
                 pos = self._to_dev(staged["positions"])
                 cell_b = self._to_dev(staged["cells"])
+                at = self._to_dev(staged["atom_types"])
                 pi, pj, rij, d = self._search_device(pos, cell_b, staged["nat"],
                                                      staged["off"])
-                pi_r, pi_a = pi[d < self._rc_r], pi[d < self._rc_a]
+                (pi_r, _, _), (pi_a, _, _) = self._split_pairs(at, pi, pj, rij, d)
             if pi_r.numel() == 0:
                 continue
             n_atoms = staged["N"]
@@ -638,15 +671,16 @@ class StreamDataStore:
                     with torch.cuda.stream(self._side_stream):
                         pos = out["positions"].to(self.device, non_blocking=True)
                         cells = out["cells"].to(self.device, non_blocking=True)
+                        at = out["atom_types"].to(self.device, non_blocking=True)
                         pi, pj, rij, d = self._search_device(pos, cells, nat,
                                                              offsets[:-1])
-                        m_r = d < self._rc_r
-                        m_a = d < self._rc_a
+                        (pi_r, pj_r, rij_r), (pi_a, pj_a, rij_a) = \
+                            self._split_pairs(at, pi, pj, rij, d)
                         dev_pairs = {"positions": pos, "cells": cells,
-                                     "pair_i_rad": pi[m_r], "pair_j_rad": pj[m_r],
-                                     "rij_rad": rij[m_r],
-                                     "pair_i_ang": pi[m_a], "pair_j_ang": pj[m_a],
-                                     "rij_ang": rij[m_a]}
+                                     "pair_i_rad": pi_r, "pair_j_rad": pj_r,
+                                     "rij_rad": rij_r,
+                                     "pair_i_ang": pi_a, "pair_j_ang": pj_a,
+                                     "rij_ang": rij_a}
                         ev = torch.cuda.Event()
                         ev.record(self._side_stream)
                     out["dev_pairs"] = dev_pairs
@@ -682,17 +716,19 @@ class StreamDataStore:
         "on_the_fly": ("positions", "cells"),
     }
 
-    def _basis_impl(self, rij_r, rij_a):
+    def _basis_impl(self, rij_r, rij_a, rc_r, rc_a):
         """Per-batch Chebyshev/angular basis.
 
-        Per-pair elementwise math — chunking-invariant, so results do not
-        depend on how the dataset is batched. ``compile_basis`` may swap in
-        a torch.compile'd version of this same method.
+        ``rc_r`` / ``rc_a``: the cutoff floats, or per-pair (P,) tensors for
+        per-species cutoffs (see ``_pair_rc``). Per-pair elementwise math —
+        chunking-invariant, so results do not depend on how the dataset is
+        batched. ``compile_basis`` may swap in a torch.compile'd version of
+        this same method.
         """
         dr = torch.norm(rij_r, dim=-1)
-        fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, self._rc_r, self._bs_r)
+        fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_r, self._bs_r)
         da = torch.norm(rij_a, dim=-1)
-        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, self._rc_a, self._bs_a)
+        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_a, self._bs_a)
         dinv_a = 1.0 / da
         if self._num_lm > 0:
             blm = ops.angular_basis(
@@ -747,15 +783,16 @@ class StreamDataStore:
         elif mode == "on_the_fly":              # CPU / MPS: search in place
             pi, pj, rij, d = self._search_device(
                 batch["positions"], batch["cells"], staged["nat"], staged["off"])
-            m_r = d < self._rc_r
-            m_a = d < self._rc_a
-            batch["pair_i_rad"], batch["pair_j_rad"], batch["rij_rad"] = \
-                pi[m_r], pj[m_r], rij[m_r]
-            batch["pair_i_ang"], batch["pair_j_ang"], batch["rij_ang"] = \
-                pi[m_a], pj[m_a], rij[m_a]
+            (batch["pair_i_rad"], batch["pair_j_rad"], batch["rij_rad"]), \
+                (batch["pair_i_ang"], batch["pair_j_ang"], batch["rij_ang"]) = \
+                self._split_pairs(batch["atom_types"], pi, pj, rij, d)
+        at = batch["atom_types"]
+        rc_r, _ = self._pair_rc(at, batch["pair_i_rad"], batch["pair_j_rad"])
+        _, rc_a = self._pair_rc(at, batch["pair_i_ang"], batch["pair_j_ang"])
         (batch["fk_rad"], batch["fkp_rad"], batch["d12inv_rad"],
          batch["fk_ang"], batch["fkp_ang"], batch["d12inv_ang"],
-         batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"])
+         batch["blm"]) = self._basis_fn(batch["rij_rad"], batch["rij_ang"],
+                                        rc_r, rc_a)
 
         return batch
 
@@ -871,6 +908,7 @@ def _preprocess_one_frame(args):
       itself runs on the device per batch.
     """
     frame, rc_rad, rc_ang, max_rc, type_names, dtype, mode = args
+    # rc_rad / rc_ang: floats, or (T, T) per-element-pair tables
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
@@ -888,8 +926,8 @@ def _preprocess_one_frame(args):
         pair_i, pair_j, rij, shift, pos_w = build_neighbor_list_np_ex(
             positions, cell, max_rc)
         dij = np.linalg.norm(rij, axis=1)
-        rad_mask = dij < rc_rad
-        ang_mask = dij < rc_ang
+        rad_mask = dij < pair_cutoff_np(rc_rad, atom_types, pair_i, pair_j)
+        ang_mask = dij < pair_cutoff_np(rc_ang, atom_types, pair_i, pair_j)
         if mode == "cached":
             s.update({
                 "pair_i_rad": pair_i[rad_mask], "pair_j_rad": pair_j[rad_mask],
@@ -983,6 +1021,11 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
     rc_ang = config["cutoff_angular"]
     type_names = config["type_names"]
     max_rc = max(rc_rad, rc_ang)
+    if config.get("cutoff_radial_per_type") is not None:
+        # per-species cutoffs: search within the largest, then filter each
+        # pair by its own (T, T) table value
+        rc_rad = cutoff_pair_table(config["cutoff_radial_per_type"])
+        rc_ang = cutoff_pair_table(config["cutoff_angular_per_type"])
     if mode not in NEIGHBOR_MODES:
         raise ValueError(f"neighbor mode {mode!r} not in {NEIGHBOR_MODES}")
     args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype, mode)

@@ -56,59 +56,68 @@ def _run_gpumd(workdir: Path) -> None:
     print(f"    GPUMD took {time.time()-t0:.1f}s", flush=True)
 
 
-def bake_one(fixture: dict) -> None:
-    print(f"baking {fixture['name']}", flush=True)
+def prepare_workdir(fixture: dict, workdir: Path) -> None:
+    """Write nep.txt / train.xyz / nep.in (+ zbl.in) for a GPUMD prediction
+    run of ``fixture`` into ``workdir``."""
     frames = read_xyz(str(fixture["xyz"]))
     hdr = parse_nep_header(fixture["nep"])
+    workdir.mkdir(parents=True, exist_ok=True)
+    # nep.txt
+    shutil.copy(fixture["nep"], workdir / "nep.txt")
+    if hdr.get("zbl_flexible"):
+        # GPUMD's nep (prediction mode) takes the flexible-ZBL parameters
+        # from zbl.in in the working directory: extract the table that
+        # torchnep appended to nep.txt (10 numbers per element pair)
+        n_pairs = hdr["num_types"] * (hdr["num_types"] + 1) // 2
+        body = [ln for ln in Path(fixture["nep"]).read_text().splitlines() if ln.strip()]
+        tail = body[-10 * n_pairs:]
+        rows = [" ".join(tail[10 * k:10 * (k + 1)]) for k in range(n_pairs)]
+        (workdir / "zbl.in").write_text("\n".join(rows) + "\n")
+    # train.xyz (inject dummy energy / forces if absent)
+    write_gpumd_xyz(frames, workdir / "train.xyz")
+    # nep.in (with descriptor mode 2 = per-atom row)
+    write_nep_in(hdr, workdir / "nep.in", output_descriptor=2)
 
+
+def collect_workdir(fixture: dict, workdir: Path) -> None:
+    """Turn the GPUMD outputs in ``workdir`` into the fixture's .npz."""
+    # GPUMD output schemas:
+    #   energy_train.out  shape (Nframes, 2)   col 0 = predicted E/atom
+    #   force_train.out   shape (Natoms_total, 6)   col 0..2 = predicted F
+    #   virial_train.out  shape (Nframes, 12)  col 0..5 = predicted V/atom
+    #   descriptor.out    shape (Natoms_total, dim) — scaled q (mode 2)
+    e = np.loadtxt(workdir / "energy_train.out")
+    f = np.loadtxt(workdir / "force_train.out")
+    v = np.loadtxt(workdir / "virial_train.out")
+    d = np.loadtxt(workdir / "descriptor.out")
+
+    if e.ndim == 1:
+        e = e.reshape(1, -1)
+    if v.ndim == 1:
+        v = v.reshape(1, -1)
+    if f.ndim == 1:
+        f = f.reshape(1, -1)
+    if d.ndim == 1:
+        d = d.reshape(1, -1)
+
+    E_pa = e[:, 0].astype(np.float64)
+    F = f[:, :3].astype(np.float64)
+    V_pa = v[:, :6].astype(np.float64)
+    D_pa = d.astype(np.float64)
+
+    np.savez(fixture["ref"],
+             E_per_atom=E_pa, F=F, V_per_atom=V_pa, D_per_atom=D_pa)
+    print(f"    wrote {fixture['ref']}  "
+          f"(E:{E_pa.shape} F:{F.shape} V:{V_pa.shape} D:{D_pa.shape})")
+
+
+def bake_one(fixture: dict) -> None:
+    print(f"baking {fixture['name']}", flush=True)
     workdir = Path(tempfile.mkdtemp(prefix=f"bake_{fixture['name']}_"))
     try:
-        # nep.txt
-        shutil.copy(fixture["nep"], workdir / "nep.txt")
-        if hdr.get("zbl_flexible"):
-            # GPUMD's nep (prediction mode) takes the flexible-ZBL parameters
-            # from zbl.in in the working directory: extract the table that
-            # torchnep appended to nep.txt (10 numbers per element pair)
-            n_pairs = hdr["num_types"] * (hdr["num_types"] + 1) // 2
-            body = [ln for ln in Path(fixture["nep"]).read_text().splitlines() if ln.strip()]
-            tail = body[-10 * n_pairs:]
-            rows = [" ".join(tail[10 * k:10 * (k + 1)]) for k in range(n_pairs)]
-            (workdir / "zbl.in").write_text("\n".join(rows) + "\n")
-        # train.xyz (inject dummy energy / forces if absent)
-        write_gpumd_xyz(frames, workdir / "train.xyz")
-        # nep.in (with descriptor mode 2 = per-atom row)
-        write_nep_in(hdr, workdir / "nep.in", output_descriptor=2)
-
+        prepare_workdir(fixture, workdir)
         _run_gpumd(workdir)
-
-        # GPUMD output schemas:
-        #   energy_train.out  shape (Nframes, 2)   col 0 = predicted E/atom
-        #   force_train.out   shape (Natoms_total, 6)   col 0..2 = predicted F
-        #   virial_train.out  shape (Nframes, 12)  col 0..5 = predicted V/atom
-        #   descriptor.out    shape (Natoms_total, dim) — scaled q (mode 2)
-        e = np.loadtxt(workdir / "energy_train.out")
-        f = np.loadtxt(workdir / "force_train.out")
-        v = np.loadtxt(workdir / "virial_train.out")
-        d = np.loadtxt(workdir / "descriptor.out")
-
-        if e.ndim == 1:
-            e = e.reshape(1, -1)
-        if v.ndim == 1:
-            v = v.reshape(1, -1)
-        if f.ndim == 1:
-            f = f.reshape(1, -1)
-        if d.ndim == 1:
-            d = d.reshape(1, -1)
-
-        E_pa = e[:, 0].astype(np.float64)
-        F = f[:, :3].astype(np.float64)
-        V_pa = v[:, :6].astype(np.float64)
-        D_pa = d.astype(np.float64)
-
-        np.savez(fixture["ref"],
-                 E_per_atom=E_pa, F=F, V_per_atom=V_pa, D_per_atom=D_pa)
-        print(f"    wrote {fixture['ref']}  "
-              f"(E:{E_pa.shape} F:{F.shape} V:{V_pa.shape} D:{D_pa.shape})")
+        collect_workdir(fixture, workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -141,6 +150,19 @@ def bake_virial_mix() -> None:
 
 
 def main() -> int:
+    # Two-step mode for a GPUMD build on another machine:
+    #   bake_fixtures.py prepare <name> <dir>   -> GPUMD inputs in <dir>
+    #   (run `nep` inside <dir> there, copy the *.out files back)
+    #   bake_fixtures.py collect <name> <dir>   -> tests/data/<name>.gpumd.npz
+    if len(sys.argv) == 4 and sys.argv[1] in ("prepare", "collect"):
+        fx = next(f for f in FIXTURES if f["name"] == sys.argv[2])
+        if sys.argv[1] == "prepare":
+            prepare_workdir(fx, Path(sys.argv[3]))
+            print(f"GPUMD inputs for {fx['name']} written to {sys.argv[3]}")
+        else:
+            collect_workdir(fx, Path(sys.argv[3]))
+        return 0
+
     if not Path(GPUMD_NEP).is_file():
         sys.exit(f"GPUMD nep binary not found: {GPUMD_NEP}")
     print(f"GPUMD nep: {GPUMD_NEP}\n")

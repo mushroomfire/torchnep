@@ -94,7 +94,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `type` | required | `N name1 name2 ...` — number and names of element types |
-| `cutoff` | `8 4` | Radial and angular cutoff (Å) |
+| `cutoff` | `8 4` | Radial and angular cutoff (Å). Per species (GPUMD): `cutoff rR1 rA1 rR2 rA2 …` with one radial/angular pair per element in `type` order; an element pair uses the mean of the two species' values (e.g. a larger radius for alkali metals, a smaller one for H). Written to `nep.txt` in GPUMD's format |
 | `n_max` | `6 6` | Radial and angular expansion orders |
 | `basis_size` | `6 6` | Chebyshev basis size per channel (radial / angular)|
 | `l_max` | `4 1 0` | `L_3b q_222 q_1111 q_112 q_123 q_233 q_134` — max L of 3-body terms (1–8) plus up to six boolean flags (matching GPUMD) enabling each higher-body invariant|

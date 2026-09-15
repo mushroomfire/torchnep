@@ -176,10 +176,14 @@ class CompiledAutogradForce:
         """
         m = self.model
         N = atom_types.shape[0]
+        # per-species cutoffs: the (T, T) pair tables are buffers, i.e.
+        # graph inputs like every other table; uniform cutoffs stay floats
+        rc_r = pd["rc_radial_pair"] if "rc_radial_pair" in pd else m.rc_radial
+        rc_a = pd["rc_angular_pair"] if "rc_angular_pair" in pd else m.rc_angular
         q = ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, pd["c_param_2"], pd.get("c_param_3"),
-            m.rc_radial, m.rc_angular,
+            rc_r, rc_a,
             m.basis_size_radial, m.basis_size_angular,
             m.n_max_radial, m.n_max_angular,
             m.l_max_3b,
