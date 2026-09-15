@@ -29,7 +29,7 @@ from .constants import (
     ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS, ZBL_PARA,
 )
 from . import ops
-from .data import zbl_pair_index, cutoff_pair_table
+from .data import zbl_pair_index, cutoff_pair_table, validate_cutoffs
 
 
 class FittingNet(nn.Module):
@@ -65,6 +65,7 @@ class NEPModel(nn.Module):
 
     def __init__(self, config: dict):
         super().__init__()
+        validate_cutoffs(config, where="NEPModel config")
         self.num_types = config["num_types"]
         self.type_names = config["type_names"]
         # Cutoffs: rc_radial / rc_angular are the LARGEST values (neighbor
