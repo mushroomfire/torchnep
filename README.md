@@ -419,7 +419,7 @@ p.parity("pred", shift_energy="element", xyz="test.xyz", # data of another DFT r
 ```
 
 `NEPPlotter(font, fontsize, dpi, colors, cmaps, panel_labels, label_format, frame, rc)` sets the
-style for every figure; each method takes `out` (save) and returns the `Figure`.
+style for every figure.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_dashboard.png" alt="training dashboard" width="60%">
