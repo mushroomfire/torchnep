@@ -149,8 +149,9 @@ class CompiledAutogradForce:
     def __init__(self, model, backend: str = "inductor"):
         """``backend`` is handed to ``torch.compile`` for the traced graph.
         The trainer uses the default Inductor pipeline; ``"eager"`` runs the
-        same make_fx graph without code generation, so the traced source
-        can be tested on CPU-only hosts."""
+        same make_fx graph through dynamo without code generation, and
+        ``"fx"`` runs the traced GraphModule as is (no torch.compile at
+        all) — both let the traced source be tested on CPU-only hosts."""
         apply_compile_patches()
         self.model = model
         self.backend = backend
@@ -292,6 +293,8 @@ class CompiledAutogradForce:
         if self.backend == "inductor":
             self._compiled = torch.compile(gm, dynamic=True,
                                            options=inductor_options())
+        elif self.backend == "fx":
+            self._compiled = gm
         else:
             self._compiled = torch.compile(gm, dynamic=True,
                                            backend=self.backend)

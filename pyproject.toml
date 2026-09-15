@@ -33,7 +33,7 @@ torch = ["torch>=2.0", "numpy>=1.20"]
 ase = ["ase>=3.22"]
 plot = ["matplotlib>=3.5", "polars>=0.20"]
 all = ["ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
-dev = ["pytest", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
+dev = ["pytest", "pytest-xdist", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
 
 [tool.pytest.ini_options]
 

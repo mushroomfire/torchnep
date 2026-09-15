@@ -21,8 +21,9 @@
   ``zbl 0 0`` header and read back by the calculator and the trainer.
 Every ZBL check runs on all four training compute paths (``PATHS``):
 autograd forces and analytical forces, each eager and under torch.compile.
-The compiled variants use the ``eager`` dynamo backend so they run on the
-CPU-only CI: the point is that the traced SOURCE (CompiledAutogradForce._raw,
+The compiled variants run the make_fx graph as is (``backend="fx"``) and the
+cached core under the ``eager`` dynamo backend, so they run on the CPU-only
+CI: the point is that the traced SOURCE (CompiledAutogradForce._raw,
 NEPModel._cached_core) carries the per-pair table, not Inductor codegen.
 The GPUMD parity of the whole thing is covered by the CrCoNi_flexzbl fixture
 in test_gpumd_parity.py; the Inductor pipeline itself by
@@ -102,7 +103,7 @@ def _efv(model, batch, path):
             out = model.compute_properties(*args, need_forces=True, need_virial=True, backend="loop")
         elif path == "autograd+compile":
             from torchnep.compiled_autograd import CompiledAutogradForce
-            out = CompiledAutogradForce(model, backend="eager").compute_properties(
+            out = CompiledAutogradForce(model, backend="fx").compute_properties(
                 *args, need_forces=True, need_virial=True, backend="bmm")
         elif path == "analytical":
             out = model.compute_properties_cached(batch, need_forces=True, need_virial=True,

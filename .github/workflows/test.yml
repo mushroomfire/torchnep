@@ -36,4 +36,4 @@ jobs:
         run: pip install .[ase,dev]
 
       - name: Run tests
-        run: pytest -q
+        run: pytest -q -n auto      # one worker per core (pytest-xdist)

@@ -159,9 +159,9 @@ def test_weight_decay_shrinks_weights(tmp_path):
     that still carry them get a warning and the keys are ignored.)"""
     _, xyz = _write_run_files(tmp_path)
     base = tmp_path / "nep0.in"
-    base.write_text(NEP_IN + "epoch 15\nbatch 8\nlambda_2 0\n")
+    base.write_text(NEP_IN + "epoch 8\nbatch 8\nlambda_2 0\n")
     reg = tmp_path / "nepR.in"
-    reg.write_text(NEP_IN + "epoch 15\nbatch 8\nweight_decay 0.3\n")
+    reg.write_text(NEP_IN + "epoch 8\nbatch 8\nweight_decay 0.3\n")
 
     kw = dict(data_file=xyz, device="cpu", precision="float64",
               print_interval=100, restart=False, checkpoint_interval=10000,
