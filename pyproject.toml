@@ -31,7 +31,8 @@ dependencies = []
 [project.optional-dependencies]
 torch = ["torch>=2.0", "numpy>=1.20"]
 ase = ["ase>=3.22"]
-dev = ["pytest"]
+plot = ["matplotlib>=3.5"]
+dev = ["pytest", "matplotlib>=3.5"]
 
 [tool.pytest.ini_options]
 

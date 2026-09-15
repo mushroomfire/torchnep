@@ -20,6 +20,7 @@ Many ready-to-use examples (the training inputs and trained models of the TorchN
 - 💾 **Memory-friendly** — the dataset stays in host memory and batches are streamed to the GPU, so memory scales with batch size, not dataset size
 - 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
+- 📈 **Plots** — loss curves, parity plots and error breakdowns straight from the output files (`torchnep.plot`)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
@@ -395,6 +396,54 @@ predict_dataset_sharded("nep.txt", "huge.xyz", output_dir="results")
 
 ---
 
+## 📈 Plotting
+
+`torchnep.plot.NEPPlotter` draws figures from the files a training run or `predict_dataset`
+writes (`loss.out`, `energy/force/virial/stress_train.out`, `*_test.out`), so nothing has to be
+recomputed. It needs matplotlib (`pip install torchnep[plot]`) and uses Arial when the font is
+installed, matplotlib's default otherwise. Every method returns the `Figure`; with `out=` it is
+also saved. Axes always span the full data range, so outliers stay visible.
+
+```python
+from torchnep.plot import NEPPlotter
+
+p = NEPPlotter()                       # font="Arial", dpi=150, cmap="viridis", max_points=300_000
+p.loss("run/loss.out", out="loss.png")                          # loss + RMSE E/F/V, train and test
+p.parity("run", split="train", kind="density", out="parity.png")  # E/F/V parity, "scatter" or "density"
+p.parity_train_test("run", out="parity_tt.png")                 # train row + test row
+p.dashboard("run", out="dashboard.png")                          # loss curves + train/test parity in one figure
+p.errors("run", xyz="train.xyz", out="errors.png")              # error histograms, |ΔF| vs |F|, per element / config_type
+p.prediction("pred", xyz="test.xyz", out="pred.png",             # predict_dataset view: parity + error distributions
+             shift_energy="element")                             # + per-element / per-config_type breakdown
+```
+
+`shift_energy="mean"` / `"element"` removes a constant or a per-element energy offset before
+plotting — for data computed with another DFT setup, whose energies differ from the model's
+reference by a per-element constant (`"element"` needs the `xyz` for the element counts).
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_loss.png" alt="loss curves" width="95%">
+  <br>
+  <sub><em><code>p.loss()</code> — loss and train/test RMSEs of a two-stage run.</em></sub>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_density.png" alt="parity plots" width="95%">
+  <br>
+  <sub><em><code>p.parity(kind="density")</code> on a literature data set with <code>shift_energy="element"</code>.</em></sub>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_prediction.png" alt="prediction view" width="80%">
+  <br>
+  <sub><em><code>p.prediction(xyz=...)</code> — parity, error distributions and the per-element force RMSE.</em></sub>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_dashboard.png" alt="training dashboard" width="80%">
+  <br>
+  <sub><em><code>p.dashboard()</code> of a small demo run (24 frames): loss curves plus train and test parity.</em></sub>
+</p>
+
+---
+
 ## 🗂️ Source layout
 
 The `torchnep/` package is organised as follows:
@@ -412,6 +461,7 @@ The `torchnep/` package is organised as follows:
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
 | `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
+| `plot.py` | `NEPPlotter` — loss curves, parity plots, error distributions and per-element / per-config_type breakdowns from the output files (matplotlib) |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 
 ---

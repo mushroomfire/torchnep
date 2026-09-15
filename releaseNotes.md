@@ -1,5 +1,13 @@
 # Release Notes
 
+## 1.0.5a1
+
+- **Plotting**: new `torchnep.plot.NEPPlotter` (needs matplotlib,
+  `pip install torchnep[plot]`): loss curves, energy/force/virial parity plots
+  (scatter or density, train and test), error distributions with per-element
+  and per-config-type breakdowns, and a one-call training dashboard, all from
+  the `loss.out` / `*_train.out` / `*_test.out` files.
+
 ## 1.0.4
 
 - **Per-species cutoffs** (#9): `cutoff rR1 rA1 rR2 rA2 ...` in nep.in gives
