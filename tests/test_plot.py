@@ -82,8 +82,14 @@ def test_all_figures(tmp_path):
              xyz=tmp_path / "data.xyz", out=tmp_path / "shift.png")
     p.loss(tmp_path / "loss.out", out=tmp_path / "loss.png")
     p.errors(tmp_path, xyz=tmp_path / "data.xyz", out=tmp_path / "errors.png")
+    fig = p.periodic_table(path=tmp_path, xyz=tmp_path / "data.xyz", out=tmp_path / "ptable.png")
+    assert len(fig.axes) >= 2                                          # E and F tables
+    from torchnep.plot import element_errors
+    err = element_errors(tmp_path, tmp_path / "data.xyz")
+    assert set(err["F"]) == {"Cr", "Ni"} and err["n_atoms"]["Ni"] == 40 * 3
+    p.periodic_table(values={"x": {"Fe": 1.0, "Cu": 2.5}}, vmax=2.0, out=tmp_path / "ptable2.png")
     for name in ("dash", "dash_density", "parity_scatter", "parity_density", "pred_scatter",
-                 "pred_density", "shift", "loss", "errors"):
+                 "pred_density", "shift", "loss", "errors", "ptable", "ptable2"):
         assert (tmp_path / f"{name}.png").stat().st_size > 1000
 
 

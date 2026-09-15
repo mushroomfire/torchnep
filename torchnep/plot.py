@@ -245,6 +245,58 @@ DEFAULT_COLORS = {"train": PALETTE["blue"], "valid": PALETTE["pink"],
 DEFAULT_CMAPS = {"train": "Blues", "valid": "Reds"}
 
 
+# Periodic-table layout: symbol -> (row, column), 18 columns, lanthanides and
+# actinides in two extra rows (rows 9 and 10, columns 4-18 in the usual way).
+_PT_ROWS = [
+    "H . . . . . . . . . . . . . . . . He",
+    "Li Be . . . . . . . . . . B C N O F Ne",
+    "Na Mg . . . . . . . . . . Al Si P S Cl Ar",
+    "K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr",
+    "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe",
+    "Cs Ba * Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn",
+    "Fr Ra ** Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og",
+    ". . . La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu",
+    ". . . Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr",
+]
+PT_POSITIONS = {}
+for _r, _row in enumerate(_PT_ROWS):
+    for _c, _sym in enumerate(_row.split()):
+        if _sym not in (".", "*", "**"):
+            PT_POSITIONS[_sym] = (_r + (0.5 if _r >= 7 else 0), _c)   # half a row of gap before the f-block
+
+
+def element_errors(path, xyz, split="train"):
+    """Per-element RMSEs of the ``*_<split>.out`` outputs of ``path`` for the
+    frames of ``xyz``: ``{"E": {el: meV/atom}, "F": {el: meV/A},
+    "n_atoms": {el: count}, "n_frames": {el: count}}``. The force RMSE is
+    over the atoms of the element; the energy RMSE over the frames that
+    contain it (per-atom energies, every frame weighted once)."""
+    d = read_outputs(path, split)
+    natoms, species, _ = frame_meta(xyz)
+    out = {"E": {}, "F": {}, "n_atoms": {}, "n_frames": {}}
+    if "F" in d:
+        sym = np.concatenate([np.asarray(s) for s in species])
+        if len(sym) != len(d["F"]["ref"]):
+            raise ValueError(f"{xyz} has {len(sym)} atoms, the force file {len(d['F']['ref'])} rows")
+        err2 = ((d["F"]["pred"] - d["F"]["ref"]) ** 2).sum(1)
+        for e in np.unique(sym):
+            m = sym == e
+            out["F"][str(e)] = float(np.sqrt(err2[m].sum() / (3 * m.sum())) * 1e3)
+            out["n_atoms"][str(e)] = int(m.sum())
+    if "E" in d:
+        if len(natoms) != len(d["E"]["ref"]):
+            raise ValueError(f"{xyz} has {len(natoms)} frames, the energy file {len(d['E']['ref'])} rows")
+        de2 = (d["E"]["pred"] - d["E"]["ref"]) ** 2
+        frames_of = {}
+        for i, s in enumerate(species):
+            for e in set(s):
+                frames_of.setdefault(e, []).append(i)
+        for e, idx in frames_of.items():
+            out["E"][e] = float(np.sqrt(de2[idx].mean()) * 1e3)
+            out["n_frames"][e] = len(idx)
+    return out
+
+
 def _cm(*v):
     return tuple(x / 2.54 for x in v)
 
@@ -604,6 +656,66 @@ class NEPPlotter:
                         cb.ax.tick_params(which="minor", length=1.0)
             if title:
                 fig.suptitle(title)
+        return self._finish(fig, out)
+
+    def periodic_table(self, values=None, path=None, xyz=None, split="train",
+                       quantities=("E", "F"), out=None, cmap="YlOrRd", vmax=None,
+                       title=None, size=0.62):
+        """Periodic table coloured by a per-element number: either the
+        per-element RMSEs of a run (``path`` + ``xyz`` -> :func:`element_errors`,
+        one table per entry of ``quantities``) or your own ``values``
+        (``{label: {element: value}}``). Elements without a value are grey.
+        ``vmax``: colour-scale top (default: the largest value); ``size``: cell
+        side in cm."""
+        import matplotlib.pyplot as plt
+        from matplotlib import colors as mcolors
+        from matplotlib.patches import Rectangle
+        if values is None:
+            if path is None or xyz is None:
+                raise ValueError("periodic_table needs values= or path= and xyz=")
+            errs = element_errors(path, xyz, split)
+            units = {"E": "Energy RMSE (meV/atom)", "F": "Force RMSE (meV/Å)"}
+            values = {units[q]: errs[q] for q in quantities if errs.get(q)}
+        panels = list(values.items())
+        ncol, nrow = 18, 9.5
+        w = ncol * size + 0.4
+        h = len(panels) * (nrow * size + 1.2)
+        with plt.rc_context(self.rc):
+            fig, axes = plt.subplots(len(panels), 1, figsize=_cm(w, h), squeeze=False)
+            for ax, (label, vals) in zip(axes.ravel(), panels):
+                vmax_ = vmax or (max(vals.values()) if vals else 1.0)
+                norm = mcolors.Normalize(vmin=0.0, vmax=vmax_)
+                cm_ = plt.get_cmap(cmap)
+                for sym, (r, c) in PT_POSITIONS.items():
+                    x, y = c, nrow - 1 - r
+                    if sym in vals:
+                        v = vals[sym]
+                        fc = cm_(norm(v))
+                        lum = 0.299 * fc[0] + 0.587 * fc[1] + 0.114 * fc[2]
+                        tc = "white" if lum < 0.5 else "black"
+                        ax.add_patch(Rectangle((x, y), 1, 1, facecolor=fc, edgecolor="white", lw=0.6))
+                        ax.text(x + 0.5, y + 0.62, sym, ha="center", va="center", color=tc,
+                                fontsize=self.rc["font.size"], fontweight="bold")
+                        ax.text(x + 0.5, y + 0.24, f"{v:.0f}" if v >= 10 else f"{v:.1f}",
+                                ha="center", va="center", color=tc, fontsize=self.rc["font.size"] - 1.5)
+                    else:
+                        ax.add_patch(Rectangle((x, y), 1, 1, facecolor="#ececec", edgecolor="white", lw=0.6))
+                        ax.text(x + 0.5, y + 0.5, sym, ha="center", va="center", color="#9a9a9a",
+                                fontsize=self.rc["font.size"] - 1)
+                ax.set_xlim(0, ncol)
+                ax.set_ylim(0, nrow)
+                ax.set_aspect("equal")
+                ax.axis("off")
+                sm = plt.cm.ScalarMappable(norm=norm, cmap=cm_)
+                cax = ax.inset_axes([3.2 / ncol, (nrow - 1.9) / nrow, 8.0 / ncol, 0.32 / nrow])
+                cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+                cb.set_label(label, labelpad=2)
+                cb.ax.tick_params(length=1.5, pad=1)
+                if vmax is not None and max(vals.values(), default=0) > vmax:
+                    cb.ax.set_title(f"> {vmax:g} saturated", fontsize=self.rc["font.size"] - 1, pad=1)
+            if title:
+                fig.suptitle(title)
+            fig.tight_layout(pad=0.3)
         return self._finish(fig, out)
 
     def errors(self, path, split="train", out=None, xyz=None,
