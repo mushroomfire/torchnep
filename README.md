@@ -106,7 +106,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion. A file name instead of a number (e.g. `zbl zbl.in`) uses GPUMD's flexible ZBL: one line per element pair (1-1, 1-2, …, n-n) with `rc_inner rc_outer a1 … a8`; to change only the cutoffs keep the universal coefficients `0.18175 3.1998 0.50986 0.94229 0.28022 0.4029 0.02817 0.20162`. The table is stored in `nep.txt`, and `use_typewise_cutoff_zbl` is ignored |
 | `use_typewise_cutoff_zbl` | — | `use_typewise_cutoff_zbl <factor>`: per-pair ZBL outer cutoff = min(factor × (R_i + R_j), `zbl`) with the covalent radii R, inner cutoff 0; the factor is required (0.7 recommended, ≥ 0.5) |
 
-Cutoff rules, checked on load: angular cutoff ≥ 3 Å and ≤ the radial cutoff for every species, radial cutoff ≤ 100 Å, ZBL outer cutoff (`zbl`, every `zbl.in` row) between 1 and 3 Å and never above the smallest angular cutoff (ZBL pairs come from the angular neighbor list), `use_typewise_cutoff_zbl` factor ≥ 0.5 (must be given).
+Cutoff rules, checked on load: the angular cutoff is ≥ 3 Å and ≤ the radial cutoff for every species, the radial cutoff ≤ 100 Å, and the ZBL outer cutoff (`zbl`, every `zbl.in` row) is between 1 and 3 Å. The ZBL cutoff is therefore always below the smallest angular cutoff, so the ZBL term can safely be evaluated on the angular neighbor list.
 
 ### Training hyperparameters
 
