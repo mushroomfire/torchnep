@@ -1,5 +1,12 @@
 # Release Notes
 
+## 1.0.4a1
+
+- **Bug fix** (#8): with `use_autograd_forces=True` and `use_compile=True`, a
+  flexible ZBL table (`zbl zbl.in`) was ignored and the universal ZBL
+  coefficients were used instead. ZBL tests now cover autograd / analytical
+  forces, each eager and compiled.
+
 ## 1.0.3
 
 - **Multi-node training**: each rank streams only its own part of the xyz file,
