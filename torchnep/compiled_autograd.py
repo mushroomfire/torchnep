@@ -146,9 +146,14 @@ class CompiledAutogradForce:
     fully initialized.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, backend: str = "inductor"):
+        """``backend`` is handed to ``torch.compile`` for the traced graph.
+        The trainer uses the default Inductor pipeline; ``"eager"`` runs the
+        same make_fx graph without code generation, so the traced source
+        can be tested on CPU-only hosts."""
         apply_compile_patches()
         self.model = model
+        self.backend = backend
         pd = {**dict(model.named_parameters()), **dict(model.named_buffers())}
         self.pkeys = list(pd)
         self._compiled = None
@@ -225,12 +230,16 @@ class CompiledAutogradForce:
         # the undetached rij_ang input (no autograd needed; no trainable
         # params) and folded into the angular pair gradient before the
         # accumulate, mirroring the cached analytical path (g_extra_ang).
+        # The flexible ZBL (zbl.in) screening table is a buffer, so it is a
+        # graph input like the cutoff tables — same call as _cached_core.
         if self.model.zbl is not None:
             e_zbl, g_zbl = ops.compute_zbl_pair(
                 atom_types, pi_ang, pj_ang, rij_ang,
                 pd["zbl_zizj_pair"], pd["zbl_a_inv_pair"],
                 pd["zbl_rc_inner_pair"], pd["zbl_rc_outer_pair"],
-                need_grad=True)
+                need_grad=True,
+                phi_tab=(pd["zbl_phi_pair"]
+                         if self.model.zbl_flexible is not None else None))
             Ei = Ei.scatter_add(0, pi_ang, e_zbl)
             ga = ga + g_zbl
         forces, virial = ops.accumulate_forces_virial(
@@ -276,8 +285,12 @@ class CompiledAutogradForce:
         gm = make_fx(fn, tracing_mode="symbolic",
                      _allow_non_fake_inputs=True)(*self._prime_args(args))
         strip_detach(gm)
-        self._compiled = torch.compile(gm, dynamic=True,
-                                       options=inductor_options())
+        if self.backend == "inductor":
+            self._compiled = torch.compile(gm, dynamic=True,
+                                           options=inductor_options())
+        else:
+            self._compiled = torch.compile(gm, dynamic=True,
+                                           backend=self.backend)
 
     # -- public: drop-in for NEPModel.compute_properties ----------------------
 

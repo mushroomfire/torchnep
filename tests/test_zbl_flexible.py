@@ -14,14 +14,19 @@
 """Flexible ZBL (GPUMD ``zbl.in``): ``zbl <file>`` in nep.in.
 
 - a zbl.in that spells out the universal parameters must give the SAME
-  energies / forces as the universal path (both the eager and the compiled
-  ZBL kernels);
+  energies / forces as the universal path;
 - arbitrary per-pair parameters must match an independent numpy evaluation
   of E = K Z_i Z_j / d * phi(d * a_inv) * fc(d; rc_inner_ij, rc_outer_ij);
 - nep.txt round trip: the table is written after the q_scaler under a
   ``zbl 0 0`` header and read back by the calculator and the trainer.
+Every ZBL check runs on all four training compute paths (``PATHS``):
+autograd forces and analytical forces, each eager and under torch.compile.
+The compiled variants use the ``eager`` dynamo backend so they run on the
+CPU-only CI: the point is that the traced SOURCE (CompiledAutogradForce._raw,
+NEPModel._cached_core) carries the per-pair table, not Inductor codegen.
 The GPUMD parity of the whole thing is covered by the CrCoNi_flexzbl fixture
-in test_gpumd_parity.py.
+in test_gpumd_parity.py; the Inductor pipeline itself by
+test_compiled_autograd.py (CUDA).
 """
 import numpy as np
 import pytest
@@ -79,21 +84,39 @@ def _model_and_batch(tmp_path, zbl_line, frames):
     return cfg, model, store.collate(list(range(len(frames))))
 
 
-def _energy_forces(model, batch, path):
-    """Both ZBL kernels: ``eager`` = ops.compute_zbl (per-pair gather of the
-    flexible tables), ``cached`` = ops.compute_zbl_pair (branch-free table
-    variant used by the compiled core)."""
+PATHS = ["autograd", "autograd+compile", "analytical", "analytical+compile"]
+
+
+def _efv(model, batch, path):
+    """Energy / forces / virial through one of the four training compute paths
+    (the same objects train_nep wires up for use_autograd_forces x use_compile):
+    ``autograd``            NEPModel.compute_properties  -> ops.compute_zbl
+    ``autograd+compile``    CompiledAutogradForce (make_fx graph) -> ops.compute_zbl_pair
+    ``analytical``          NEPModel.compute_properties_cached -> ops.compute_zbl_pair
+    ``analytical+compile``  the same with torch.compile(model._cached_core)"""
+    args = (batch["rij_rad"], batch["rij_ang"], batch["pair_i_rad"], batch["pair_j_rad"],
+            batch["pair_i_ang"], batch["pair_j_ang"], batch["atom_types"], batch["N"],
+            batch["struct_idx"], batch["num_structures"])
     with torch.enable_grad():
-        if path == "eager":
-            out = model.compute_properties(
-                batch["rij_rad"], batch["rij_ang"], batch["pair_i_rad"], batch["pair_j_rad"],
-                batch["pair_i_ang"], batch["pair_j_ang"], batch["atom_types"], batch["N"],
-                batch["struct_idx"], batch["num_structures"],
-                need_forces=True, need_virial=True, backend="loop")
-        else:
+        if path == "autograd":
+            out = model.compute_properties(*args, need_forces=True, need_virial=True, backend="loop")
+        elif path == "autograd+compile":
+            from torchnep.compiled_autograd import CompiledAutogradForce
+            out = CompiledAutogradForce(model, backend="eager").compute_properties(
+                *args, need_forces=True, need_virial=True, backend="bmm")
+        elif path == "analytical":
             out = model.compute_properties_cached(batch, need_forces=True, need_virial=True,
                                                   backend="loop")
-    return out["Etot"].detach(), out["forces"].detach()
+        else:
+            core = torch.compile(model._cached_core, dynamic=True, backend="eager")
+            out = model.compute_properties_cached(batch, need_forces=True, need_virial=True,
+                                                  backend="bmm", core_fn=core)
+    return out["Etot"].detach(), out["forces"].detach(), out["virial"].detach()
+
+
+def _energy_forces(model, batch, path):
+    e, f, _ = _efv(model, batch, path)
+    return e, f
 
 
 def test_parse_zbl_file_and_table(tmp_path):
@@ -108,7 +131,7 @@ def test_parse_zbl_file_and_table(tmp_path):
         read_zbl_in(str(tmp_path / "my_zbl.in"), 4)      # wrong number of rows
 
 
-@pytest.mark.parametrize("path", ["eager", "cached"])
+@pytest.mark.parametrize("path", PATHS)
 def test_universal_file_matches_universal(tmp_path, path):
     frames = _frames()
     cfg_u, m_u, b_u = _model_and_batch(tmp_path, "zbl 2.5", frames)
@@ -145,7 +168,7 @@ def _numpy_zbl(batch, cfg, rows, atom_numbers):
     return E
 
 
-@pytest.mark.parametrize("path", ["eager", "cached"])
+@pytest.mark.parametrize("path", PATHS)
 def test_custom_table_matches_numpy(tmp_path, path):
     frames = _frames(n=4)
     rows = _custom_rows(3, seed=3)
@@ -162,6 +185,28 @@ def test_custom_table_matches_numpy(tmp_path, path):
     ref_uni = _numpy_zbl(b0, cfg0, _universal_rows(3, 2.5), Z)
     assert np.allclose((e_flex - e_uni).numpy(), ref_flex - ref_uni, atol=1e-7, rtol=1e-9)
     assert np.abs(ref_flex - ref_uni).max() > 1e-3      # the test actually exercised ZBL
+
+
+@pytest.mark.parametrize("path", PATHS[1:])
+def test_custom_table_paths_agree(tmp_path, path):
+    """Forces and virial from a custom table must agree across the four paths
+    (the autograd path is the reference: it gathers the table per pair and is
+    pinned to numpy above). A path that silently falls back to the universal
+    coefficients (CompiledAutogradForce used to drop the table when tracing)
+    reproduces the universal model instead, which the second assertion rules
+    out."""
+    frames = _frames(n=4)
+    rows = _custom_rows(3, seed=5)
+    _write_zbl_in(tmp_path / "zbl.in", rows)
+    _, m, b = _model_and_batch(tmp_path, "zbl zbl.in", frames)
+    _, m0, b0 = _model_and_batch(tmp_path, "zbl 2.5", frames)
+    m0.load_state_dict({k: v for k, v in m.state_dict().items() if k != "zbl_flexible"}, strict=False)
+    e_ref, f_ref, v_ref = _efv(m, b, "autograd")
+    e, f, v = _efv(m, b, path)
+    assert torch.allclose(e, e_ref, atol=1e-9) and torch.allclose(f, f_ref, atol=1e-8) \
+        and torch.allclose(v, v_ref, atol=1e-8)
+    e_uni, f_uni, _ = _efv(m0, b0, path)
+    assert not torch.allclose(f, f_uni, atol=1e-3) and not torch.allclose(e, e_uni, atol=1e-3)
 
 
 def test_nep_txt_round_trip(tmp_path):
@@ -181,7 +226,7 @@ def test_nep_txt_round_trip(tmp_path):
     # calculator: same energies / forces as the training model
     calc = NEPCalculator(str(path), dtype=torch.float64)
     assert calc.zbl_flexible
-    e_m, f_m = _energy_forces(m, b, "cached")
+    e_m, f_m = _energy_forces(m, b, "analytical")
     off = 0
     for k, fr in enumerate(frames):
         r = calc.compute(fr["species"], fr["positions"], fr["cell"])
@@ -195,5 +240,5 @@ def test_nep_txt_round_trip(tmp_path):
     m_u.load_weights_from_nep_txt(str(path))
     assert m_u.zbl_flexible is not None
     assert torch.allclose(m_u.zbl_flexible.double(), torch.tensor(rows, dtype=torch.float64))
-    e_l, f_l = _energy_forces(m_u, b, "cached")
+    e_l, f_l = _energy_forces(m_u, b, "analytical")
     assert torch.allclose(e_l, e_m) and torch.allclose(f_l, f_m)
