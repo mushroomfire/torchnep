@@ -11,10 +11,10 @@
 # You should have received a copy of the GNU General Public License
 # along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Cutoff rules enforced on nep.in and on every NEPModel: GPUMD's limits
-(angular >= 3 A and <= radial per species, radial <= 100 A, ZBL outer in
-[1, 4] A) plus ZBL outer <= the smallest angular cutoff (ZBL runs on the
-angular neighbor list), for the universal `zbl` value and every zbl.in row."""
+"""Cutoff rules enforced on nep.in and on every NEPModel: angular >= 3 A
+and <= radial per species, radial <= 100 A, ZBL outer in [1, 3] A and <=
+the smallest angular cutoff (ZBL runs on the angular neighbor list) — for
+the universal `zbl` value and every zbl.in row — and typewise factor >= 0.5."""
 import re
 
 import pytest
@@ -40,7 +40,7 @@ def _zbl_in(tmp_path, rc_outer, name="zbl.in"):
 @pytest.mark.parametrize("lines", [
     "cutoff 6 4\nzbl 2.5\n",
     "cutoff 6 4 5 3.5 4.5 3\nzbl 3\n",        # ZBL equal to the smallest angular cutoff: allowed
-    "cutoff 6 4\nzbl 4\n",                    # GPUMD's upper limit
+    "cutoff 6 4\nzbl 3\nuse_typewise_cutoff_zbl\n",   # factor defaults to 0.7
     "cutoff 3 3\nzbl 1\n",
     "cutoff 6 4\n",                            # no ZBL at all
 ])
@@ -55,15 +55,19 @@ def test_valid_configs(tmp_path, lines):
     ("cutoff 6 4 5 3.5 3 3.5\n", "radial cutoff (Ni) 3.0 A is smaller"),
     ("cutoff 120 4\n", "radial cutoff 120.0 A exceeds 100.0 A"),
     ("cutoff 6 4\nzbl 0.8\n", "ZBL outer cutoff 0.8 A outside"),
-    ("cutoff 6 4\nzbl 4.5\n", "ZBL outer cutoff 4.5 A outside"),
-    ("cutoff 6 4 5 3.5 4.5 3\nzbl 3.5\n", "ZBL outer cutoff 3.5 A exceeds the smallest angular"),
+    ("cutoff 6 4\nzbl 3.5\n", "ZBL outer cutoff 3.5 A outside"),
+    ("cutoff 6 4\nzbl 2.5\nuse_typewise_cutoff_zbl 0.4\n", "use_typewise_cutoff_zbl factor 0.4 is below 0.5"),
 ])
 def test_invalid_configs(tmp_path, lines, msg):
     with pytest.raises(ValueError, match=re.escape(msg)):
         _parse(tmp_path, lines)
 
 
-def test_zbl_above_smallest_angular():
+def test_zbl_above_smallest_angular(monkeypatch):
+    """Implied by angular >= 3 and ZBL <= 3, but checked explicitly as a
+    guard: widen the ZBL range to reach it."""
+    from torchnep import data
+    monkeypatch.setattr(data, "ZBL_RC_OUTER_RANGE", (1.0, 5.0))
     cfg = {"cutoff_radial": 6.0, "cutoff_angular": 3.0, "type_names": ["Cr", "Ni"],
            "cutoff_radial_per_type": [6.0, 6.0], "cutoff_angular_per_type": [3.0, 4.0], "zbl": 3.5}
     with pytest.raises(ValueError, match="exceeds the smallest angular"):
@@ -78,8 +82,8 @@ def test_zbl_above_smallest_angular():
 def test_zbl_in_rows(tmp_path):
     ok = _zbl_in(tmp_path, 2.8, "ok.in")
     assert len(read_zbl_in(str(tmp_path / ok), 3)) == 6
-    bad = _zbl_in(tmp_path, 4.2, "bad.in")
-    with pytest.raises(ValueError, match="rc_outer 4.2 outside"):
+    bad = _zbl_in(tmp_path, 3.2, "bad.in")
+    with pytest.raises(ValueError, match="rc_outer 3.2 outside"):
         read_zbl_in(str(tmp_path / bad), 3)
     _zbl_in(tmp_path, 2.8)
     NEPModel(_parse(tmp_path, "cutoff 6 4 5 3.5 4.5 3\nzbl zbl.in\n"))   # 2.8 <= 3: fine

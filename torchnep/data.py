@@ -336,15 +336,17 @@ def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
     return table
 
 
-# Cutoff rules (checked for nep.in and for every NEPModel). GPUMD's own
-# limits (main_nep/parameters.cu): angular cutoff >= 3 A and <= radial
-# cutoff, radial cutoff <= 100 A, ZBL outer cutoff within [1, 4] A. On top
-# of those, the ZBL outer cutoff (universal value or every zbl.in row) must
-# not exceed the smallest angular cutoff: the ZBL term is evaluated on the
-# ANGULAR neighbor list, so pairs beyond it would silently lose their ZBL.
+# Cutoff rules (checked for nep.in and for every NEPModel): angular cutoff
+# >= 3 A and <= radial cutoff (per species), radial cutoff <= 100 A, ZBL
+# outer cutoff within [1, 3] A (GPUMD's documented range; the universal
+# value and every zbl.in row), typewise ZBL factor >= 0.5. The ZBL term is
+# evaluated on the ANGULAR neighbor list, so the ZBL outer cutoff must not
+# exceed the smallest angular cutoff either (implied by the two limits, but
+# checked explicitly): pairs beyond that list would silently lose their ZBL.
 MIN_ANGULAR_CUTOFF = 3.0
 MAX_RADIAL_CUTOFF = 100.0
-ZBL_RC_OUTER_RANGE = (1.0, 4.0)
+ZBL_RC_OUTER_RANGE = (1.0, 3.0)
+MIN_TYPEWISE_ZBL_FACTOR = 0.5
 
 
 def validate_cutoffs(config, where="nep.in"):
@@ -365,6 +367,10 @@ def validate_cutoffs(config, where="nep.in"):
     zbl = config.get("zbl")
     if zbl is None:
         return
+    tw = config.get("typewise_cutoff_zbl_factor")
+    if tw is not None and tw < MIN_TYPEWISE_ZBL_FACTOR:
+        raise ValueError(f"{where}: use_typewise_cutoff_zbl factor {tw} is below "
+                         f"{MIN_TYPEWISE_ZBL_FACTOR}")
     rows = config.get("zbl_flexible")
     outer = max(row[1] for row in rows) if rows else float(zbl)
     lo, hi = ZBL_RC_OUTER_RANGE
@@ -426,7 +432,8 @@ def parse_nep_in(filename: str) -> Dict:
                             os.path.dirname(os.path.abspath(filename)), zbl_path)
                     params["zbl_file"] = zbl_path
             elif key == "use_typewise_cutoff_zbl":
-                params["typewise_cutoff_zbl_factor"] = float(parts[1])
+                # GPUMD: optional factor, default 0.7
+                params["typewise_cutoff_zbl_factor"] = float(parts[1]) if len(parts) > 1 else 0.7
             elif key == "cutoff":
                 # "cutoff rR rA"                      -> one pair of cutoffs;
                 # "cutoff rR1 rA1 rR2 rA2 ... rRn rAn" -> per species (GPUMD):
