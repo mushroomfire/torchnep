@@ -29,7 +29,7 @@ from .constants import (
     ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS, ZBL_PARA,
 )
 from . import ops
-from .data import zbl_pair_index
+from .data import zbl_pair_index, cutoff_pair_table
 
 
 class FittingNet(nn.Module):
@@ -67,8 +67,27 @@ class NEPModel(nn.Module):
         super().__init__()
         self.num_types = config["num_types"]
         self.type_names = config["type_names"]
+        # Cutoffs: rc_radial / rc_angular are the LARGEST values (neighbor
+        # search radius, tracing ranges); with per-species cutoffs (GPUMD
+        # "cutoff rR1 rA1 rR2 rA2 ...") the (T, T) pair tables below carry
+        # the value each element pair actually uses, 0.5 * (rc[t1] + rc[t2]).
         self.rc_radial = config["cutoff_radial"]
         self.rc_angular = config["cutoff_angular"]
+        self.rc_radial_per_type = config.get("cutoff_radial_per_type")
+        self.rc_angular_per_type = config.get("cutoff_angular_per_type")
+        if self.rc_radial_per_type is not None:
+            self.rc_radial_per_type = [float(x) for x in self.rc_radial_per_type]
+            self.rc_angular_per_type = [float(x) for x in self.rc_angular_per_type]
+            if len(self.rc_radial_per_type) != self.num_types:
+                raise ValueError(f"cutoff_radial_per_type has "
+                                 f"{len(self.rc_radial_per_type)} values for "
+                                 f"{self.num_types} types")
+            self.rc_radial = max(self.rc_radial_per_type)
+            self.rc_angular = max(self.rc_angular_per_type)
+            self.register_buffer("rc_radial_pair", torch.tensor(
+                cutoff_pair_table(self.rc_radial_per_type)), persistent=False)
+            self.register_buffer("rc_angular_pair", torch.tensor(
+                cutoff_pair_table(self.rc_angular_per_type)), persistent=False)
         self.n_max_radial = config["n_max_radial"]
         self.n_max_angular = config["n_max_angular"]
         self.basis_size_radial = config["basis_size_radial"]
@@ -210,6 +229,13 @@ class NEPModel(nn.Module):
         self.register_buffer("_c5b", torch.tensor(C5B))
         self.register_buffer("_c4b2", torch.tensor(C4B2))
 
+    def cutoff_args(self):
+        """``(rc_radial, rc_angular)`` as the basis functions take them: the
+        floats for uniform cutoffs, the (T, T) pair tables per species."""
+        if self.rc_radial_per_type is None:
+            return self.rc_radial, self.rc_angular
+        return self.rc_radial_pair, self.rc_angular_pair
+
     @torch.no_grad()
     def set_q_scaler(self, q_min: torch.Tensor, q_max: torch.Tensor):
         diff = torch.clamp(q_max - q_min, min=1e-10)
@@ -222,7 +248,7 @@ class NEPModel(nn.Module):
         return ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c_param_2, self.c_param_3,
-            self.rc_radial, self.rc_angular,
+            *self.cutoff_args(),
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
@@ -662,13 +688,18 @@ class NEPModel(nn.Module):
                 lines.append(f"zbl {rc_inner_out} {rc_outer_out}")
 
         # Format cutoff: integer if whole number (matches GPUMD style).
-        # Always emit 4 fields — GPUMD's nep.txt parser requires both
-        # max_NN_radial and max_NN_angular on the cutoff line.
+        # GPUMD's nep.txt parser requires max_NN_radial and max_NN_angular
+        # at the end of the cutoff line; per-species cutoffs are written as
+        # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A" (2 * num_types + 3 tokens).
         def _fmt(v):
             return str(int(v)) if v == int(v) else str(v)
-        lines.append(
-            f"cutoff {_fmt(self.rc_radial)} {_fmt(self.rc_angular)} "
-            f"{max_NN_radial} {max_NN_angular}")
+        if self.rc_radial_per_type is None:
+            cut = [self.rc_radial, self.rc_angular]
+        else:
+            cut = [v for pair in zip(self.rc_radial_per_type,
+                                     self.rc_angular_per_type) for v in pair]
+        lines.append("cutoff " + " ".join(_fmt(v) for v in cut)
+                     + f" {max_NN_radial} {max_NN_angular}")
         lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
         lines.append(f"basis_size {self.basis_size_radial} "
                      f"{self.basis_size_angular}")
@@ -782,6 +813,10 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         "type_names":         list(keep_type_names),
         "cutoff_radial":      model.rc_radial,
         "cutoff_angular":     model.rc_angular,
+        "cutoff_radial_per_type": ([model.rc_radial_per_type[i] for i in keep_idx]
+                                   if model.rc_radial_per_type is not None else None),
+        "cutoff_angular_per_type": ([model.rc_angular_per_type[i] for i in keep_idx]
+                                    if model.rc_angular_per_type is not None else None),
         "n_max_radial":       model.n_max_radial,
         "n_max_angular":      model.n_max_angular,
         "basis_size_radial":  model.basis_size_radial,

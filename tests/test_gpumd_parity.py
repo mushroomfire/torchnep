@@ -48,7 +48,7 @@ THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR.parent))
 
 from torchnep import ops, predict_dataset
-from torchnep.data import read_xyz, build_neighbor_list_np
+from torchnep.data import read_xyz, build_neighbor_list_np, pair_cutoff_np
 from torchnep.nep import NEPCalculator
 from torchnep.model import NEPModel
 from _common import (DTYPE_MAP, NP_DTYPE_MAP, DATA_DIR, FIXTURES, devices,
@@ -63,8 +63,10 @@ from _common import (DTYPE_MAP, NP_DTYPE_MAP, DATA_DIR, FIXTURES, devices,
 def _preprocess_for_prediction(frames, calc, np_dtype):
     """Build neighbor lists for a list of frames. Returns structure dicts
     with the same schema the training pipeline produces."""
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
-    max_rc = max(rc_rad, rc_ang)
+    max_rc = max(calc.rc_radial, calc.rc_angular)
+    rc_rad, rc_ang = calc.cutoff_args()
+    if isinstance(rc_rad, torch.Tensor):       # per-species: (T, T) tables
+        rc_rad, rc_ang = rc_rad.cpu().numpy(), rc_ang.cpu().numpy()
 
     structures = []
     for frame in frames:
@@ -75,15 +77,17 @@ def _preprocess_for_prediction(frames, calc, np_dtype):
             dtype=np.int64)
         pair_i, pair_j, rij = build_neighbor_list_np(positions, cell, max_rc)
         dij = np.linalg.norm(rij, axis=1)
+        m_r = dij < pair_cutoff_np(rc_rad, atom_types, pair_i, pair_j)
+        m_a = dij < pair_cutoff_np(rc_ang, atom_types, pair_i, pair_j)
         structures.append({
             "natoms": frame["natoms"],
             "atom_types": atom_types,
-            "pair_i_rad": pair_i[dij < rc_rad],
-            "pair_j_rad": pair_j[dij < rc_rad],
-            "rij_rad":    rij[dij < rc_rad],
-            "pair_i_ang": pair_i[dij < rc_ang],
-            "pair_j_ang": pair_j[dij < rc_ang],
-            "rij_ang":    rij[dij < rc_ang],
+            "pair_i_rad": pair_i[m_r],
+            "pair_j_rad": pair_j[m_r],
+            "rij_rad":    rij[m_r],
+            "pair_i_ang": pair_i[m_a],
+            "pair_j_ang": pair_j[m_a],
+            "rij_ang":    rij[m_a],
             "energy": frame.get("energy"),
             "forces": frame.get("forces"),
             "virial": frame.get("virial"),
@@ -94,7 +98,7 @@ def _preprocess_for_prediction(frames, calc, np_dtype):
 def _build_batch(structures, indices, calc, dtype, device):
     """Collate a list of structure indices into a GPU batch with cached basis,
     matching the dict shape NEPCalculator.compute_batch expects."""
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    rc_rad, rc_ang = calc.cutoff_args()
     basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
     l_max_3b, num_lm = calc.l_max_3b, calc.num_lm
 
@@ -129,12 +133,14 @@ def _build_batch(structures, indices, calc, dtype, device):
     rij_a = _cat_rij("rij_ang")
 
     dr = torch.norm(rij_r, dim=-1)
-    fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+    fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
+        dr, ops.pair_cutoff(rc_rad, atom_types, pi_r, pj_r), basis_r)
     d12inv_r = 1.0 / dr.clamp(min=1e-10)
 
     if rij_a.shape[0] > 0:
         da = torch.norm(rij_a, dim=-1)
-        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
+            da, ops.pair_cutoff(rc_ang, atom_types, pi_a, pj_a), basis_a)
         d12inv_a = 1.0 / da.clamp(min=1e-10)
         blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
                                 rij_a[:, 1] * d12inv_a,
@@ -282,6 +288,8 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
         "num_types":           calc.num_types,
         "cutoff_radial":       calc.rc_radial,
         "cutoff_angular":      calc.rc_angular,
+        "cutoff_radial_per_type":  calc.rc_radial_per_type,
+        "cutoff_angular_per_type": calc.rc_angular_per_type,
         "n_max_radial":        calc.n_max_radial,
         "n_max_angular":       calc.n_max_angular,
         "basis_size_radial":   calc.basis_size_radial,

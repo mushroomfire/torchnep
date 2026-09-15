@@ -384,8 +384,34 @@ def parse_nep_in(filename: str) -> Dict:
             elif key == "use_typewise_cutoff_zbl":
                 params["typewise_cutoff_zbl_factor"] = float(parts[1])
             elif key == "cutoff":
-                params["cutoff_radial"] = float(parts[1])
-                params["cutoff_angular"] = float(parts[2])
+                # "cutoff rR rA"                      -> one pair of cutoffs;
+                # "cutoff rR1 rA1 rR2 rA2 ... rRn rAn" -> per species (GPUMD):
+                #   the cutoff of an element pair is the mean of the two
+                #   species' values. Needs the 'type' line first.
+                vals = [float(x) for x in parts[1:]]
+                if len(vals) == 2:
+                    params["cutoff_radial"], params["cutoff_angular"] = vals
+                    params["cutoff_radial_per_type"] = None
+                    params["cutoff_angular_per_type"] = None
+                else:
+                    if "num_types" not in params:
+                        raise ValueError("nep.in: per-species 'cutoff' needs "
+                                         "the 'type' line before it")
+                    nt = params["num_types"]
+                    if len(vals) != 2 * nt:
+                        raise ValueError(
+                            f"nep.in: 'cutoff' takes 2 values or 2 per "
+                            f"species ({2 * nt} for {nt} types); got {len(vals)}")
+                    rr, ra = vals[0::2], vals[1::2]
+                    params["cutoff_radial_per_type"] = rr
+                    params["cutoff_angular_per_type"] = ra
+                    params["cutoff_radial"] = max(rr)
+                    params["cutoff_angular"] = max(ra)
+                for t in range(len(vals) // 2):
+                    if not 0.0 < vals[2 * t + 1] <= vals[2 * t]:
+                        raise ValueError(
+                            f"nep.in: cutoff pair {t + 1}: need 0 < angular "
+                            f"({vals[2 * t + 1]}) <= radial ({vals[2 * t]})")
             elif key == "n_max":
                 params["n_max_radial"] = int(parts[1])
                 params["n_max_angular"] = int(parts[2])
@@ -468,6 +494,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("version", 4)
     params.setdefault("cutoff_radial", 8.0)
     params.setdefault("cutoff_angular", 4.0)
+    params.setdefault("cutoff_radial_per_type", None)
+    params.setdefault("cutoff_angular_per_type", None)
     params.setdefault("n_max_radial", 6)
     params.setdefault("n_max_angular", 6)
     params.setdefault("basis_size_radial", 6)
@@ -508,6 +536,21 @@ def parse_nep_in(filename: str) -> Dict:
 # ---------------------------------------------------------------------------
 # Neighbor list construction (numpy, CPU — shared by training and prediction)
 # ---------------------------------------------------------------------------
+
+def cutoff_pair_table(per_type):
+    """``(T, T)`` float64 array of element-pair cutoffs from per-species values:
+    ``0.5 * (rc[t1] + rc[t2])`` (GPUMD's per-species ``cutoff`` convention)."""
+    r = np.asarray(per_type, dtype=np.float64)
+    return 0.5 * (r[:, None] + r[None, :])
+
+
+def pair_cutoff_np(rc, atom_types, pair_i, pair_j):
+    """Numpy twin of :func:`torchnep.ops.pair_cutoff`: ``rc`` is a float (returned
+    as is) or a ``(T, T)`` table gathered to one cutoff per pair."""
+    if np.ndim(rc) == 0:
+        return float(rc)
+    return np.asarray(rc)[atom_types[pair_i], atom_types[pair_j]]
+
 
 def wrap_positions(positions, cell):
     """Wrap ``positions`` into the primary cell (fractional coords in [0, 1)).

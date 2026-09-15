@@ -104,7 +104,20 @@ def _select_contraction_funcs(backend: str):
 # Basis functions
 # ---------------------------------------------------------------------------
 
-def chebyshev_basis(dij: torch.Tensor, rc: float,
+def pair_cutoff(rc, atom_types, pair_i, pair_j):
+    """Per-pair cutoff for a pair list.
+
+    ``rc`` is either a float (one cutoff for every pair — returned as is, so
+    the uniform path keeps its scalar arithmetic) or a ``(T, T)`` tensor of
+    per-element-pair cutoffs (GPUMD per-species ``cutoff``: the table holds
+    ``0.5 * (rc[t1] + rc[t2])``), gathered to a ``(P,)`` tensor.
+    """
+    if isinstance(rc, torch.Tensor):
+        return rc[atom_types[pair_i], atom_types[pair_j]]
+    return rc
+
+
+def chebyshev_basis(dij: torch.Tensor, rc,
                     basis_size: int) -> torch.Tensor:
     """Chebyshev radial basis: f_k(r) = 0.5*(T_k(x)+1)*fc(r).
 
@@ -113,8 +126,10 @@ def chebyshev_basis(dij: torch.Tensor, rc: float,
     dij : (P,) float
         Pair distances in A. P is the total number of pairs in the batch
         (so this works for one frame, many frames, or zero pairs).
-    rc : float
-        Radial cutoff in A. Basis is designed so f_k(rc) = 0.
+    rc : float or (P,) float tensor
+        Radial cutoff in A — one value, or one per pair (per-species
+        cutoffs, see :func:`pair_cutoff`). Basis is designed so f_k(rc) = 0;
+        every pair must satisfy dij < rc (the neighbor lists guarantee it).
     basis_size : int
         Polynomial order (== NEP ``basis_size`` parameter).
 
@@ -134,7 +149,7 @@ def chebyshev_basis(dij: torch.Tensor, rc: float,
     return 0.5 * (T + 1.0) * fc.unsqueeze(-1)
 
 
-def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
+def chebyshev_basis_and_deriv(dij: torch.Tensor, rc,
                               basis_size: int):
     """Compute Chebyshev basis AND its derivative wrt distance.
 
@@ -142,8 +157,9 @@ def chebyshev_basis_and_deriv(dij: torch.Tensor, rc: float,
     ----------
     dij : (P,) float
         Pair distances in A.
-    rc : float
-        Radial cutoff in A.
+    rc : float or (P,) float tensor
+        Radial cutoff in A, one value or one per pair (see
+        :func:`chebyshev_basis`).
     basis_size : int
         Polynomial order.
 
@@ -320,7 +336,10 @@ def compute_descriptors(
                                         radial type-pair expansion coeffs.
     c3             : (ntypes, ntypes, basis_size_angular+1, n_max_angular+1)
                                         angular type-pair expansion coeffs.
-    rc_radial, rc_angular : float      cutoffs (A).
+    rc_radial, rc_angular : float or (ntypes, ntypes) tensor
+                                        cutoffs (A): one value, or the
+                                        per-element-pair table (see
+                                        :func:`pair_cutoff`).
     basis_size_radial, basis_size_angular : int
     n_max_radial, n_max_angular           : int
     l_max_3b       : int               max L for 3-body angular descriptors.
@@ -343,7 +362,9 @@ def compute_descriptors(
 
     # --- Radial ---
     dij_rad = torch.norm(rij_rad, dim=-1)
-    fk_rad = chebyshev_basis(dij_rad, rc_radial, basis_size_radial)
+    fk_rad = chebyshev_basis(dij_rad,
+                             pair_cutoff(rc_radial, atom_types, pi_rad, pj_rad),
+                             basis_size_radial)
     q_rad = scatter_fn(fk_rad, pi_rad, pj_rad, atom_types, c2, N)
 
     parts = [q_rad]
@@ -361,7 +382,9 @@ def compute_descriptors(
 
     if l_max_3b > 0 and rij_ang.shape[0] > 0:
         dij_ang = torch.norm(rij_ang, dim=-1)
-        fk_ang = chebyshev_basis(dij_ang, rc_angular, basis_size_angular)
+        fk_ang = chebyshev_basis(dij_ang,
+                                 pair_cutoff(rc_angular, atom_types, pi_ang, pj_ang),
+                                 basis_size_angular)
         gn_ang = type_fn(fk_ang, pi_ang, pj_ang, atom_types, c3)
         d12inv = 1.0 / torch.clamp(dij_ang, min=1e-10)
         blm = angular_basis(rij_ang[:, 0]*d12inv, rij_ang[:, 1]*d12inv,

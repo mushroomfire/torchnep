@@ -27,6 +27,7 @@ import numpy as np
 from typing import Dict
 
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
+from .data import cutoff_pair_table
 from .neighbor import build_neighbor_list, CellList
 from . import ops
 
@@ -94,6 +95,13 @@ class NEPCalculator:
         self.device = torch.device(device)
         self._load_model(model_file)
 
+    def cutoff_args(self):
+        """``(rc_radial, rc_angular)`` for the basis functions: floats for
+        uniform cutoffs, the (T, T) element-pair tables per species."""
+        if self.rc_radial_per_type is None:
+            return self.rc_radial, self.rc_angular
+        return self.rc_radial_pair, self.rc_angular_pair
+
     def _load_model(self, path: str):
         with open(path) as f:
             lines = f.readlines()
@@ -137,10 +145,30 @@ class NEPCalculator:
             self.zbl_typewise_factor = None
             self.zbl_flexible = False
 
-        # Cutoff
+        # Cutoff line: "cutoff rR rA MN_R MN_A" or, per species (GPUMD),
+        # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A" (2 * num_types + 3 tokens):
+        # the pair cutoff is the mean of the two species' values.
         parts = lines[idx].split()
-        self.rc_radial = float(parts[1])
-        self.rc_angular = float(parts[2])
+        vals = [float(x) for x in parts[1:]]
+        if len(vals) == 2 * self.num_types + 2 and self.num_types > 1:
+            self.rc_radial_per_type = vals[0:2 * self.num_types:2]
+            self.rc_angular_per_type = vals[1:2 * self.num_types:2]
+        elif len(vals) >= 2:
+            self.rc_radial_per_type = self.rc_angular_per_type = None
+        else:
+            raise ValueError(f"{path}: malformed cutoff line {lines[idx]!r}")
+        if self.rc_radial_per_type is None:
+            self.rc_radial, self.rc_angular = vals[0], vals[1]
+            self.rc_radial_pair = self.rc_angular_pair = None
+        else:
+            self.rc_radial = max(self.rc_radial_per_type)
+            self.rc_angular = max(self.rc_angular_per_type)
+            self.rc_radial_pair = torch.tensor(
+                cutoff_pair_table(self.rc_radial_per_type),
+                dtype=self.dtype, device=self.device)
+            self.rc_angular_pair = torch.tensor(
+                cutoff_pair_table(self.rc_angular_per_type),
+                dtype=self.dtype, device=self.device)
         idx += 1
 
         # n_max, basis_size, l_max
@@ -308,8 +336,9 @@ class NEPCalculator:
             pos_np, cell_np, max_rc, device=self.device, dtype=self.dtype)
         dij = torch.norm(rij, dim=-1)
 
-        rad_mask = dij < self.rc_radial
-        ang_mask = dij < self.rc_angular
+        rc_r, rc_a = self.cutoff_args()
+        rad_mask = dij < ops.pair_cutoff(rc_r, atom_types, pair_i, pair_j)
+        ang_mask = dij < ops.pair_cutoff(rc_a, atom_types, pair_i, pair_j)
 
         rij_rad = rij[rad_mask].detach().requires_grad_(True)
         rij_ang = rij[ang_mask].detach().requires_grad_(True)
@@ -319,7 +348,7 @@ class NEPCalculator:
         q = ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c2, self.c3,
-            self.rc_radial, self.rc_angular,
+            rc_r, rc_a,
             self.basis_size_radial, self.basis_size_angular,
             self.n_max_radial, self.n_max_angular,
             self.l_max_3b,
@@ -668,18 +697,23 @@ class NEPCalculator:
             rij = rij.to(dtype)
             dij = torch.norm(rij, dim=-1)
 
-            rad = dij < self.rc_radial
-            ang = dij < self.rc_angular
+            rc_r_tab, rc_a_tab = self.cutoff_args()
+            rc_r = ops.pair_cutoff(rc_r_tab, atom_types, pi, pj)
+            rc_a = ops.pair_cutoff(rc_a_tab, atom_types, pi, pj)
+            rad = dij < rc_r
+            ang = dij < rc_a
             pir, pjr, rij_r, dr = pi[rad], pj[rad], rij[rad], dij[rad]
             pia, pja, rij_a, da = pi[ang], pj[ang], rij[ang], dij[ang]
+            if isinstance(rc_r, torch.Tensor):
+                rc_r, rc_a = rc_r[rad], rc_a[ang]
 
             # Cached basis for this block's pairs (analytical-force inputs).
             fk_r, fkp_r = ops.chebyshev_basis_and_deriv(
-                dr, self.rc_radial, self.basis_size_radial)
+                dr, rc_r, self.basis_size_radial)
             d12inv_r = 1.0 / dr.clamp(min=1e-10)
             if rij_a.shape[0] > 0:
                 fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
-                    da, self.rc_angular, self.basis_size_angular)
+                    da, rc_a, self.basis_size_angular)
                 d12inv_a = 1.0 / da.clamp(min=1e-10)
                 blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
                                         rij_a[:, 1] * d12inv_a,

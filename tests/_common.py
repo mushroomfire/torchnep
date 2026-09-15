@@ -85,6 +85,15 @@ FIXTURES = [
                  "data/CrCoNi_flexzbl.zbl.in: pair-specific cutoffs and "
                  "screening coefficients).",
     },
+    {
+        "name":  "CrCoNi_multicut",
+        "nep":   DATA_DIR / "nep_CrCoNi_multicut.txt",
+        "xyz":   DATA_DIR / "CrCoNi.xyz",
+        "ref":   DATA_DIR / "CrCoNi_multicut.gpumd.npz",
+        "note":  "Same weights as CrCoNi with PER-SPECIES cutoffs "
+                 "(cutoff 6 4 5 3.5 4.5 3: Cr 6/4, Co 5/3.5, Ni 4.5/3 A; the "
+                 "pair cutoff is the mean of the two species' values).",
+    },
 ]
 
 
@@ -211,8 +220,17 @@ def parse_nep_header(nep_path: Path) -> dict:
                 if float(parts[1]) == 0.0 and float(parts[2]) == 0.0:
                     out["zbl_flexible"] = True
             elif key == "cutoff":
-                out["rc_radial"]  = float(parts[1])
-                out["rc_angular"] = float(parts[2])
+                # "cutoff rR rA MN_R MN_A" or per species
+                # "cutoff rR1 rA1 ... rRn rAn MN_R MN_A"
+                vals = [float(x) for x in parts[1:]]
+                nt = out["num_types"]
+                if nt > 1 and len(vals) == 2 * nt + 2:
+                    out["rc_radial_per_type"] = vals[0:2 * nt:2]
+                    out["rc_angular_per_type"] = vals[1:2 * nt:2]
+                    out["rc_radial"] = max(out["rc_radial_per_type"])
+                    out["rc_angular"] = max(out["rc_angular_per_type"])
+                else:
+                    out["rc_radial"], out["rc_angular"] = vals[0], vals[1]
             elif key == "n_max":
                 out["n_max_radial"]  = int(parts[1])
                 out["n_max_angular"] = int(parts[2])
@@ -233,11 +251,18 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
     ``output_descriptor`` in {0, 1, 2}: 0 disables descriptor.out; 1 writes
     one row per frame (averaged); 2 writes one row per atom.
     """
+    def _g(v):
+        return str(int(v)) if float(v) == int(v) else f"{v:g}"
+    if hdr.get("rc_radial_per_type"):
+        cut = " ".join(f"{_g(r)} {_g(a)}" for r, a in
+                       zip(hdr["rc_radial_per_type"], hdr["rc_angular_per_type"]))
+    else:
+        cut = f"{_g(hdr['rc_radial'])} {_g(hdr['rc_angular'])}"
     lines = [
         f"type {hdr['num_types']} {' '.join(hdr['type_names'])}",
         "prediction 1",
         "batch 1",
-        f"cutoff {int(hdr['rc_radial'])} {int(hdr['rc_angular'])}",
+        f"cutoff {cut}",
         f"n_max {hdr['n_max_radial']} {hdr['n_max_angular']}",
         f"basis_size {hdr['basis_size_radial']} {hdr['basis_size_angular']}",
         # Pad l_max to 5 fields with zeros (new GPUMD format accepts 1–5
