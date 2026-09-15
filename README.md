@@ -167,8 +167,8 @@ function (`train_nep` / `train_nep_sharded`):
 
 | File | Contents |
 |------|----------|
-| `nep_best.txt` | Best model |
-| `nep_final.txt`    | Model at the last epoch (used for the end-of-training predict) |
+| `nep_best.txt` | Best model — the end-of-training predict (the `*_train.out` / `*_test.out` files below) is made with it |
+| `nep_final.txt`    | Model at the last epoch |
 | `nep_average.txt` | SWA-averaged model (only with `use_swa=True`) |
 | `checkpoint.pt`    | Full training state |
 | `checkpoint_stage1.pt` | Full end-of-Stage-1 checkpoint |

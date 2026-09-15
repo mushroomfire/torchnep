@@ -1842,8 +1842,9 @@ def train_nep(
         checkpoint.pt if present.
     checkpoint_interval : save checkpoint.pt every N epochs.
     prediction_interval : every N epochs, run predict_from_store with the
-        current nep_best weights and overwrite {energy,force,virial}_train.out
-        in output_dir — lets you watch the parity-plot converge live.
+        current-epoch weights and overwrite {energy,force,virial}_train.out
+        in output_dir — lets you watch the parity-plot converge live. The
+        end-of-training predict overwrites them with the nep_best.txt model.
         Set to 0 or a negative value to disable.
     finetune_from : path to an existing .pt or nep.txt to load weights from
         (weights only — a NEW training starts from them: epoch 1, nep.in lr,
@@ -2871,7 +2872,7 @@ def train_nep(
             # the screen average covers weights that were still improving
             # throughout the epoch).
             # Skip on the final epoch — the end-of-training predict (below)
-            # immediately overwrites these files with the final-epoch result.
+            # immediately overwrites these files with the nep_best result.
             if (prediction_interval > 0
                     and epoch % prediction_interval == 0
                     and epoch != num_epochs):
@@ -2948,9 +2949,17 @@ def train_nep(
         _log(f"\nDone. Best loss: {best_loss:.6e}")
     _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-    # End-of-training predict reuses the in-memory data_store (no xyz re-read)
-    # and the final-epoch weights in raw_model (no model-file round-trip).
-    _log("\nRunning prediction on training set (final-epoch model)...")
+    # End-of-training predict with the BEST model: the *_train.out / *_test.out
+    # files then describe nep_best.txt — the model people actually use — so
+    # the parity plots need no separate prediction run. Reuses the in-memory
+    # data_store (no xyz re-read); nep_final.txt keeps the last-epoch weights.
+    best_path = os.path.join(output_dir, "nep_best.txt")
+    if os.path.exists(best_path):
+        raw_model.load_weights_from_nep_txt(best_path)
+        _log("\nRunning prediction on training set (nep_best.txt)...")
+    else:
+        _log("\nRunning prediction on training set (final-epoch model, "
+             "no nep_best.txt found)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
                        batch_size=batch_size, verbose=False)
