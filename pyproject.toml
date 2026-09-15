@@ -45,6 +45,8 @@ filterwarnings = [
     # torch probes NVML on CUDA init; harmless when the driver/library
     # versions mismatch (monitoring only — CUDA compute still works).
     "ignore:.*Can't initialize NVML.*:UserWarning",
+    # ase.atoms assigns ndarray.shape, deprecated in NumPy 2.5 — ASE's to fix.
+    "ignore:Setting the shape on a NumPy array has been deprecated:DeprecationWarning",
 ]
 
 [project.urls]

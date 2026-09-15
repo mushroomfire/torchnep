@@ -71,7 +71,7 @@ def test_readers_and_shift(tmp_path):
 
 def test_all_figures(tmp_path):
     _write_run(tmp_path)
-    p = NEPPlotter(font="Arial", dpi=60)
+    p = NEPPlotter(font=None, dpi=60)          # no font lookup: CI runners have no Arial
     fig = p.dashboard(tmp_path, out=tmp_path / "dash.png")
     assert len([a for a in fig.axes if a.get_xlabel()]) == 4       # 2 x 2 with stress
     p.dashboard(tmp_path, stage2=None, out=tmp_path / "dash_density.png")
