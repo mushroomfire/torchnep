@@ -20,6 +20,7 @@ Many ready-to-use examples (the training inputs and trained models of the TorchN
 - 💾 **Memory-friendly** — the dataset stays in host memory and batches are streamed to the GPU, so memory scales with batch size, not dataset size
 - 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
+- 📈 **Plots** — loss curves, parity plots and error breakdowns straight from the output files (`torchnep.plot`)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
@@ -52,6 +53,9 @@ git clone https://github.com/mushroomfire/torchnep.git
 cd torchnep
 pip install .
 ```
+
+Optional extras: `torchnep[ase]` (ASE calculator), `torchnep[plot]` (figures: matplotlib, polars),
+`torchnep[all]` (everything).
 
 ---
 
@@ -395,6 +399,41 @@ predict_dataset_sharded("nep.txt", "huge.xyz", output_dir="results")
 
 ---
 
+## 📈 Plotting
+
+`torchnep.plot.NEPPlotter` draws figures straight from the files a run writes (`loss.out`,
+`energy/force/virial/stress_train.out`, `*_test.out`; `predict_dataset` writes the same files).
+Needs matplotlib: `pip install torchnep[plot]`.
+
+```python
+from torchnep.plot import NEPPlotter
+
+p = NEPPlotter()
+p.dashboard("run", out="dashboard.png")                 # loss curves + E/F/stress parity, train and valid
+p.loss("run", out="loss.png")                            # the loss panel alone
+p.parity("run", out="parity.png")                        # E/F/stress parity plots (virial=True for the virial)
+p.parity("run", kind="density", margins=True,            # hexbin density + error distributions
+         out="parity_density.png")
+p.parity("pred", shift_energy="element", xyz="test.xyz", # data of another DFT reference: remove
+         out="pred.png")                                 # the per-element energy offset first
+```
+
+`NEPPlotter(font, fontsize, dpi, colors, cmaps, panel_labels, label_format, frame, rc)` sets the
+style for every figure.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_dashboard.png" alt="training dashboard" width="60%">
+  <br>
+  <sub><em><code>p.dashboard("run")</code></em></sub>
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_margins_density.png" alt="parity plots with error distributions" width="95%">
+  <br>
+  <sub><em><code>p.parity("run", kind="density", margins=True)</code></em></sub>
+</p>
+
+---
+
 ## 🗂️ Source layout
 
 The `torchnep/` package is organised as follows:
@@ -412,6 +451,7 @@ The `torchnep/` package is organised as follows:
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
 | `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
+| `plot.py` | `NEPPlotter` — loss curves, parity plots, error distributions and per-element / per-config_type breakdowns from the output files (matplotlib) |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 
 ---
