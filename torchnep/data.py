@@ -330,7 +330,47 @@ def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
         if not (0.0 <= row[0] < row[1]):
             raise ValueError(f"{filename}: pair row {k + 1}: need "
                              f"0 <= rc_inner < rc_outer, got {row[0]} {row[1]}")
+        if not (ZBL_RC_OUTER_RANGE[0] <= row[1] <= ZBL_RC_OUTER_RANGE[1]):
+            raise ValueError(f"{filename}: pair row {k + 1}: rc_outer {row[1]} outside "
+                             f"[{ZBL_RC_OUTER_RANGE[0]}, {ZBL_RC_OUTER_RANGE[1]}] A")
     return table
+
+
+# Cutoff rules shared with GPUMD (checked for nep.in and for every NEPModel):
+#   angular cutoff >= MIN_ANGULAR_CUTOFF and <= radial cutoff (per species);
+#   ZBL outer cutoff within ZBL_RC_OUTER_RANGE and <= the smallest angular
+#   cutoff, because the ZBL term is evaluated on the ANGULAR neighbor list —
+#   a larger ZBL cutoff would silently drop the pairs beyond that list.
+MIN_ANGULAR_CUTOFF = 3.0
+ZBL_RC_OUTER_RANGE = (1.0, 3.0)
+
+
+def validate_cutoffs(config, where="nep.in"):
+    """Raise ValueError when the cutoffs of ``config`` break the rules above."""
+    rr = config.get("cutoff_radial_per_type") or [config["cutoff_radial"]]
+    ra = config.get("cutoff_angular_per_type") or [config["cutoff_angular"]]
+    names = config.get("type_names") or [""] * len(rr)
+    for t, (r, a) in enumerate(zip(rr, ra)):
+        tag = f" ({names[t]})" if len(rr) > 1 and t < len(names) else ""
+        if a < MIN_ANGULAR_CUTOFF:
+            raise ValueError(f"{where}: angular cutoff{tag} {a} A is below the minimum "
+                             f"{MIN_ANGULAR_CUTOFF} A")
+        if r < a:
+            raise ValueError(f"{where}: radial cutoff{tag} {r} A is smaller than the "
+                             f"angular cutoff {a} A")
+    zbl = config.get("zbl")
+    if zbl is None:
+        return
+    rows = config.get("zbl_flexible")
+    outer = max(row[1] for row in rows) if rows else float(zbl)
+    lo, hi = ZBL_RC_OUTER_RANGE
+    if not (lo <= outer <= hi):
+        raise ValueError(f"{where}: ZBL outer cutoff {outer} A outside [{lo}, {hi}] A")
+    min_ang = min(ra)
+    if outer > min_ang:
+        raise ValueError(f"{where}: ZBL outer cutoff {outer} A exceeds the smallest angular "
+                         f"cutoff {min_ang} A — ZBL pairs are taken from the angular "
+                         f"neighbor list, so pairs beyond it would be lost")
 
 
 def parse_nep_in(filename: str) -> Dict:
@@ -407,11 +447,7 @@ def parse_nep_in(filename: str) -> Dict:
                     params["cutoff_angular_per_type"] = ra
                     params["cutoff_radial"] = max(rr)
                     params["cutoff_angular"] = max(ra)
-                for t in range(len(vals) // 2):
-                    if not 0.0 < vals[2 * t + 1] <= vals[2 * t]:
-                        raise ValueError(
-                            f"nep.in: cutoff pair {t + 1}: need 0 < angular "
-                            f"({vals[2 * t + 1]}) <= radial ({vals[2 * t]})")
+
             elif key == "n_max":
                 params["n_max_radial"] = int(parts[1])
                 params["n_max_angular"] = int(parts[2])
@@ -530,6 +566,7 @@ def parse_nep_in(filename: str) -> Dict:
     # safely ignore it). Leading underscore so it can't collide with nep.in
     # tokens.
     params["_explicit"] = explicit
+    validate_cutoffs(params, where=os.path.basename(filename))
     return params
 
 

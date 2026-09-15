@@ -106,6 +106,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion. A file name instead of a number (e.g. `zbl zbl.in`) uses GPUMD's flexible ZBL: one line per element pair (1-1, 1-2, …, n-n) with `rc_inner rc_outer a1 … a8`; to change only the cutoffs keep the universal coefficients `0.18175 3.1998 0.50986 0.94229 0.28022 0.4029 0.02817 0.20162`. The table is stored in `nep.txt`, and `use_typewise_cutoff_zbl` is ignored |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
 
+Cutoff rules (as in GPUMD, checked on load): angular cutoff ≥ 3 Å and ≤ the radial cutoff for every species; the ZBL outer cutoff (`zbl`, every `zbl.in` row) between 1 and 3 Å and never above the smallest angular cutoff — ZBL pairs come from the angular neighbor list.
+
 ### Training hyperparameters
 
 | Parameter | Default | Description |
