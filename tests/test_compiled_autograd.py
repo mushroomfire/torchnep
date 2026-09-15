@@ -33,14 +33,15 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="CompiledAutogradForce needs CUDA")
 
 
-def _setup(tmp_path, n_frames=24):
+def _setup(tmp_path, n_frames=24, nep_in=NEP_IN, frames=None):
     from torchnep.compiled_autograd import CompiledAutogradForce
     dev = torch.device("cuda")
     dtype = torch.float32
     p = tmp_path / "nep.in"
-    p.write_text(NEP_IN)
+    p.write_text(nep_in)
     cfg = parse_nep_in(str(p))
-    frames = read_xyz(str(XYZ))[:n_frames]
+    if frames is None:
+        frames = read_xyz(str(XYZ))[:n_frames]
     structs = preprocess_structures(frames, cfg, np.float32)
     store = StreamDataStore(structs, dev, dtype, config=cfg)
     torch.manual_seed(11)
@@ -127,3 +128,53 @@ def test_compiled_energy_only_falls_back(tmp_path):
     torch.testing.assert_close(r["Etot"], r_ref["Etot"],
                                rtol=1e-6, atol=1e-4)
     assert "forces" not in r
+
+
+def _compressed_frames(n=8, scale=0.8):
+    """Frames plus uniformly compressed copies (NN ~1.2 A) so the ZBL
+    switching windows are actually inside the sampled pair distances."""
+    out = []
+    for f in read_xyz(str(XYZ))[:n]:
+        out.append(f)
+        g = dict(f)
+        g["positions"] = f["positions"] * scale
+        g["cell"] = f["cell"] * scale
+        out.append(g)
+    return out
+
+
+def test_compiled_flexible_zbl_table(tmp_path):
+    """Flexible ZBL (zbl.in) through the real Inductor pipeline: the per-pair
+    screening coefficients must reach the compiled graph, so the compiled
+    result matches the eager autograd model with the same table and differs
+    from the universal-ZBL model (which is what the graph computed when the
+    table was dropped at trace time)."""
+    rng = np.random.default_rng(3)
+    rows = []
+    for _ in range(6):                        # 3 types -> 6 element pairs
+        rc_o = float(rng.uniform(1.8, 2.8))
+        rc_i = float(rng.uniform(0.6, 0.9 * rc_o))
+        coef = [0.18175, 3.1998, 0.50986, 0.94229, 0.28022, 0.4029,
+                0.02817, 0.20162]
+        rows.append([rc_i, rc_o] + [c * float(rng.uniform(0.7, 1.3))
+                                    for c in coef])
+    (tmp_path / "zbl.in").write_text(
+        "\n".join(" ".join(f"{v:.17g}" for v in r) for r in rows) + "\n")
+    frames = _compressed_frames()
+    model, store, caf = _setup(tmp_path, nep_in=NEP_IN + "zbl zbl.in\n",
+                               frames=frames)
+    assert model.zbl_flexible is not None
+    batch = store.collate(list(range(len(frames))))
+    r_e = _run(model.compute_properties, batch)
+    r_c = _run(caf.compute_properties, batch)
+    for key in ("Ei", "Etot", "forces", "virial"):
+        assert _rel(r_e[key].detach(), r_c[key].detach()) < 1e-4, key
+
+    # same weights, universal ZBL with the same outer cutoff: must differ
+    model_u, store_u, caf_u = _setup(
+        tmp_path, nep_in=NEP_IN + f"zbl {max(r[1] for r in rows):.6f}\n",
+        frames=frames)
+    model_u.load_state_dict({k: v for k, v in model.state_dict().items()
+                             if k != "zbl_flexible"}, strict=False)
+    r_u = _run(caf_u.compute_properties, store_u.collate(list(range(len(frames)))))
+    assert _rel(r_u["forces"].detach(), r_c["forces"].detach()) > 1e-3
