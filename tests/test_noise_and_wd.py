@@ -108,8 +108,8 @@ def test_zbl_static_equivalence(tmp_path):
     store, cfg = _store(tmp_path, n=8)
     batch = store.collate([0, 2, 4, 6])
 
-    for extra in ({"zbl": 3.0},                       # <= 3 A (cutoff rule)
-                  {"zbl": 3.0, "typewise_cutoff_zbl_factor": 1.2}):
+    for extra in ({"zbl": 3.5},
+                  {"zbl": 3.5, "typewise_cutoff_zbl_factor": 1.2}):
         c = dict(cfg)
         c.update(extra)
         torch.manual_seed(3)

@@ -336,13 +336,15 @@ def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
     return table
 
 
-# Cutoff rules shared with GPUMD (checked for nep.in and for every NEPModel):
-#   angular cutoff >= MIN_ANGULAR_CUTOFF and <= radial cutoff (per species);
-#   ZBL outer cutoff within ZBL_RC_OUTER_RANGE and <= the smallest angular
-#   cutoff, because the ZBL term is evaluated on the ANGULAR neighbor list —
-#   a larger ZBL cutoff would silently drop the pairs beyond that list.
+# Cutoff rules (checked for nep.in and for every NEPModel). GPUMD's own
+# limits (main_nep/parameters.cu): angular cutoff >= 3 A and <= radial
+# cutoff, radial cutoff <= 100 A, ZBL outer cutoff within [1, 4] A. On top
+# of those, the ZBL outer cutoff (universal value or every zbl.in row) must
+# not exceed the smallest angular cutoff: the ZBL term is evaluated on the
+# ANGULAR neighbor list, so pairs beyond it would silently lose their ZBL.
 MIN_ANGULAR_CUTOFF = 3.0
-ZBL_RC_OUTER_RANGE = (1.0, 3.0)
+MAX_RADIAL_CUTOFF = 100.0
+ZBL_RC_OUTER_RANGE = (1.0, 4.0)
 
 
 def validate_cutoffs(config, where="nep.in"):
@@ -358,6 +360,8 @@ def validate_cutoffs(config, where="nep.in"):
         if r < a:
             raise ValueError(f"{where}: radial cutoff{tag} {r} A is smaller than the "
                              f"angular cutoff {a} A")
+        if r > MAX_RADIAL_CUTOFF:
+            raise ValueError(f"{where}: radial cutoff{tag} {r} A exceeds {MAX_RADIAL_CUTOFF} A")
     zbl = config.get("zbl")
     if zbl is None:
         return
