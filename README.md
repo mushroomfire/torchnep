@@ -54,6 +54,9 @@ cd torchnep
 pip install .
 ```
 
+Optional extras: `torchnep[ase]` (ASE calculator), `torchnep[plot]` (figures: matplotlib, polars),
+`torchnep[all]` (everything).
+
 ---
 
 ## 📄 Training data (extended-XYZ)
@@ -398,48 +401,35 @@ predict_dataset_sharded("nep.txt", "huge.xyz", output_dir="results")
 
 ## 📈 Plotting
 
-`torchnep.plot.NEPPlotter` draws figures from the files a training run or `predict_dataset`
-writes (`loss.out`, `energy/force/virial/stress_train.out`, `*_test.out`), so nothing has to be
-recomputed. It needs matplotlib (`pip install torchnep[plot]`) and uses Arial when the font is
-installed, matplotlib's default otherwise. Every method returns the `Figure`; with `out=` it is
-also saved. Axes always span the full data range, so outliers stay visible.
+`torchnep.plot.NEPPlotter` draws figures straight from the files a run writes (`loss.out`,
+`energy/force/virial/stress_train.out`, `*_test.out`; `predict_dataset` writes the same files).
+Needs matplotlib: `pip install torchnep[plot]`.
 
 ```python
 from torchnep.plot import NEPPlotter
 
-p = NEPPlotter()                       # font="Arial", dpi=150, cmap="viridis", max_points=300_000
-p.loss("run/loss.out", out="loss.png")                          # loss + RMSE E/F/V, train and test
-p.parity("run", split="train", kind="density", out="parity.png")  # E/F/V parity, "scatter" or "density"
-p.parity_train_test("run", out="parity_tt.png")                 # train row + test row
-p.dashboard("run", out="dashboard.png")                          # loss curves + train/test parity in one figure
-p.errors("run", xyz="train.xyz", out="errors.png")              # error histograms, |ΔF| vs |F|, per element / config_type
-p.prediction("pred", xyz="test.xyz", out="pred.png",             # predict_dataset view: parity + error distributions
-             shift_energy="element")                             # + per-element / per-config_type breakdown
+p = NEPPlotter()
+p.dashboard("run", out="dashboard.png")                 # loss curves + E/F/stress parity, train and valid
+p.loss("run", out="loss.png")                            # the loss panel alone
+p.parity("run", out="parity.png")                        # E/F/stress parity plots
+p.parity("run", kind="density", margins=True,            # hexbin density + error distributions
+         out="parity_density.png")
+p.parity("pred", shift_energy="element", xyz="test.xyz", # data of another DFT reference: remove
+         out="pred.png")                                 # the per-element energy offset first
 ```
 
-`shift_energy="mean"` / `"element"` removes a constant or a per-element energy offset before
-plotting — for data computed with another DFT setup, whose energies differ from the model's
-reference by a per-element constant (`"element"` needs the `xyz` for the element counts).
+`NEPPlotter(font, fontsize, dpi, colors, cmaps, panel_labels, label_format, frame, rc)` sets the
+style for every figure; each method takes `out` (save) and returns the `Figure`.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_loss.png" alt="loss curves" width="95%">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_dashboard.png" alt="training dashboard" width="60%">
   <br>
-  <sub><em><code>p.loss()</code> — loss and train/test RMSEs of a two-stage run.</em></sub>
+  <sub><em><code>p.dashboard("run")</code></em></sub>
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_density.png" alt="parity plots" width="95%">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_margins_density.png" alt="parity plots with error distributions" width="95%">
   <br>
-  <sub><em><code>p.parity(kind="density")</code> on a literature data set with <code>shift_energy="element"</code>.</em></sub>
-</p>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_prediction.png" alt="prediction view" width="80%">
-  <br>
-  <sub><em><code>p.prediction(xyz=...)</code> — parity, error distributions and the per-element force RMSE.</em></sub>
-</p>
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_dashboard.png" alt="training dashboard" width="80%">
-  <br>
-  <sub><em><code>p.dashboard()</code> of a small demo run (24 frames): loss curves plus train and test parity.</em></sub>
+  <sub><em><code>p.parity("run", kind="density", margins=True)</code></em></sub>
 </p>
 
 ---

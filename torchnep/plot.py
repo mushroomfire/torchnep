@@ -46,14 +46,38 @@ _NO_LABEL = -1e5          # reference virial / stress below this: no label (GPUM
 # ---------------------------------------------------------------------------
 
 def _read_table(path):
-    """Whitespace table -> float64 (rows, cols); '#' lines ignored. pandas
-    when available (C parser, ~10x faster on the big force files)."""
+    """Whitespace table -> float64 (rows, cols); '#' lines ignored. polars
+    when installed (multi-threaded, ~20x faster than numpy on the big force
+    files), else numpy."""
     try:
-        import pandas as pd
-        return pd.read_csv(path, sep=r"\s+", header=None, comment="#",
-                           dtype=np.float64).to_numpy()
+        import polars as pl
     except ImportError:
         return np.loadtxt(path, comments="#", ndmin=2)
+    with open(path) as fh:
+        first = fh.readline()
+        while first.startswith("#"):
+            first = fh.readline()
+    ncol = len(first.split())
+    try:
+        df = pl.read_csv(path, separator=" ", has_header=False, comment_prefix="#",
+                         schema_overrides=[pl.Float64] * ncol, truncate_ragged_lines=True,
+                         infer_schema_length=0)
+        t = df.to_numpy()
+        if t.shape[1] == ncol and not np.isnan(t).any():
+            return t
+    except Exception:
+        pass
+    # multiple spaces between columns (GPUMD's fixed-width output): normalise
+    # the whitespace first, then let polars parse the single-space table
+    import io
+    buf = io.StringIO()
+    with open(path) as fh:
+        for line in fh:
+            if not line.startswith("#"):
+                buf.write(" ".join(line.split()) + "\n")
+    buf.seek(0)
+    return pl.read_csv(buf, separator=" ", has_header=False,
+                       schema_overrides=[pl.Float64] * ncol).to_numpy()
 
 
 def read_loss(path="loss.out"):
@@ -87,6 +111,32 @@ def read_outputs(path=".", split="train"):
     if not out:
         raise FileNotFoundError(f"no *_{split}.out files in {path}")
     return out
+
+
+def stage2_epoch(path="."):
+    """Epoch at which stage 2 started, from ``output.log`` ("Stage 2 from
+    epoch N") or ``nep.in`` (``start_stage2``, else half of ``epoch`` when
+    ``stage2 1``) in ``path``; None when not found / no stage 2."""
+    log = os.path.join(path, "output.log")
+    if os.path.exists(log):
+        with open(log, errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"Stage 2 from epoch (\d+)", line)
+                if m:
+                    return int(m.group(1))
+    nep_in = os.path.join(path, "nep.in")
+    if os.path.exists(nep_in):
+        kv = {}
+        for line in open(nep_in):
+            parts = line.split("#")[0].split()
+            if len(parts) >= 2:
+                kv[parts[0].lower()] = parts[1]
+        if kv.get("stage2", "0") not in ("0", "false"):
+            if "start_stage2" in kv:
+                return int(float(kv["start_stage2"]))
+            if "epoch" in kv:
+                return int(float(kv["epoch"]) * 0.5)
+    return None
 
 
 def frame_meta(xyz):
@@ -155,12 +205,48 @@ def shift_energy(d, mode=None, meta=None):
     raise ValueError(f"shift_energy: {mode!r} (None, 'mean' or 'element')")
 
 
+def _dark(cmap_name):
+    """A dark colour of a sequential colormap (for text over its hexbins)."""
+    import matplotlib
+    return matplotlib.colormaps[cmap_name](0.85)
+
+
+def _kde(x, grid, n_max=100_000, rng=np.random.default_rng(0)):
+    """Gaussian kernel density of ``x`` on ``grid`` (Silverman bandwidth),
+    on a random subsample of at most ``n_max`` points."""
+    x = np.asarray(x, float).ravel()
+    if len(x) > n_max:
+        x = x[rng.choice(len(x), n_max, replace=False)]
+    sd = float(x.std())
+    if sd <= 0:
+        return np.zeros_like(grid)
+    h = 1.06 * sd * len(x) ** (-0.2)
+    out = np.zeros_like(grid)
+    for i in range(0, len(x), 20_000):
+        z = (grid[:, None] - x[None, i:i + 20_000]) / h
+        out += np.exp(-0.5 * z * z).sum(1)
+    return out / (len(x) * h * np.sqrt(2 * np.pi))
+
+
 _QTY = {   # key: (title, unit, error unit, error scale)
     "E": ("Energy", "eV/atom", "meV/atom", 1e3),
     "F": ("Force", "eV/Å", "meV/Å", 1e3),
     "V": ("Virial", "eV/atom", "meV/atom", 1e3),
     "S": ("Stress", "GPa", "GPa", 1.0),
 }
+
+
+# default palette (the paper template): pink / blue / yellow + two greys
+PALETTE = {"pink": "#FE218B", "blue": "#21B0FE", "yellow": "#FED700",
+           "grey": "#7f7f7f", "lightgrey": "#bfbfbf"}
+DEFAULT_COLORS = {"train": PALETTE["blue"], "valid": PALETTE["pink"],
+                  "energy": PALETTE["blue"], "force": PALETTE["pink"], "virial": PALETTE["yellow"],
+                  "stress": PALETTE["grey"]}
+DEFAULT_CMAPS = {"train": "Blues", "valid": "Reds"}
+
+
+def _cm(*v):
+    return tuple(x / 2.54 for x in v)
 
 
 class NEPPlotter:
@@ -170,37 +256,87 @@ class NEPPlotter:
     ----------
     font : str
         Font family (default ``"Arial"``); matplotlib's default when absent.
-    fontsize, dpi : int
-    cmap : str
-        Colormap of the density (hexbin) panels.
+    fontsize : float
+        Base font size in points (labels; ticks and legends one point smaller).
+    dpi : int
+        Figure / saved-file resolution.
+    cmaps : dict
+        Colormaps of the density (hexbin) panels per set, overrides of
+        ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
-    colors : (train, test) line / marker colours.
+    colors : dict
+        Overrides of ``DEFAULT_COLORS`` — keys ``train``, ``valid`` (parity
+        sets) and ``energy``, ``force``, ``virial``, ``stress`` (curves).
+    panel_labels : str or sequence
+        Labels of the panels of multi-panel figures (default ``"abcd..."``);
+        ``label_format`` wraps them (``"{}"`` -> ``a``, ``"({})"`` -> ``(a)``),
+        ``label_weight`` is their font weight. ``panel_labels=None`` for none.
+    frame : bool
+        ``False`` (default): only the left and bottom spines; ``True``: the
+        full box with ticks on all four sides.
+    rc : dict
+        Extra matplotlib rcParams applied on top of the built-in style.
     """
 
-    def __init__(self, font="Arial", fontsize=10, dpi=150, cmap="viridis",
-                 max_points=300_000, colors=("#1f77b4", "#d62728")):
+    def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
+                 max_points=300_000, colors=None, panel_labels="abcdefghijkl",
+                 label_format="{}", label_weight="bold", frame=False, rc=None):
         import matplotlib  # noqa: F401  (fail early with a clear message)
         fam = _font_family(font)
-        self.rc = {"font.size": fontsize, "axes.labelsize": fontsize,
-                   "axes.titlesize": fontsize + 1, "legend.fontsize": fontsize - 1,
-                   "xtick.labelsize": fontsize - 1, "ytick.labelsize": fontsize - 1,
-                   "figure.dpi": dpi, "savefig.dpi": dpi, "axes.linewidth": 0.8,
-                   "xtick.direction": "in", "ytick.direction": "in",
-                   "legend.frameon": False, "mathtext.default": "regular"}
-        if fam:
-            self.rc["font.family"] = fam
-        self.cmap = cmap
+        fs = float(fontsize)
+        self.rc = {
+            "font.family": fam or "sans-serif",
+            "font.size": fs, "axes.labelsize": fs, "axes.titlesize": fs,
+            "legend.fontsize": fs - 1, "xtick.labelsize": fs, "ytick.labelsize": fs,
+            "axes.spines.right": bool(frame), "axes.spines.top": bool(frame),
+            "xtick.top": bool(frame), "ytick.right": bool(frame),
+            "xtick.major.size": 2.5, "ytick.major.size": 2.5, "xtick.major.width": 0.6,
+            "ytick.major.width": 0.6, "xtick.minor.size": 1.5, "ytick.minor.size": 1.5,
+            "xtick.minor.width": 0.5, "ytick.minor.width": 0.5, "xtick.major.pad": 1.5,
+            "ytick.major.pad": 1.5, "axes.labelpad": 1.5,
+            "axes.linewidth": 0.6, "lines.linewidth": 1.0, "lines.markersize": 3,
+            "legend.frameon": False, "legend.handlelength": 1.4, "legend.handletextpad": 0.4,
+            "legend.labelspacing": 0.2, "legend.borderaxespad": 0.2,
+            "mathtext.fontset": "stix", "axes.formatter.use_mathtext": True,
+            "figure.dpi": dpi, "savefig.dpi": dpi,
+        }
+        self.rc.update(rc or {})
+        self.colors = dict(DEFAULT_COLORS, **(colors or {}))
+        self.cmaps = dict(DEFAULT_CMAPS, **(cmaps or {}))
+        self.cmap = self.cmaps["train"]
         self.max_points = int(max_points)
-        self.c_train, self.c_test = colors
+        self.panel_labels = list(panel_labels) if panel_labels else []
+        self.label_format = label_format
+        self.label_weight = label_weight
         self._rng = np.random.default_rng(0)
+
+    # kept for the simpler figures below
+    @property
+    def c_train(self):
+        return self.colors["train"]
+
+    @property
+    def c_test(self):
+        return self.colors["valid"]
+
+    def _label_panels(self, axes, dx=-22, dy=1):
+        """Panel labels at the top-left corner outside every axes, offset in
+        points so they line up whatever the panel's axis type."""
+        for ax, lab in zip(axes, self.panel_labels):
+            ax.annotate(self.label_format.format(lab), xy=(0, 1), xycoords="axes fraction",
+                        xytext=(dx, dy), textcoords="offset points", ha="left", va="bottom",
+                        fontsize=self.rc["font.size"] + 3, fontweight=self.label_weight)
 
     # ---- generic panels ---------------------------------------------------
     def _finish(self, fig, out):
+        """Save (inside the style context: fonts resolve at draw time) and
+        close when ``out`` is given; always return the figure."""
         import matplotlib.pyplot as plt
         if out:
-            fig.savefig(out, bbox_inches="tight")
+            with plt.rc_context(self.rc):
+                fig.savefig(out, bbox_inches="tight")
             plt.close(fig)
         return fig
 
@@ -322,84 +458,152 @@ class NEPPlotter:
                 "Energy RMSE per config_type (frame count)", self.c_test))
         return panels
 
-    def _loss_panels(self, fig, gs_row, d):
-        for i, (k, kt, name, unit) in enumerate(
-                [("loss", None, "loss", ""), ("e", "e_test", "RMSE E", "eV/atom"),
-                 ("f", "f_test", "RMSE F", "eV/Å"), ("v", "v_test", "RMSE V", "eV/atom")]):
-            ax = fig.add_subplot(gs_row[i])
-            if k == "loss":
-                ax.plot(d["epoch"], d["loss"], color=self.c_train, lw=1.2,
-                        label="valid" if "e_test" in d else "train")
-                ax.set_ylabel("loss")
-            else:
-                ax.plot(d["epoch"], d[k], color=self.c_train, lw=1.2, label="train")
-                if kt in d:
-                    ax.plot(d["epoch"], d[kt], color=self.c_test, lw=1.2, ls="--", label="test")
-                ax.set_ylabel(f"{name} ({unit})")
-                last = f"{d[k][-1]:.4g}" + (f" / {d[kt][-1]:.4g}" if kt in d else "")
-                ax.set_title(f"{name}: last {last}", fontsize=self.rc["font.size"])
-            ax.set_yscale("log")
-            ax.set_xlabel("epoch")
-            ax.legend(loc="upper right")
-
-    # ---- figures ----------------------------------------------------------
-    def loss(self, path="loss.out", out=None):
-        """Training curves from ``loss.out``: the loss and the E / F / V
-        RMSEs per epoch, train (solid) and test (dashed) when present."""
+    def loss(self, path, out=None, stage2="auto", stress=False, figsize=None):
+        """Training curves from ``loss.out``: the E / F / V RMSEs against the
+        epoch on a log scale, training solid and validation faint (same
+        colour), a dashed line at the start of stage 2 — the panel of the
+        dashboard on its own. ``stress=True`` adds the stress RMSE.
+        ``path``: the run directory or the loss.out file. ``figsize`` in cm."""
         import matplotlib.pyplot as plt
+        run_dir = path if os.path.isdir(path) else os.path.dirname(os.path.abspath(path))
         d = read_loss(path)
+        if stage2 == "auto":
+            stage2 = stage2_epoch(run_dir)
+        keys = [("e", "e_test", "energy", "E", "eV/atom"), ("f", "f_test", "force", "F", "eV/Å"),
+                ("v", "v_test", "virial", "V", "eV/atom")]
+        if stress:
+            keys.append(("s", "s_test", "stress", "S", "GPa"))
         with plt.rc_context(self.rc):
-            fig = plt.figure(figsize=(13.6, 3.1))
-            self._loss_panels(fig, fig.add_gridspec(1, 4)[0, :].subgridspec(1, 4), d)
-            fig.tight_layout()
+            fig, ax = plt.subplots(figsize=_cm(*(figsize or (6.5, 5.6))), constrained_layout=True)
+            self._rmse_curves(ax, d, stage2, keys)
         return self._finish(fig, out)
 
-    def parity(self, path=".", split="train", kind="scatter", out=None,
-               quantities=("E", "F", "V"), title=None, shift_energy=None, xyz=None):
-        """Parity plots (DFT vs NEP) of the ``*_<split>.out`` files in
-        ``path``. ``kind``: ``"scatter"`` or ``"density"`` (log-count hexbin).
-        ``quantities``: any of ``E F V S``. ``shift_energy``: None, ``"mean"``
-        or ``"element"`` (needs ``xyz``) for data of another DFT reference."""
+    def _block(self, fig, box, sets, q, kind, margins):
+        """One quantity: square parity panel at ``box = (x0, y0, L)`` (cm) and,
+        with ``margins``, the error against the DFT value on top and the
+        error density on the right. Returns (main axes, top axes or None,
+        hexbin handles)."""
+        W, H = fig.get_size_inches() * 2.54
+        x0, y0, L = box
+        gap, strip = 0.12, 0.3 * L
+
+        def add(x, y, w, h):
+            return fig.add_axes([x / W, y / H, w / W, h / H])
+        ax = add(x0, y0, L, L)
+        handles = self._parity_overlay(ax, sets, q, kind)
+        if not margins:
+            return ax, None, handles
+        ax_top = add(x0, y0 + L + gap, L, strip)
+        ax_right = add(x0 + L + gap, y0, strip, L)
+        title, unit, _, _ = _QTY[q]
+        errs = []
+        for k, (label, ref, pred, sk) in enumerate(sets):
+            ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
+            err = pred - ref
+            errs.append((err, sk))
+            color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
+            if kind == "density":
+                ax_top.hexbin(ref, err, gridsize=(90, 22), mincnt=1, bins="log",
+                              cmap=self.cmaps[sk], rasterized=True, linewidths=0.1, zorder=2 + k)
+            else:
+                if len(ref) > self.max_points:
+                    sel = self._rng.choice(len(ref), self.max_points, replace=False)
+                    ref, err = ref[sel], err[sel]
+                ax_top.scatter(ref, err, s=2, alpha=0.5, color=color, edgecolors="none",
+                               rasterized=True, zorder=2 + k)
+        ax_top.axhline(0.0, color="grey", lw=0.7, ls="--", zorder=1)
+        ax_top.set_xlim(ax.get_xlim())
+        ax_top.set_ylabel("Error")               # same unit as the axes below
+        ax_top.tick_params(labelbottom=False)
+        if errs:
+            allerr = np.concatenate([e for e, _ in errs])
+            lo, hi = float(allerr.min()), float(allerr.max())
+            if hi - lo < 1e-12:
+                lo, hi = lo - 0.5, hi + 0.5
+            lo, hi = lo - 0.04 * (hi - lo), hi + 0.04 * (hi - lo)
+            grid = np.linspace(lo, hi, 300)
+            for err, sk in errs:
+                color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
+                dens = _kde(err, grid)
+                ax_right.fill_betweenx(grid, 0, dens, color=color, alpha=0.35, lw=0)
+                ax_right.plot(dens, grid, color=color, lw=0.9)
+            ax_right.axhline(0.0, color="grey", lw=0.7, ls="--", zorder=1)
+            ax_top.set_ylim(lo, hi)
+            ax_right.set_ylim(lo, hi)
+            ax_right.set_xlim(0, None)
+        ax_right.set_xlabel("Density")
+        ax_right.set_xticks([])
+        ax_right.tick_params(labelleft=False)
+        return ax, ax_top, handles
+
+    def parity(self, path, kind="scatter", margins=False, out=None, quantities=None,
+               size=4.0, shift_energy=None, xyz=None, title=None):
+        """Parity plots of the run in ``path``: energy, force and stress (the
+        last only with stress labels) with training and validation overlaid
+        and R^2 / RMSE / MAE per set. ``kind="density"``: log-count hexbins
+        (training Blues, validation Reds) with a small horizontal colorbar
+        under every panel. ``margins=True`` adds the error distribution
+        around each panel: NEP − DFT against the DFT value on top, a kernel
+        density estimate of the error on the right. ``quantities`` overrides
+        the panels (any of ``E F V S``); ``shift_energy`` (``"mean"`` /
+        ``"element"``, needs ``xyz``) removes a reference offset from the
+        predicted energies; ``size`` is the side of one panel in cm."""
         import matplotlib.pyplot as plt
-        d = read_outputs(path, split)
-        qs = [q for q in quantities if q in d]
-        meta = frame_meta(xyz) if xyz else None
-        e_pred = shift_energy_fn(d, shift_energy, meta) if "E" in d else None
+        from matplotlib.ticker import LogLocator, NullFormatter
+        splits = [sp for sp in ("train", "test")
+                  if os.path.exists(os.path.join(path, f"energy_{sp}.out"))]
+        if not splits:
+            raise FileNotFoundError(f"no energy_train.out / energy_test.out in {path}")
+        data = {sp: read_outputs(path, sp) for sp in splits}
+        if shift_energy:
+            meta = frame_meta(xyz) if xyz else None
+            for sp in splits:
+                data[sp]["E"]["pred"] = shift_energy_fn(data[sp], shift_energy, meta)
+        if quantities is None:
+            has_s = all("S" in data[sp] and data[sp]["S"]["mask"].any() for sp in splits)
+            quantities = ["E", "F"] + (["S"] if has_s else [])
+        qs = [q for q in quantities if any(q in data[sp] for sp in splits)]
+        n = len(qs)
+        L = float(size)
+        left, top, gap = 1.25, 0.55, 0.12                  # margins in cm
+        strip = 0.3 * L if margins else 0.0
+        right = 0.35 + (strip + gap if margins else 0.0)
+        cbar_h = 0.75 if kind == "density" else 0.0         # bar + its label
+        bottom = 0.95 + cbar_h
+        block = left + L + right
+        W = n * block
+        H = bottom + L + (strip + gap if margins else 0.0) + top + (0.4 if title else 0.0)
         with plt.rc_context(self.rc):
-            fig, axes = plt.subplots(1, len(qs), figsize=(3.9 * len(qs), 3.7))
-            axes = np.atleast_1d(axes)
-            color = self.c_test if split == "test" else self.c_train
-            for ax, q in zip(axes, qs):
-                m = d[q]["mask"]
-                pred = e_pred if q == "E" else d[q]["pred"]
-                self._parity_panel(ax, d[q]["ref"][m], pred[m], q, kind, color,
-                                   note=_shift_note(q, shift_energy))
+            fig = plt.figure(figsize=_cm(W, H))
+            mains, tops, per_block = [], [], []
+            for i, q in enumerate(qs):
+                ax, ax_top, h = self._block(fig, (i * block + left, bottom, L),
+                                            self._sets(data, q), q, kind, margins)
+                mains.append(ax)
+                tops.append(ax_top)
+                per_block.append(h)
+            self._label_panels(tops if margins else mains,
+                               dx=-int(left * 72 / 2.54) + 2, dy=2)
+            if kind == "density":
+                for i, h in enumerate(per_block):
+                    keys = [k for k in ("train", "valid") if k in h]
+                    bw = (L - 0.3 * (len(keys) - 1)) / max(1, len(keys))
+                    for j, k in enumerate(keys):
+                        x = (i * block + left + j * (bw + 0.3)) / W
+                        cax = fig.add_axes([x, 0.5 / H, bw / W, 0.14 / H])
+                        cb = fig.colorbar(h[k], cax=cax, orientation="horizontal")
+                        cb.set_label("Training count" if k == "train" else "Validation count",
+                                     labelpad=1)
+                        cb.ax.xaxis.set_major_locator(LogLocator(base=10, numticks=4))
+                        cb.ax.xaxis.set_minor_locator(LogLocator(base=10, subs="auto", numticks=6))
+                        cb.ax.xaxis.set_minor_formatter(NullFormatter())
+                        cb.ax.tick_params(length=1.5, pad=1, labelsize=self.rc["font.size"] - 1)
+                        cb.ax.tick_params(which="minor", length=1.0)
             if title:
-                fig.suptitle(title, fontsize=self.rc["font.size"] + 1)
-            fig.tight_layout()
+                fig.suptitle(title)
         return self._finish(fig, out)
 
-    def parity_train_test(self, path=".", kind="scatter", out=None,
-                          quantities=("E", "F", "V")):
-        """Train (top row) and test (bottom row) parity plots."""
-        import matplotlib.pyplot as plt
-        splits = [s for s in ("train", "test")
-                  if os.path.exists(os.path.join(path, f"energy_{s}.out"))]
-        data = {s: read_outputs(path, s) for s in splits}
-        qs = [q for q in quantities if all(q in data[s] for s in splits)]
-        with plt.rc_context(self.rc):
-            fig, axes = plt.subplots(len(splits), len(qs),
-                                     figsize=(3.9 * len(qs), 3.7 * len(splits)), squeeze=False)
-            for i, s in enumerate(splits):
-                color = self.c_test if s == "test" else self.c_train
-                for ax, q in zip(axes[i], qs):
-                    m = data[s][q]["mask"]
-                    self._parity_panel(ax, data[s][q]["ref"][m], data[s][q]["pred"][m],
-                                       q, kind, color, label=s)
-            fig.tight_layout()
-        return self._finish(fig, out)
-
-    def errors(self, path=".", split="train", out=None, xyz=None,
+    def errors(self, path, split="train", out=None, xyz=None,
                quantities=("E", "F", "V"), shift_energy=None):
         """Error distributions of the ``*_<split>.out`` files: histograms of
         NEP − DFT for E / F / V, the force error against the force magnitude
@@ -431,63 +635,130 @@ class NEPPlotter:
             fig.tight_layout()
         return self._finish(fig, out)
 
-    def prediction(self, path=".", split="train", kind="density", out=None, xyz=None,
-                   quantities=("E", "F", "V"), shift_energy=None, title=None):
-        """The ``predict_dataset`` view: parity plots (top) and error
-        distributions (middle) of the outputs in ``path``; with ``xyz`` also
-        the per-element / per-config_type breakdown (bottom)."""
-        import matplotlib.pyplot as plt
-        d = read_outputs(path, split)
-        qs = [q for q in quantities if q in d]
-        meta = frame_meta(xyz) if xyz else None
-        e_pred = shift_energy_fn(d, shift_energy, meta) if "E" in d else None
-        extra = self._breakdown_panels(d, meta, e_pred) if meta else []
-        n_cols = max(len(qs), 2)
-        n_rows = 2 + (1 if extra else 0)
-        with plt.rc_context(self.rc):
-            fig = plt.figure(figsize=(3.9 * n_cols, 3.6 * n_rows))
-            gs = fig.add_gridspec(n_rows, n_cols)
-            for i, q in enumerate(qs):
-                m = d[q]["mask"]
-                pred = e_pred if q == "E" else d[q]["pred"]
-                self._parity_panel(fig.add_subplot(gs[0, i]), d[q]["ref"][m], pred[m], q, kind,
-                                   note=_shift_note(q, shift_energy))
-                self._hist_panel(fig.add_subplot(gs[1, i]), pred[m] - d[q]["ref"][m], q)
-            if extra:
-                bounds = np.linspace(0, n_cols, len(extra) + 1).astype(int)
-                for k, draw in enumerate(extra):
-                    draw(fig.add_subplot(gs[2, bounds[k]:bounds[k + 1]]))
-            if title:
-                fig.suptitle(title, fontsize=self.rc["font.size"] + 1)
-            fig.tight_layout()
-        return self._finish(fig, out)
+    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True):
+        """Training and validation points of one quantity in one panel (full
+        range, diagonal). ``sets``: ``(label, ref, pred, set_key)`` tuples,
+        ``set_key`` in {"train", "valid"}. ``kind="density"`` draws every set
+        as a log-count hexbin with the set's colormap. Each set is annotated
+        with R^2 / RMSE / MAE in its own corner (train top-left, valid
+        bottom-right: off the diagonal, so the text never covers the data).
+        Returns the hexbin handles (density) for colorbars."""
+        title, unit, eunit, scale = _QTY[key]
+        allv = np.concatenate([np.concatenate([np.ravel(r), np.ravel(p)]) for _, r, p, _ in sets])
+        lo, hi = float(allv.min()), float(allv.max())
+        pad = 0.04 * (hi - lo) + 1e-9
+        lo, hi = lo - pad, hi + pad
+        corners = {"train": dict(x=0.03, y=0.97, ha="left", va="top"),
+                   "valid": dict(x=0.97, y=0.03, ha="right", va="bottom")}
+        handles = {}
+        for k, (label, ref, pred, sk) in enumerate(sets):
+            ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
+            if len(ref) == 0:
+                continue
+            color = self.colors[sk]
+            if kind == "density":
+                handles[sk] = ax.hexbin(ref, pred, gridsize=110, extent=(lo, hi, lo, hi), mincnt=1,
+                                        bins="log", cmap=self.cmaps[sk], rasterized=True,
+                                        linewidths=0.1, zorder=2 + k)
+            else:
+                if len(ref) > self.max_points:
+                    sel = self._rng.choice(len(ref), self.max_points, replace=False)
+                    r, pp = ref[sel], pred[sel]
+                else:
+                    r, pp = ref, pred
+                ax.scatter(r, pp, s=3, alpha=0.6, color=color, edgecolors="none",
+                           rasterized=True, label=label, zorder=2 + k)
+            if annotate:
+                ss_res = float(np.sum((pred - ref) ** 2))
+                ss_tot = float(np.sum((ref - ref.mean()) ** 2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                c = corners[sk]
+                fmt = ".2f" if key == "S" else ".1f"
+                tcolor = color if kind != "density" else _dark(self.cmaps[sk])
+                ax.text(c["x"], c["y"],
+                        f"{label}\n$R^2$ = {r2:.4f}\nRMSE = {_rmse(ref, pred) * scale:{fmt}} {eunit}\n"
+                        f"MAE = {_mae(ref, pred) * scale:{fmt}} {eunit}",
+                        transform=ax.transAxes, ha=c["ha"], va=c["va"], color=tcolor,
+                        fontsize=self.rc["font.size"], linespacing=1.3, zorder=10)
+        ax.plot([lo, hi], [lo, hi], "--", color="grey", lw=0.8, zorder=1)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(f"DFT {title.lower()} ({unit})")
+        ax.set_ylabel(f"NEP {title.lower()} ({unit})")
+        return handles
 
-    def dashboard(self, path=".", kind="scatter", out=None, quantities=("E", "F", "V"),
-                  title=None):
-        """One figure per training run: the loss curves (top row) and the
-        train / test parity plots (one row each) from ``path``."""
+    def _sets(self, data, q):
+        """``(label, ref, pred, set_key)`` for the splits that carry ``q``."""
+        out = []
+        for split, sk, label in (("train", "train", "Training"), ("test", "valid", "Validation")):
+            if split in data and q in data[split]:
+                m = data[split][q]["mask"]
+                if m.any():
+                    out.append((label, data[split][q]["ref"][m], data[split][q]["pred"][m], sk))
+        return out
+
+    def _rmse_curves(self, ax, d, stage2=None, keys=None):
+        """Training (solid) and validation (same colour, alpha 0.5) RMSE of
+        E / F / V against the epoch on a log scale; a dashed line marks the
+        start of stage 2."""
+        tr, va = [], []
+        keys = keys or [("e", "e_test", "energy", "E", ""), ("f", "f_test", "force", "F", ""),
+                        ("v", "v_test", "virial", "V", "")]
+        for k, kt, name, short, _unit in keys:
+            if k not in d:
+                continue
+            color = self.colors[name]
+            tr.append(ax.plot(d["epoch"], d[k], color=color, label=f"Training-{short}")[0])
+            if kt in d:
+                va.append(ax.plot(d["epoch"], d[kt], color=color, alpha=0.5,
+                                  label=f"Validation-{short}")[0])
+        if stage2 is not None:
+            ax.axvline(stage2, color="0.4", lw=0.7, ls="--")
+        ax.set_yscale("log")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        handles = tr + va
+        leg = ax.legend(handles, [h.get_label() for h in handles], loc="upper right",
+                        ncol=2 if va else 1, columnspacing=0.8, frameon=True,
+                        facecolor="white", edgecolor="none", framealpha=1.0,
+                        borderpad=0.3)
+        leg.set_zorder(20)                       # above the stage-2 line
+
+    def dashboard(self, path, out=None, title=None, stage2="auto", figsize=None):
+        """One figure per training run: (a) the training / validation RMSE
+        curves of E, F, V from ``loss.out`` and (b)(c)(d) the energy / force /
+        stress parity plots (scatter) with both sets overlaid — 2 x 2 panels
+        of equal size, or one row of three when the data carry no stress
+        labels. ``stage2``: epoch where stage 2 started (dashed line);
+        ``"auto"`` reads it from ``output.log`` / ``nep.in`` in ``path``,
+        None for none. ``figsize`` in cm."""
         import matplotlib.pyplot as plt
         d = read_loss(os.path.join(path, "loss.out"))
+        if stage2 == "auto":
+            stage2 = stage2_epoch(path)
         splits = [s for s in ("train", "test")
-                  if os.path.exists(os.path.join(path, f"energy_{s}.out"))]
+                 if os.path.exists(os.path.join(path, f"energy_{s}.out"))]
         data = {s: read_outputs(path, s) for s in splits}
-        qs = [q for q in quantities if all(q in data[s] for s in splits)] if splits else []
-        n_cols = max(4, len(qs))
+        has_s = bool(splits) and all("S" in data[s] and data[s]["S"]["mask"].any() for s in splits)
+        qs = ["E", "F"] + (["S"] if has_s else [])
         with plt.rc_context(self.rc):
-            fig = plt.figure(figsize=(3.6 * n_cols, 3.3 * (1 + len(splits))))
-            gs = fig.add_gridspec(1 + len(splits), n_cols)
-            self._loss_panels(fig, gs[0, :4].subgridspec(1, 4), d)
-            for r, s in enumerate(splits, start=1):
-                color = self.c_test if s == "test" else self.c_train
-                for i, q in enumerate(qs):
-                    m = data[s][q]["mask"]
-                    self._parity_panel(fig.add_subplot(gs[r, i]), data[s][q]["ref"][m],
-                                       data[s][q]["pred"][m], q, kind, color, label=s)
-            fig.suptitle(title or os.path.basename(os.path.abspath(path)),
-                         fontsize=self.rc["font.size"] + 1)
-            fig.tight_layout()
+            if has_s:
+                fig, axes = plt.subplots(2, 2, figsize=_cm(*(figsize or (12, 11.5))),
+                                         constrained_layout=True)
+            else:
+                fig, axes = plt.subplots(1, 3, figsize=_cm(*(figsize or (17, 5.6))),
+                                         constrained_layout=True)
+            fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.04, hspace=0.04)
+            axes = axes.ravel()
+            self._rmse_curves(axes[0], d, stage2)
+            axes[0].set_box_aspect(1)                  # same square as the parity panels
+            for ax, q in zip(axes[1:], qs):
+                self._parity_overlay(ax, self._sets(data, q), q, "scatter")
+            self._label_panels(axes)
+            if title:
+                fig.suptitle(title)
         return self._finish(fig, out)
-
 
 def _shift_note(q, mode):
     return None if (q != "E" or mode is None) else f"shifted ({mode})"
