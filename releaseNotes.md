@@ -1,7 +1,10 @@
 # Release Notes
 
-## 1.0.4a1
+## 1.0.4
 
+- **Per-species cutoffs** (#9): `cutoff rR1 rA1 rR2 rA2 ...` in nep.in gives
+  each element its own radial/angular cutoff (an element pair uses the mean of
+  the two), as in GPUMD; written to `nep.txt` in GPUMD's format.
 - **Bug fix** (#8): with `use_autograd_forces=True` and `use_compile=True`, a
   flexible ZBL table (`zbl zbl.in`) was ignored and the universal ZBL
   coefficients were used instead. ZBL tests now cover autograd / analytical
