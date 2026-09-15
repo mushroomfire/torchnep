@@ -14,7 +14,7 @@
 """Cutoff rules enforced on nep.in and on every NEPModel: angular >= 3 A
 and <= radial per species, radial <= 100 A, ZBL outer in [1, 3] A and <=
 the smallest angular cutoff (ZBL runs on the angular neighbor list) — for
-the universal `zbl` value and every zbl.in row — and typewise factor >= 0.5."""
+the universal `zbl` value and every zbl.in row — and typewise factor >= 0.5 (required)."""
 import re
 
 import pytest
@@ -40,7 +40,7 @@ def _zbl_in(tmp_path, rc_outer, name="zbl.in"):
 @pytest.mark.parametrize("lines", [
     "cutoff 6 4\nzbl 2.5\n",
     "cutoff 6 4 5 3.5 4.5 3\nzbl 3\n",        # ZBL equal to the smallest angular cutoff: allowed
-    "cutoff 6 4\nzbl 3\nuse_typewise_cutoff_zbl\n",   # factor defaults to 0.7
+    "cutoff 6 4\nzbl 3\nuse_typewise_cutoff_zbl 0.7\n",
     "cutoff 3 3\nzbl 1\n",
     "cutoff 6 4\n",                            # no ZBL at all
 ])
@@ -57,6 +57,7 @@ def test_valid_configs(tmp_path, lines):
     ("cutoff 6 4\nzbl 0.8\n", "ZBL outer cutoff 0.8 A outside"),
     ("cutoff 6 4\nzbl 3.5\n", "ZBL outer cutoff 3.5 A outside"),
     ("cutoff 6 4\nzbl 2.5\nuse_typewise_cutoff_zbl 0.4\n", "use_typewise_cutoff_zbl factor 0.4 is below 0.5"),
+    ("cutoff 6 4\nzbl 2.5\nuse_typewise_cutoff_zbl\n", "use_typewise_cutoff_zbl needs the factor"),
 ])
 def test_invalid_configs(tmp_path, lines, msg):
     with pytest.raises(ValueError, match=re.escape(msg)):

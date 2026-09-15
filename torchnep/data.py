@@ -339,7 +339,8 @@ def read_zbl_in(filename: str, num_types: int) -> List[List[float]]:
 # Cutoff rules (checked for nep.in and for every NEPModel): angular cutoff
 # >= 3 A and <= radial cutoff (per species), radial cutoff <= 100 A, ZBL
 # outer cutoff within [1, 3] A (GPUMD's documented range; the universal
-# value and every zbl.in row), typewise ZBL factor >= 0.5. The ZBL term is
+# value and every zbl.in row), typewise ZBL factor >= 0.5 (given explicitly).
+# The ZBL term is
 # evaluated on the ANGULAR neighbor list, so the ZBL outer cutoff must not
 # exceed the smallest angular cutoff either (implied by the two limits, but
 # checked explicitly): pairs beyond that list would silently lose their ZBL.
@@ -432,8 +433,10 @@ def parse_nep_in(filename: str) -> Dict:
                             os.path.dirname(os.path.abspath(filename)), zbl_path)
                     params["zbl_file"] = zbl_path
             elif key == "use_typewise_cutoff_zbl":
-                # GPUMD: optional factor, default 0.7
-                params["typewise_cutoff_zbl_factor"] = float(parts[1]) if len(parts) > 1 else 0.7
+                if len(parts) < 2:
+                    raise ValueError("nep.in: use_typewise_cutoff_zbl needs the factor "
+                                     "(e.g. 'use_typewise_cutoff_zbl 0.7')")
+                params["typewise_cutoff_zbl_factor"] = float(parts[1])
             elif key == "cutoff":
                 # "cutoff rR rA"                      -> one pair of cutoffs;
                 # "cutoff rR1 rA1 rR2 rA2 ... rRn rAn" -> per species (GPUMD):
