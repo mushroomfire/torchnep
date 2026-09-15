@@ -1,5 +1,13 @@
 # Release Notes
 
+## 1.0.5a2
+
+- **Cutoff rules** (#13), checked when nep.in is parsed and when a model is
+  built: angular cutoff >= 3 Å and <= radial cutoff per species, radial cutoff
+  <= 100 Å, ZBL outer cutoff (`zbl` and every `zbl.in` row) between 1 and 3 Å
+  (so ZBL always lies inside the angular neighbor list), and
+  `use_typewise_cutoff_zbl` requires its factor (>= 0.5).
+
 ## 1.0.5a1
 
 - **End-of-training prediction uses `nep_best.txt`**: the `*_train.out` /
