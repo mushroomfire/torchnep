@@ -536,16 +536,18 @@ class NEPPlotter:
         ax_right.tick_params(labelleft=False)
         return ax, ax_top, handles
 
-    def parity(self, path, kind="scatter", margins=False, out=None, quantities=None,
-               size=4.0, shift_energy=None, xyz=None, title=None):
+    def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
+               quantities=None, size=4.0, shift_energy=None, xyz=None, title=None):
         """Parity plots of the run in ``path``: energy, force and stress (the
         last only with stress labels) with training and validation overlaid
         and R^2 / RMSE / MAE per set. ``kind="density"``: log-count hexbins
         (training Blues, validation Reds) with a small horizontal colorbar
         under every panel. ``margins=True`` adds the error distribution
         around each panel: NEP − DFT against the DFT value on top, a kernel
-        density estimate of the error on the right. ``quantities`` overrides
-        the panels (any of ``E F V S``); ``shift_energy`` (``"mean"`` /
+        density estimate of the error on the right. ``virial=True`` shows the
+        virial (eV/atom) instead of the stress in the third panel;
+        ``quantities`` overrides the panels altogether (any of ``E F V S``);
+        ``shift_energy`` (``"mean"`` /
         ``"element"``, needs ``xyz``) removes a reference offset from the
         predicted energies; ``size`` is the side of one panel in cm."""
         import matplotlib.pyplot as plt
@@ -560,8 +562,9 @@ class NEPPlotter:
             for sp in splits:
                 data[sp]["E"]["pred"] = shift_energy_fn(data[sp], shift_energy, meta)
         if quantities is None:
-            has_s = all("S" in data[sp] and data[sp]["S"]["mask"].any() for sp in splits)
-            quantities = ["E", "F"] + (["S"] if has_s else [])
+            third = "V" if virial else "S"
+            has_3 = all(third in data[sp] and data[sp][third]["mask"].any() for sp in splits)
+            quantities = ["E", "F"] + ([third] if has_3 else [])
         qs = [q for q in quantities if any(q in data[sp] for sp in splits)]
         n = len(qs)
         L = float(size)
@@ -725,14 +728,15 @@ class NEPPlotter:
                         borderpad=0.3)
         leg.set_zorder(20)                       # above the stage-2 line
 
-    def dashboard(self, path, out=None, title=None, stage2="auto", figsize=None):
+    def dashboard(self, path, out=None, virial=False, title=None, stage2="auto", figsize=None):
         """One figure per training run: (a) the training / validation RMSE
         curves of E, F, V from ``loss.out`` and (b)(c)(d) the energy / force /
         stress parity plots (scatter) with both sets overlaid — 2 x 2 panels
         of equal size, or one row of three when the data carry no stress
-        labels. ``stage2``: epoch where stage 2 started (dashed line);
-        ``"auto"`` reads it from ``output.log`` / ``nep.in`` in ``path``,
-        None for none. ``figsize`` in cm."""
+        labels. ``virial=True``: the virial (eV/atom) instead of the stress.
+        ``stage2``: epoch where stage 2 started (dashed line); ``"auto"``
+        reads it from ``output.log`` / ``nep.in`` in ``path``, None for
+        none. ``figsize`` in cm."""
         import matplotlib.pyplot as plt
         d = read_loss(os.path.join(path, "loss.out"))
         if stage2 == "auto":
@@ -740,8 +744,10 @@ class NEPPlotter:
         splits = [s for s in ("train", "test")
                  if os.path.exists(os.path.join(path, f"energy_{s}.out"))]
         data = {s: read_outputs(path, s) for s in splits}
-        has_s = bool(splits) and all("S" in data[s] and data[s]["S"]["mask"].any() for s in splits)
-        qs = ["E", "F"] + (["S"] if has_s else [])
+        third = "V" if virial else "S"
+        has_s = bool(splits) and all(third in data[s] and data[s][third]["mask"].any()
+                                     for s in splits)
+        qs = ["E", "F"] + ([third] if has_s else [])
         with plt.rc_context(self.rc):
             if has_s:
                 fig, axes = plt.subplots(2, 2, figsize=_cm(*(figsize or (12, 11.5))),

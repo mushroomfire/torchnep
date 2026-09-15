@@ -97,5 +97,9 @@ def test_train_only_no_stress_and_options(tmp_path):
     fig = p.parity(tmp_path, out=tmp_path / "parity.png")
     assert len(fig.axes) == 2
     p.parity(tmp_path, margins=True, kind="density", out=tmp_path / "pred.png")
+    fig = p.dashboard(tmp_path, virial=True, out=tmp_path / "dash_v.png")
+    assert len([a for a in fig.axes if a.get_xlabel()]) == 4       # virial labels exist
+    fig = p.parity(tmp_path, virial=True, out=tmp_path / "parity_v.png")
+    assert len(fig.axes) == 3
     with pytest.raises(TypeError):
         p.dashboard()                                                # path is required
