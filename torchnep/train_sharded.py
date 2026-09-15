@@ -1684,12 +1684,23 @@ def train_nep_sharded(
             _log(f"\nDone. Best loss: {best_loss:.6e}")
         _log(f"Training time: {int(h):02d}:{int(m_):02d}:{s:04.1f}")
 
-        _log("\nRunning prediction on training set (final-epoch model)...")
-
-    # End-of-training predict: every rank still holds its data_store shard,
-    # so we reuse it — no xyz re-read, no neighbor-list rebuild, no model-
-    # file round-trip. Each rank predicts its own shard; rank 0 gathers the
-    # per-frame arrays via all_gather_object and writes the output files.
+    # End-of-training predict with the BEST model (nep_best.txt, written by
+    # rank 0 during training; the barrier orders that write before the
+    # reads): the *_train.out / *_test.out files then describe the model
+    # people actually use. Every rank still holds its data_store shard, so
+    # we reuse it — no xyz re-read, no neighbor-list rebuild. Each rank
+    # predicts its own shard; rank 0 gathers the per-frame arrays via
+    # all_gather_object and writes the output files.
+    if dist.is_initialized():
+        dist.barrier()
+    best_path = os.path.join(output_dir, "nep_best.txt")
+    if os.path.exists(best_path):
+        raw_model.load_weights_from_nep_txt(best_path)
+        if is_main:
+            _log("\nRunning prediction on training set (nep_best.txt)...")
+    elif is_main:
+        _log("\nRunning prediction on training set (final-epoch model, "
+             "no nep_best.txt found)...")
     pred_t0 = time.time()
     predict_from_store_sharded(
         raw_model, data_store, local_global_idx,

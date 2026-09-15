@@ -463,3 +463,28 @@ def test_stratified_split_and_export(tmp_path):
     assert [f["natoms"] for f in got_va] == [frames[i]["natoms"] for i in vaf]
     assert np.allclose([f["energy"] for f in got_va],
                        [frames[i]["energy"] for i in vaf])
+
+
+def test_final_predict_uses_nep_best(tmp_path):
+    """The end-of-training *_train.out files are the predictions of
+    nep_best.txt (the model people use), not of the last epoch."""
+    from torchnep.nep import NEPCalculator
+    nepin, xyz = _write_run_files(tmp_path, n_frames=12, epochs=8)
+    # a large learning rate: the validation loss bottoms out before the last
+    # epoch, so nep_best and nep_final are different models
+    (tmp_path / "nep.in").write_text(NEP_IN + "epoch 8\nbatch 8\nlr 0.5\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=1, valid_ratio=0.25)
+    assert (out / "nep_best.txt").read_text() != (out / "nep_final.txt").read_text()
+    frames = read_xyz(xyz)
+    train_idx, _ = _expected_split(len(frames), 1, 0.25)
+    e_out = np.loadtxt(out / "energy_train.out")[:, 0]          # E/atom of the run's predict
+
+    def energies(name):
+        calc = NEPCalculator(str(out / name), dtype=torch.float64)
+        return np.array([float(calc.compute(list(frames[i]["species"]),
+                                            np.asarray(frames[i]["positions"]),
+                                            np.asarray(frames[i]["cell"]))["energy"].sum())
+                         / len(frames[i]["species"]) for i in train_idx])
+    assert np.allclose(e_out, energies("nep_best.txt"), atol=1e-6)
+    assert np.abs(e_out - energies("nep_final.txt")).max() > 1e-3

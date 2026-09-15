@@ -2,6 +2,9 @@
 
 ## 1.0.5a1
 
+- **End-of-training prediction uses `nep_best.txt`**: the `*_train.out` /
+  `*_test.out` files written when a run finishes now describe the best model
+  (previously the last-epoch model), so they can be plotted directly.
 - **Plotting**: new `torchnep.plot.NEPPlotter` (needs matplotlib,
   `pip install torchnep[plot]`): loss curves, energy/force/virial parity plots
   (scatter or density, train and test), error distributions with per-element
