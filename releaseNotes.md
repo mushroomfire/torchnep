@@ -6,8 +6,6 @@
   top (NEP − DFT against the DFT value); the error-density strip on the right
   is gone. The DFT and NEP axes of every parity panel (`parity`, `dashboard`)
   share the same limits and ticks.
-- **Density colormap direction** (#15): `NEPPlotter(cmap_reverse=False)` gives
-  the usual direction (crowded cells dark); the default keeps sparse cells dark.
 
 ## 1.0.5a3
 
