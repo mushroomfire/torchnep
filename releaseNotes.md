@@ -1,5 +1,20 @@
 # Release Notes
 
+## 1.0.5a3
+
+- **Periodic-table plots** (#14): `NEPPlotter.periodic_table` colours each
+  element by its energy or force RMSE (`element_errors` computes them from the
+  outputs and the xyz file); `families=True` outlines and labels the chemical
+  families.
+- **Density parity plots**: hexagonal cells by default (`cell="hex"` or
+  `"square"`, `bins=` sets the size), counted in chunks so hundreds of millions
+  of points fit in memory. Colormaps are reversed so that sparse cells, the
+  outliers, are dark (`cmap_range`, default `(0.1, 0.9)`).
+- **Outlier checks**: `parity(exclude=, natoms=)` leaves listed training
+  frames out; the error-density margin now uses every point.
+- **Figures**: default resolution 300 dpi; `font_dir=` (or `TORCHNEP_FONT_DIR`)
+  registers font files, e.g. Arial on clusters without it.
+
 ## 1.0.5a2
 
 - **Cutoff rules** (#13), checked when nep.in is parsed and when a model is
