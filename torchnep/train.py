@@ -2956,17 +2956,19 @@ def train_nep(
     best_path = os.path.join(output_dir, "nep_best.txt")
     if os.path.exists(best_path):
         raw_model.load_weights_from_nep_txt(best_path)
-        _log("\nRunning prediction on training set (nep_best.txt)...")
+        _log("\nRunning final prediction (nep_best.txt)...")
     else:
-        _log("\nRunning prediction on training set (final-epoch model, "
+        _log("\nRunning final prediction (final-epoch model, "
              "no nep_best.txt found)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, verbose=False)
+                       batch_size=batch_size, verbose=False,
+                       metrics_log=_log, metrics_title="Training set")
     if valid_store is not None:
         predict_from_store(raw_model, valid_store, output_dir,
                            batch_size=batch_size,
-                           verbose=False, suffix="test")
+                           verbose=False, suffix="test",
+                           metrics_log=_log, metrics_title="Validation set")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
     total_time = time.time() - total_t0

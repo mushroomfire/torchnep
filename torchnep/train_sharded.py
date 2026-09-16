@@ -1697,23 +1697,25 @@ def train_nep_sharded(
     if os.path.exists(best_path):
         raw_model.load_weights_from_nep_txt(best_path)
         if is_main:
-            _log("\nRunning prediction on training set (nep_best.txt)...")
+            _log("\nRunning final prediction (nep_best.txt)...")
     elif is_main:
-        _log("\nRunning prediction on training set (final-epoch model, "
+        _log("\nRunning final prediction (final-epoch model, "
              "no nep_best.txt found)...")
     pred_t0 = time.time()
     predict_from_store_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
-        batch_size=batch_size, verbose=is_main)
+        batch_size=batch_size, verbose=is_main,
+        metrics_log=_log if is_main else None, metrics_title="Training set")
     if valid_store is not None:
         predict_from_store_sharded(
             raw_model, valid_store, valid_local_global_idx,
             n_total_frames=n_valid_total,
             output_dir=output_dir,
             batch_size=batch_size, verbose=False,
-            suffix="test")
+            suffix="test",
+            metrics_log=_log if is_main else None, metrics_title="Validation set")
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
