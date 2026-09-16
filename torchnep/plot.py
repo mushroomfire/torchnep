@@ -436,7 +436,7 @@ class NEPPlotter:
     fontsize : float
         Base font size in points (labels; ticks and legends one point smaller).
     dpi : int
-        Figure / saved-file resolution.
+        Figure / saved-file resolution (default 300).
     cmaps : dict
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
@@ -464,7 +464,7 @@ class NEPPlotter:
         Extra matplotlib rcParams applied on top of the built-in style.
     """
 
-    def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
+    def __init__(self, font="Arial", fontsize=7, dpi=300, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
                  label_format="{}", label_weight="bold", frame=False, rc=None,
                  font_dir=None, cmap_range=(0.1, 0.9)):
