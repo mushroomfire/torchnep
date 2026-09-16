@@ -242,7 +242,7 @@ def _dark(cmap_name):
     return matplotlib.colormaps[cmap_name](0.85)
 
 
-def _density(ax, x, y, extent, cmap, zorder=2, bins=150):
+def _density(ax, x, y, extent, cmap, zorder=2, bins=80, floor=0.55):
     """Log-count density image of (x, y) over ``extent`` (x0, x1, y0, y1): a
     2-D histogram drawn with pcolormesh — O(N) and memory-light, so it
     works for hundreds of millions of points where hexbin does not. Empty
@@ -257,7 +257,7 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=150):
     # drop the near-white start of the colormap so that single-count bins
     # (the outliers one looks for) stay visible on a white background
     base = plt.get_cmap(cmap)
-    cm = mcolors.ListedColormap(base(np.linspace(0.3, 1.0, 256)), name=f"{base.name}_trunc")
+    cm = mcolors.ListedColormap(base(np.linspace(float(floor), 1.0, 256)), name=f"{base.name}_trunc")
     return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
                          rasterized=True, zorder=zorder, shading="flat")
 
@@ -387,6 +387,11 @@ class NEPPlotter:
     cmaps : dict
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
+    cmap_floor : float
+        Fraction of each density colormap skipped at the low end (default
+        0.55), so that bins holding a single frame — the outliers — get a
+        clearly visible colour. Use 0 for colormaps that already start dark
+        (e.g. ``viridis``).
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
@@ -410,7 +415,7 @@ class NEPPlotter:
     def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
                  label_format="{}", label_weight="bold", frame=False, rc=None,
-                 font_dir=None):
+                 font_dir=None, cmap_floor=0.55):
         import matplotlib  # noqa: F401  (fail early with a clear message)
         fam = _font_family(font, font_dir)
         fs = float(fontsize)
@@ -434,6 +439,7 @@ class NEPPlotter:
         self.colors = dict(DEFAULT_COLORS, **(colors or {}))
         self.cmaps = dict(DEFAULT_CMAPS, **(cmaps or {}))
         self.cmap = self.cmaps["train"]
+        self.cmap_floor = float(cmap_floor)
         self.max_points = int(max_points)
         self.panel_labels = list(panel_labels) if panel_labels else []
         self.label_format = label_format
@@ -606,7 +612,7 @@ class NEPPlotter:
             self._rmse_curves(ax, d, stage2, keys)
         return self._finish(fig, out)
 
-    def _block(self, fig, box, sets, q, kind, margins):
+    def _block(self, fig, box, sets, q, kind, margins, bins=80):
         """One quantity: square parity panel at ``box = (x0, y0, L)`` (cm) and,
         with ``margins``, the error against the DFT value on top and the
         error density on the right. Returns (main axes, top axes or None,
@@ -618,7 +624,7 @@ class NEPPlotter:
         def add(x, y, w, h):
             return fig.add_axes([x / W, y / H, w / W, h / H])
         ax = add(x0, y0, L, L)
-        handles = self._parity_overlay(ax, sets, q, kind)
+        handles = self._parity_overlay(ax, sets, q, kind, bins=bins)
         if not margins:
             return ax, None, handles
         ax_top = add(x0, y0 + L + gap, L, strip)
@@ -654,7 +660,7 @@ class NEPPlotter:
                 for k, (label, ref, pred, sk) in enumerate(sets):
                     ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
                     _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
-                             zorder=2 + k, bins=(150, 40))
+                             zorder=2 + k, bins=(bins, max(10, bins // 3)), floor=self.cmap_floor)
             for err, sk in errs:
                 color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
                 dens = _kde(err, grid)
@@ -671,10 +677,10 @@ class NEPPlotter:
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
                quantities=None, size=4.0, shift_energy=None, xyz=None, title=None,
-               exclude=None, natoms=None):
+               exclude=None, natoms=None, bins=80):
         """Parity plots of the run in ``path``: energy, force and stress (the
         last only with stress labels) with training and validation overlaid
-        and R^2 / RMSE / MAE per set. ``kind="density"``: log-count hexbins
+        and R^2 / RMSE / MAE per set. ``kind="density"``: log-count 2-D histograms
         (training Blues, validation Reds) with a small horizontal colorbar
         under every panel. ``margins=True`` adds the error distribution
         around each panel: NEP − DFT against the DFT value on top, a kernel
@@ -686,7 +692,8 @@ class NEPPlotter:
         predicted energies; ``size`` is the side of one panel in cm.
         ``exclude``: frame indices (of the training split) to leave out, e.g.
         an outlier list — needs ``natoms`` (atoms per frame, or the ``xyz``)
-        to drop their force rows too."""
+        to drop their force rows too. ``bins``: density cells per axis
+        (default 80; fewer = larger cells, isolated frames easier to see)."""
         import matplotlib.pyplot as plt
         from matplotlib.ticker import LogLocator, NullLocator
         splits = [sp for sp in ("train", "test")
@@ -724,7 +731,7 @@ class NEPPlotter:
             mains, tops, per_block = [], [], []
             for i, q in enumerate(qs):
                 ax, ax_top, h = self._block(fig, (i * block + left, bottom, L),
-                                            self._sets(data, q), q, kind, margins)
+                                            self._sets(data, q), q, kind, margins, bins=bins)
                 mains.append(ax)
                 tops.append(ax_top)
                 per_block.append(h)
@@ -853,7 +860,7 @@ class NEPPlotter:
             fig.tight_layout()
         return self._finish(fig, out)
 
-    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True):
+    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True, bins=80):
         """Training and validation points of one quantity in one panel (full
         range, diagonal). ``sets``: ``(label, ref, pred, set_key)`` tuples,
         ``set_key`` in {"train", "valid"}. ``kind="density"`` draws every set
@@ -875,7 +882,8 @@ class NEPPlotter:
                 continue
             color = self.colors[sk]
             if kind == "density":
-                handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k)
+                handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k,
+                                       bins=bins, floor=self.cmap_floor)
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
