@@ -113,6 +113,27 @@ def read_outputs(path=".", split="train"):
     return out
 
 
+def exclude_frames(d, exclude, natoms):
+    """Copy of a :func:`read_outputs` dict without the frames in ``exclude``
+    (frame indices); ``natoms`` (atoms per frame) maps them to force rows."""
+    natoms = np.asarray(natoms, dtype=np.int64)
+    n = len(natoms)
+    keep = np.ones(n, bool)
+    keep[np.asarray(list(exclude), dtype=np.int64)] = False
+    out = {}
+    for key, v in d.items():
+        if key == "F":
+            if len(v["ref"]) != natoms.sum():
+                raise ValueError(f"force rows {len(v['ref'])} != sum of natoms {natoms.sum()}")
+            m = np.repeat(keep, natoms)
+        else:
+            if len(v["ref"]) != n:
+                raise ValueError(f"{key} rows {len(v['ref'])} != frames {n}")
+            m = keep
+        out[key] = {"pred": v["pred"][m], "ref": v["ref"][m], "mask": v["mask"][m]}
+    return out
+
+
 def stage2_epoch(path="."):
     """Epoch at which stage 2 started, from ``output.log`` ("Stage 2 from
     epoch N") or ``nep.in`` (``start_stage2``, else half of ``epoch`` when
@@ -219,6 +240,21 @@ def _dark(cmap_name):
     """A dark colour of a sequential colormap (for text over its hexbins)."""
     import matplotlib
     return matplotlib.colormaps[cmap_name](0.85)
+
+
+def _density(ax, x, y, extent, cmap, zorder=2, bins=150):
+    """Log-count density image of (x, y) over ``extent`` (x0, x1, y0, y1): a
+    2-D histogram drawn with pcolormesh — O(N) and memory-light, so it
+    works for hundreds of millions of points where hexbin does not. Empty
+    bins are transparent. Returns the mappable (for a colorbar)."""
+    from matplotlib import colors as mcolors
+    x0, x1, y0, y1 = extent
+    nb = (bins, bins) if np.isscalar(bins) else bins
+    h, xe, ye = np.histogram2d(np.asarray(x, float), np.asarray(y, float), bins=nb,
+                               range=[[x0, x1], [y0, y1]])
+    h = np.ma.masked_less(h.T, 1)
+    return ax.pcolormesh(xe, ye, h, cmap=cmap, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
+                         rasterized=True, zorder=zorder, shading="flat")
 
 
 def _kde(x, grid, n_max=100_000, rng=np.random.default_rng(0)):
@@ -585,8 +621,7 @@ class NEPPlotter:
             errs.append((err, sk))
             color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
             if kind == "density":
-                ax_top.hexbin(ref, err, gridsize=(90, 22), mincnt=1, bins="log",
-                              cmap=self.cmaps[sk], rasterized=True, linewidths=0.1, zorder=2 + k)
+                pass                                    # drawn below, once the error range is known
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
@@ -604,6 +639,12 @@ class NEPPlotter:
                 lo, hi = lo - 0.5, hi + 0.5
             lo, hi = lo - 0.04 * (hi - lo), hi + 0.04 * (hi - lo)
             grid = np.linspace(lo, hi, 300)
+            if kind == "density":
+                xl = ax.get_xlim()
+                for k, (label, ref, pred, sk) in enumerate(sets):
+                    ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
+                    _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
+                             zorder=2 + k, bins=(150, 40))
             for err, sk in errs:
                 color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
                 dens = _kde(err, grid)
@@ -619,7 +660,8 @@ class NEPPlotter:
         return ax, ax_top, handles
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
-               quantities=None, size=4.0, shift_energy=None, xyz=None, title=None):
+               quantities=None, size=4.0, shift_energy=None, xyz=None, title=None,
+               exclude=None, natoms=None):
         """Parity plots of the run in ``path``: energy, force and stress (the
         last only with stress labels) with training and validation overlaid
         and R^2 / RMSE / MAE per set. ``kind="density"``: log-count hexbins
@@ -631,7 +673,10 @@ class NEPPlotter:
         ``quantities`` overrides the panels altogether (any of ``E F V S``);
         ``shift_energy`` (``"mean"`` /
         ``"element"``, needs ``xyz``) removes a reference offset from the
-        predicted energies; ``size`` is the side of one panel in cm."""
+        predicted energies; ``size`` is the side of one panel in cm.
+        ``exclude``: frame indices (of the training split) to leave out, e.g.
+        an outlier list — needs ``natoms`` (atoms per frame, or the ``xyz``)
+        to drop their force rows too."""
         import matplotlib.pyplot as plt
         from matplotlib.ticker import LogLocator, NullFormatter
         splits = [sp for sp in ("train", "test")
@@ -639,6 +684,12 @@ class NEPPlotter:
         if not splits:
             raise FileNotFoundError(f"no energy_train.out / energy_test.out in {path}")
         data = {sp: read_outputs(path, sp) for sp in splits}
+        if exclude is not None and "train" in data:
+            if natoms is None:
+                if xyz is None:
+                    raise ValueError("exclude= needs natoms= (atoms per frame) or xyz=")
+                natoms = frame_meta(xyz)[0]
+            data["train"] = exclude_frames(data["train"], exclude, natoms)
         if shift_energy:
             meta = frame_meta(xyz) if xyz else None
             for sp in splits:
@@ -816,9 +867,7 @@ class NEPPlotter:
                 continue
             color = self.colors[sk]
             if kind == "density":
-                handles[sk] = ax.hexbin(ref, pred, gridsize=110, extent=(lo, hi, lo, hi), mincnt=1,
-                                        bins="log", cmap=self.cmaps[sk], rasterized=True,
-                                        linewidths=0.1, zorder=2 + k)
+                handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k)
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
