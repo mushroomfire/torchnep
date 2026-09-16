@@ -493,3 +493,41 @@ def test_final_predict_uses_nep_best(tmp_path):
                          / len(frames[i]["species"]) for i in train_idx])
     assert np.allclose(e_out, energies(out_b / "nep_best.txt"), atol=1e-6)   # the planted model
     assert np.abs(e_out - energies(out_a / "nep_final.txt")).max() > 1e-4     # not run A's own
+
+
+def _table_rmse(log_text, title):
+    """E/F/V RMSE of the metrics table printed under ``title`` at the end of training."""
+    lines = log_text.splitlines()
+    i = max(k for k, l in enumerate(lines) if l.strip() == title)
+    out = {}
+    for l in lines[i + 1:i + 7]:
+        for key, label in (("E", "Energy"), ("F", "Force"), ("V", "Virial")):
+            if l.strip().startswith(label):
+                out[key] = float(l.split(")")[1].split()[0])
+    return out
+
+
+def _file_rmse(out, split):
+    e = np.loadtxt(out / f"energy_{split}.out")
+    f = np.loadtxt(out / f"force_{split}.out")
+    v = np.loadtxt(out / f"virial_{split}.out")
+    v = v[v[:, 6] > -1e5]
+    return {"E": np.sqrt(np.mean((e[:, 0] - e[:, 1]) ** 2)),
+            "F": np.sqrt(np.mean((f[:, :3] - f[:, 3:6]) ** 2)),
+            "V": np.sqrt(np.mean((v[:, :6] - v[:, 6:12]) ** 2))}
+
+
+def test_final_predict_prints_metrics(tmp_path):
+    """The end-of-training prediction prints (and logs) the predict_dataset-style
+    E/F/V RMSE / MAE table for the training and the validation set, and the numbers
+    match the written *_train.out / *_test.out files."""
+    nepin, xyz = _write_run_files(tmp_path, n_frames=16, epochs=2)
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, valid_ratio=0.25, run_seed=3)
+    log = (out / "output.log").read_text()
+    for title, split in (("Training set", "train"), ("Validation set", "test")):
+        table = _table_rmse(log, title)
+        ref = _file_rmse(out, split)
+        assert set(table) == {"E", "F", "V"}, (title, table)
+        for k in table:
+            assert abs(table[k] - ref[k]) <= 1e-6 + 1e-5 * ref[k], (title, k, table[k], ref[k])

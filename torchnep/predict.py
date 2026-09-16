@@ -370,10 +370,7 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
     acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
 
     def _accum(key, d):
-        d = d[np.isfinite(d)]
-        if d.size:
-            acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
-            acc[key][2] += int(d.size)
+        _accum_into(acc, key, d)
 
     tm = {"read": 0.0, "neighbors": 0.0, "compute": 0.0, "write": 0.0}
     # one neighbor-list worker pool for all chunks (fork; workers never touch CUDA)
@@ -428,7 +425,27 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
     return acc, tm, batch_size
 
 
-def _metrics_table(acc, log):
+def _accum_into(acc, key, d):
+    """Add the finite entries of the error array ``d`` to acc[key] = [sum sq, sum abs, count]."""
+    d = np.asarray(d, dtype=np.float64).ravel()
+    d = d[np.isfinite(d)]
+    if d.size:
+        acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
+        acc[key][2] += int(d.size)
+
+
+def _metrics_from_arrays(e_pred, e_ref, f_pred, f_ref, v_pred, v_ref):
+    """E/F/V error sums of full prediction arrays (per-atom energies and virials, forces per atom);
+    frames without a virial label (-1e6 sentinel) are left out of V, NaN references everywhere."""
+    acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
+    _accum_into(acc, "e", np.asarray(e_pred) - np.asarray(e_ref))
+    _accum_into(acc, "f", np.asarray(f_pred) - np.asarray(f_ref))
+    v_ref = np.asarray(v_ref); vmask = v_ref[:, 0] > _MISSING_VIRIAL / 2
+    _accum_into(acc, "v", np.asarray(v_pred)[vmask] - v_ref[vmask])
+    return acc
+
+
+def _metrics_table(acc, log, title=None):
     rows = []
     for key, label, per in (("e", "Energy (eV/atom)", "frames"),
                             ("f", "Force  (eV/A)", "atoms"),
@@ -438,6 +455,8 @@ def _metrics_table(acc, log):
             cov = n // 3 if key == "f" else (n // 6 if key == "v" else n)
             rows.append((label, np.sqrt(sq / n), ab / n, f"{cov} {per}"))
     if rows:
+        if title:
+            log(f"  {title}")
         log("  " + "-" * 58)
         log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")
         for label, rmse, mae, cov in rows:
@@ -705,8 +724,9 @@ def predict_dataset_sharded(
 
 def predict_from_store(model, data_store, output_dir: str,
                        batch_size: int = 1000,
-                                          verbose: bool = True,
-                       suffix: str = "train"):
+                       verbose: bool = True,
+                       suffix: str = "train",
+                       metrics_log=None, metrics_title=None):
     """Run prediction using an already-loaded NEPModel + StreamDataStore.
 
     Designed for the end of training: reuses the preprocessed data_store so
@@ -721,6 +741,8 @@ def predict_from_store(model, data_store, output_dir: str,
 
     ``suffix`` picks the file-name tail: "train" (default) for the training
     set, "test" for the validation set (GPUMD's *_test.out naming).
+    ``metrics_log``: a print-like function; when given, the E/F/V RMSE / MAE
+    table of ``predict_dataset`` is written through it (``metrics_title`` on top).
     """
     def _log(msg):
         if verbose:
@@ -820,6 +842,9 @@ def predict_from_store(model, data_store, output_dir: str,
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
+    if metrics_log is not None:
+        _metrics_table(_metrics_from_arrays(e_pred, e_ref_pa, f_pred, forces_ref, v_pred, virial_ref),
+                       metrics_log, metrics_title)
 
 
 # ---------------------------------------------------------------------------
@@ -939,8 +964,9 @@ def _write_predictions(output_dir: str, n_total_frames: int,
 def predict_from_store_sharded(model, data_store, local_global_idx,
                                 n_total_frames: int, output_dir: str,
                                 batch_size: int = 1000,
-                                                            verbose: bool = True,
-                                suffix: str = "train"):
+                                verbose: bool = True,
+                                suffix: str = "train",
+                                metrics_log=None, metrics_title=None):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
     data-store shard, arrays are gathered to rank 0, rank 0 writes the four
     ``*_{suffix}.out`` files in input-xyz order ("train" or "test").
@@ -955,6 +981,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
         frame (length == ``data_store.n``). Supplied by the random shard
         assignment in ``train_nep_sharded``.
     n_total_frames : int  total frames across all ranks (pre-drop).
+    metrics_log, metrics_title : as in ``predict_from_store`` (used on rank 0).
     """
     import torch.distributed as dist
     rank = dist.get_rank() if dist.is_initialized() else 0
@@ -1062,3 +1089,6 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                        v_pred_g, v_ref_g, suffix=suffix)
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
+    if metrics_log is not None:
+        _metrics_table(_metrics_from_arrays(e_pred_g, e_ref_g, f_pred_g, f_ref_g, v_pred_g, v_ref_g),
+                       metrics_log, metrics_title)

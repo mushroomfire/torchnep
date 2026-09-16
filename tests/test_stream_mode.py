@@ -209,3 +209,48 @@ def test_sharded_run_reproducible(tmp_path):
     a, b = tmp_path / "out_a", tmp_path / "out_b"
     assert (a / "loss.out").read_text() == (b / "loss.out").read_text()
     assert (a / "nep_final.txt").read_text() == (b / "nep_final.txt").read_text()
+
+
+def test_sharded_final_predict_prints_metrics(tmp_path):
+    """2-rank DDP (CPU/gloo): the end-of-training prediction logs the E/F/V table for
+    the training and validation sets on rank 0, matching the gathered output files.
+    Opt-in like test_sharded_run_reproducible (TORCHNEP_TEST_DDP=1)."""
+    import os
+    import subprocess
+    if os.environ.get("TORCHNEP_TEST_DDP") != "1":
+        pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
+    from _common import torchrun_cmd
+    from test_run_seed_and_valid import _table_rmse, _file_rmse
+    cmd = torchrun_cmd(2)
+    if not cmd:
+        pytest.skip("torchrun not on PATH")
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 2\nbatch 4\n")
+    raw = XYZ.read_text().splitlines()
+    out, i, k = [], 0, 0
+    while i < len(raw) and k < 16:
+        na = int(raw[i].strip())
+        out += raw[i:i + na + 2]
+        i += na + 2; k += 1
+    xyz = tmp_path / "train.xyz"
+    xyz.write_text("\n".join(out) + "\n")
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "import sys\nfrom torchnep.train_sharded import train_nep_sharded\n"
+        "train_nep_sharded(sys.argv[1], sys.argv[2], output_dir=sys.argv[3], precision='float64',\n"
+        "                  print_interval=100, checkpoint_interval=10000, prediction_interval=10000,\n"
+        "                  restart=False, run_seed=5, valid_ratio=0.25)\n")
+    root = str(DATA_DIR.parent.parent)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+               PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    o = tmp_path / "out"
+    r = subprocess.run(cmd + [str(runner), str(nepin), str(xyz), str(o)],
+                       capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    log = (o / "output.log").read_text()
+    for title, split in (("Training set", "train"), ("Validation set", "test")):
+        table = _table_rmse(log, title)
+        ref = _file_rmse(o, split)
+        assert set(table) == {"E", "F", "V"}, (title, table)
+        for k2 in table:
+            assert abs(table[k2] - ref[k2]) <= 1e-6 + 1e-5 * ref[k2], (title, k2, table[k2], ref[k2])
