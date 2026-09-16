@@ -1,5 +1,12 @@
 # Release Notes
 
+## 1.0.5b2
+
+- **End-of-training metrics** (#17): the final prediction with `nep_best.txt`
+  prints the E/F/V RMSE / MAE table of `predict_dataset` for the training and
+  the validation set (screen and `output.log`), in `train_nep` and
+  `train_nep_sharded`.
+
 ## 1.0.5b1
 
 - **Parity plots** (#16): `parity(margins=True)` keeps only the error strip on
