@@ -271,7 +271,8 @@ def _hex_counts(x, y, extent, sx, sy, chunk=20_000_000):
     return np.column_stack([x0 + cx * sx, y0 + cy * sy]), counts[occ]
 
 
-def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), cell="hex"):
+def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), cell="hex",
+             cmap_reverse=True):
     """Log-count density of (x, y) over ``extent`` (x0, x1, y0, y1), binned
     in O(N) with little memory (hundreds of millions of points are fine).
     ``cell="hex"``: regular hexagons (regular on screen, whatever the axes'
@@ -282,12 +283,13 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), c
     from matplotlib import colors as mcolors
     from matplotlib.collections import PolyCollection
     x0, x1, y0, y1 = extent
-    # reversed colormap: sparse cells (the outliers one looks for) get the
-    # dark end, crowded cells on the diagonal the light end; cmap_range keeps
-    # clear of the colormap's white and black extremes
-    lo_c, hi_c = cmap_range
+    # cmap_range: the part of the colormap used (clear of its white end);
+    # cmap_reverse: sparse cells (the outliers one looks for) get the end of
+    # the range that is normally used for crowded cells
+    lo_c, hi_c = sorted(float(c) for c in cmap_range)
     base = plt.get_cmap(cmap)
-    cm = mcolors.ListedColormap(base(np.linspace(float(hi_c), float(lo_c), 256)), name=f"{base.name}_rev")
+    stops = np.linspace(hi_c, lo_c, 256) if cmap_reverse else np.linspace(lo_c, hi_c, 256)
+    cm = mcolors.ListedColormap(base(stops), name=f"{base.name}_{'rev' if cmap_reverse else 'part'}")
     if cell == "square":
         nb = (bins, bins) if np.isscalar(bins) else bins
         h, xe, ye = np.histogram2d(np.ravel(x).astype(float), np.ravel(y).astype(float), bins=nb,
@@ -441,9 +443,12 @@ class NEPPlotter:
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
     cmap_range : (float, float)
-        Part of each density colormap used (default ``(0.1, 0.9)``), applied
-        reversed: cells with few points (the outliers) take the dark end,
-        crowded cells the light end; the limits keep clear of pure white.
+        Part of each density colormap used (default ``(0.1, 0.9)``), kept
+        clear of the colormap's white end.
+    cmap_reverse : bool
+        ``True`` (default): density colormaps run reversed, so cells with few
+        points (the outliers) take the dark end and crowded cells the light
+        end; ``False``: the usual direction (crowded cells dark).
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
@@ -467,7 +472,7 @@ class NEPPlotter:
     def __init__(self, font="Arial", fontsize=7, dpi=300, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
                  label_format="{}", label_weight="bold", frame=False, rc=None,
-                 font_dir=None, cmap_range=(0.1, 0.9)):
+                 font_dir=None, cmap_range=(0.1, 0.9), cmap_reverse=True):
         import matplotlib  # noqa: F401  (fail early with a clear message)
         fam = _font_family(font, font_dir)
         fs = float(fontsize)
@@ -492,6 +497,7 @@ class NEPPlotter:
         self.cmaps = dict(DEFAULT_CMAPS, **(cmaps or {}))
         self.cmap = self.cmaps["train"]
         self.cmap_range = (float(cmap_range[0]), float(cmap_range[1]))
+        self.cmap_reverse = bool(cmap_reverse)
         self.max_points = int(max_points)
         self.panel_labels = list(panel_labels) if panel_labels else []
         self.label_format = label_format
@@ -712,7 +718,7 @@ class NEPPlotter:
                 for k, (label, ref, pred, sk) in enumerate(sets):
                     ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
                     _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
-                             zorder=2 + k, cell=cell, cmap_range=self.cmap_range,
+                             zorder=2 + k, cell=cell, cmap_range=self.cmap_range, cmap_reverse=self.cmap_reverse,
                              bins=bins if cell == "hex" else (bins, max(10, bins // 3)))
             for err, sk in errs:
                 color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
@@ -937,7 +943,8 @@ class NEPPlotter:
             color = self.colors[sk]
             if kind == "density":
                 handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k,
-                                       bins=bins, cell=cell, cmap_range=self.cmap_range)
+                                       bins=bins, cell=cell, cmap_range=self.cmap_range,
+                                       cmap_reverse=self.cmap_reverse)
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)

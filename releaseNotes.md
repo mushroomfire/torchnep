@@ -9,7 +9,8 @@
 - **Density parity plots**: hexagonal cells by default (`cell="hex"` or
   `"square"`, `bins=` sets the size), counted in chunks so hundreds of millions
   of points fit in memory. Colormaps are reversed so that sparse cells, the
-  outliers, are dark (`cmap_range`, default `(0.1, 0.9)`).
+  outliers, are dark (`cmap_reverse=False` for the usual direction;
+  `cmap_range`, default `(0.1, 0.9)`, sets the part of the colormap used).
 - **Outlier checks**: `parity(exclude=, natoms=)` leaves listed training
   frames out; the error-density margin now uses every point.
 - **Figures**: default resolution 300 dpi; `font_dir=` (or `TORCHNEP_FONT_DIR`)

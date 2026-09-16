@@ -113,3 +113,17 @@ def test_train_only_no_stress_and_options(tmp_path):
     assert len(fig.axes) == 3
     with pytest.raises(TypeError):
         p.dashboard()                                                # path is required
+
+
+def test_density_colormap_direction(tmp_path):
+    """cmap_reverse=True (default): the sparsest cell takes the dark end of the
+    range; False: the usual direction. cmap_range order does not matter."""
+    from matplotlib import colormaps
+    _write_run(tmp_path)
+    blues = colormaps["Blues"]
+    for rev, rng, sparse_at in ((True, (0.1, 0.9), 0.9), (False, (0.1, 0.9), 0.1), (True, (0.9, 0.1), 0.9)):
+        p = NEPPlotter(dpi=60, cmap_reverse=rev, cmap_range=rng)
+        fig = p.parity(tmp_path, kind="density", quantities=["E"])
+        coll = [c for c in fig.axes[0].collections if c.get_array() is not None][0]
+        np.testing.assert_allclose(coll.get_cmap()(0.0), blues(sparse_at))
+    p.parity(tmp_path, kind="density", cell="square", out=tmp_path / "square.png")
