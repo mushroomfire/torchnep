@@ -1,5 +1,14 @@
 # Release Notes
 
+## 1.0.5b1
+
+- **Parity plots** (#16): `parity(margins=True)` keeps only the error strip on
+  top (NEP − DFT against the DFT value); the error-density strip on the right
+  is gone. The DFT and NEP axes of every parity panel (`parity`, `dashboard`)
+  share the same limits and ticks.
+- **Density colormap direction** (#15): `NEPPlotter(cmap_reverse=False)` gives
+  the usual direction (crowded cells dark); the default keeps sparse cells dark.
+
 ## 1.0.5a3
 
 - **Periodic-table plots** (#14): `NEPPlotter.periodic_table` colours each
