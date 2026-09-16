@@ -242,7 +242,7 @@ def _dark(cmap_name):
     return matplotlib.colormaps[cmap_name](0.85)
 
 
-def _density(ax, x, y, extent, cmap, zorder=2, bins=80, floor=0.55):
+def _density(ax, x, y, extent, cmap, zorder=2, bins=80, floor=0.3):
     """Log-count density image of (x, y) over ``extent`` (x0, x1, y0, y1): a
     2-D histogram drawn with pcolormesh — O(N) and memory-light, so it
     works for hundreds of millions of points where hexbin does not. Empty
@@ -254,10 +254,11 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=80, floor=0.55):
     h, xe, ye = np.histogram2d(np.asarray(x, float), np.asarray(y, float), bins=nb,
                                range=[[x0, x1], [y0, y1]])
     h = np.ma.masked_less(h.T, 1)
-    # drop the near-white start of the colormap so that single-count bins
-    # (the outliers one looks for) stay visible on a white background
+    # reversed: sparse bins (the outliers one looks for) get the dark end,
+    # crowded bins on the diagonal the light end; the near-white start of the
+    # colormap is skipped so even the most crowded bins show on white
     base = plt.get_cmap(cmap)
-    cm = mcolors.ListedColormap(base(np.linspace(float(floor), 1.0, 256)), name=f"{base.name}_trunc")
+    cm = mcolors.ListedColormap(base(np.linspace(1.0, float(floor), 256)), name=f"{base.name}_rev")
     return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
                          rasterized=True, zorder=zorder, shading="flat")
 
@@ -388,10 +389,10 @@ class NEPPlotter:
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
     cmap_floor : float
-        Fraction of each density colormap skipped at the low end (default
-        0.55), so that bins holding a single frame — the outliers — get a
-        clearly visible colour. Use 0 for colormaps that already start dark
-        (e.g. ``viridis``).
+        Density panels use each colormap reversed: bins with few points (the
+        outliers) are dark, crowded bins light. ``cmap_floor`` is the fraction
+        of the light end left out (default 0.3) so crowded bins stay visible
+        on white.
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
@@ -415,7 +416,7 @@ class NEPPlotter:
     def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
                  label_format="{}", label_weight="bold", frame=False, rc=None,
-                 font_dir=None, cmap_floor=0.55):
+                 font_dir=None, cmap_floor=0.3):
         import matplotlib  # noqa: F401  (fail early with a clear message)
         fam = _font_family(font, font_dir)
         fs = float(fontsize)
