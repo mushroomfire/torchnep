@@ -242,25 +242,77 @@ def _dark(cmap_name):
     return matplotlib.colormaps[cmap_name](0.85)
 
 
-def _density(ax, x, y, extent, cmap, zorder=2, bins=80, floor=0.3):
-    """Log-count density image of (x, y) over ``extent`` (x0, x1, y0, y1): a
-    2-D histogram drawn with pcolormesh — O(N) and memory-light, so it
-    works for hundreds of millions of points where hexbin does not. Empty
-    bins are transparent. Returns the mappable (for a colorbar)."""
+def _hex_counts(x, y, extent, sx, sy, chunk=20_000_000):
+    """Counts of (x, y) in the regular hexagonal lattice with spacing ``sx``
+    (x) and ``sy`` (y) over ``extent`` — the two offset rectangular lattices
+    of matplotlib's hexbin, binned in chunks (O(N), little memory). Returns
+    (centres (M, 2), counts (M,)) of the occupied cells."""
+    x0, x1, y0, y1 = extent
+    nx, ny = int(np.ceil((x1 - x0) / sx)), int(np.ceil((y1 - y0) / sy))
+    n1 = (nx + 1) * (ny + 1)
+    counts = np.zeros(n1 + nx * ny, dtype=np.int64)
+    x, y = np.ravel(x), np.ravel(y)
+    for i in range(0, len(x), chunk):
+        u = (np.asarray(x[i:i + chunk], float) - x0) / sx
+        v = (np.asarray(y[i:i + chunk], float) - y0) / sy
+        ok = (u >= 0) & (u <= nx) & (v >= 0) & (v <= ny)
+        u, v = u[ok], v[ok]
+        i1, j1 = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
+        i2 = np.clip(np.floor(u).astype(np.int64), 0, nx - 1)
+        j2 = np.clip(np.floor(v).astype(np.int64), 0, ny - 1)
+        d1 = (u - i1) ** 2 + 3.0 * (v - j1) ** 2
+        d2 = (u - i2 - 0.5) ** 2 + 3.0 * (v - j2 - 0.5) ** 2
+        idx = np.where(d1 < d2, i1 * (ny + 1) + j1, n1 + i2 * ny + j2)
+        counts += np.bincount(idx, minlength=len(counts))
+    occ = np.nonzero(counts)[0]
+    first = occ < n1
+    cx = np.where(first, occ // (ny + 1), (occ - n1) // ny + 0.5)
+    cy = np.where(first, occ % (ny + 1), (occ - n1) % ny + 0.5)
+    return np.column_stack([x0 + cx * sx, y0 + cy * sy]), counts[occ]
+
+
+def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), cell="hex"):
+    """Log-count density of (x, y) over ``extent`` (x0, x1, y0, y1), binned
+    in O(N) with little memory (hundreds of millions of points are fine).
+    ``cell="hex"``: regular hexagons (regular on screen, whatever the axes'
+    aspect), ``bins`` of them across the x range; ``"square"``: a 2-D
+    histogram with ``bins`` cells per axis (or ``(nx, ny)``). Empty cells
+    are transparent. Returns the mappable (for a colorbar)."""
     import matplotlib.pyplot as plt
     from matplotlib import colors as mcolors
+    from matplotlib.collections import PolyCollection
     x0, x1, y0, y1 = extent
-    nb = (bins, bins) if np.isscalar(bins) else bins
-    h, xe, ye = np.histogram2d(np.asarray(x, float), np.asarray(y, float), bins=nb,
-                               range=[[x0, x1], [y0, y1]])
-    h = np.ma.masked_less(h.T, 1)
-    # reversed: sparse bins (the outliers one looks for) get the dark end,
-    # crowded bins on the diagonal the light end; the near-white start of the
-    # colormap is skipped so even the most crowded bins show on white
+    # reversed colormap: sparse cells (the outliers one looks for) get the
+    # dark end, crowded cells on the diagonal the light end; cmap_range keeps
+    # clear of the colormap's white and black extremes
+    lo_c, hi_c = cmap_range
     base = plt.get_cmap(cmap)
-    cm = mcolors.ListedColormap(base(np.linspace(1.0, float(floor), 256)), name=f"{base.name}_rev")
-    return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
-                         rasterized=True, zorder=zorder, shading="flat")
+    cm = mcolors.ListedColormap(base(np.linspace(float(hi_c), float(lo_c), 256)), name=f"{base.name}_rev")
+    if cell == "square":
+        nb = (bins, bins) if np.isscalar(bins) else bins
+        h, xe, ye = np.histogram2d(np.ravel(x).astype(float), np.ravel(y).astype(float), bins=nb,
+                                   range=[[x0, x1], [y0, y1]])
+        h = np.ma.masked_less(h.T, 1)
+        return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
+                             rasterized=True, zorder=zorder, shading="flat")
+    if cell != "hex":
+        raise ValueError(f"cell must be 'hex' or 'square', got {cell!r}")
+    nx = int(bins if np.isscalar(bins) else bins[0])
+    sx = (x1 - x0) / nx
+    # y spacing for hexagons that are regular in display space
+    fw, fh = ax.figure.get_size_inches()
+    pos = ax.get_position()
+    w_in, h_in = pos.width * fw, pos.height * fh
+    sy = np.sqrt(3.0) * sx * ((y1 - y0) / h_in) / ((x1 - x0) / w_in)
+    centres, c = _hex_counts(x, y, extent, sx, sy)
+    hexagon = np.array([[0.5, -0.5], [0.5, 0.5], [0.0, 1.0], [-0.5, 0.5], [-0.5, -0.5], [0.0, -1.0]]) \
+        * [sx, sy / 3.0]
+    verts = centres[:, None, :] + hexagon[None, :, :]
+    col = PolyCollection(verts, array=c.astype(float), cmap=cm,
+                         norm=mcolors.LogNorm(vmin=1, vmax=max(float(c.max()) if len(c) else 2.0, 2.0)),
+                         edgecolors="face", linewidths=0.2, rasterized=True, zorder=zorder)
+    ax.add_collection(col)
+    return col
 
 
 def _kde(x, grid):
@@ -388,11 +440,10 @@ class NEPPlotter:
     cmaps : dict
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
-    cmap_floor : float
-        Density panels use each colormap reversed: bins with few points (the
-        outliers) are dark, crowded bins light. ``cmap_floor`` is the fraction
-        of the light end left out (default 0.3) so crowded bins stay visible
-        on white.
+    cmap_range : (float, float)
+        Part of each density colormap used (default ``(0.1, 0.9)``), applied
+        reversed: cells with few points (the outliers) take the dark end,
+        crowded cells the light end; the limits keep clear of pure white.
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
@@ -416,7 +467,7 @@ class NEPPlotter:
     def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
                  label_format="{}", label_weight="bold", frame=False, rc=None,
-                 font_dir=None, cmap_floor=0.3):
+                 font_dir=None, cmap_range=(0.1, 0.9)):
         import matplotlib  # noqa: F401  (fail early with a clear message)
         fam = _font_family(font, font_dir)
         fs = float(fontsize)
@@ -440,7 +491,7 @@ class NEPPlotter:
         self.colors = dict(DEFAULT_COLORS, **(colors or {}))
         self.cmaps = dict(DEFAULT_CMAPS, **(cmaps or {}))
         self.cmap = self.cmaps["train"]
-        self.cmap_floor = float(cmap_floor)
+        self.cmap_range = (float(cmap_range[0]), float(cmap_range[1]))
         self.max_points = int(max_points)
         self.panel_labels = list(panel_labels) if panel_labels else []
         self.label_format = label_format
@@ -613,7 +664,7 @@ class NEPPlotter:
             self._rmse_curves(ax, d, stage2, keys)
         return self._finish(fig, out)
 
-    def _block(self, fig, box, sets, q, kind, margins, bins=80):
+    def _block(self, fig, box, sets, q, kind, margins, bins=80, cell="hex"):
         """One quantity: square parity panel at ``box = (x0, y0, L)`` (cm) and,
         with ``margins``, the error against the DFT value on top and the
         error density on the right. Returns (main axes, top axes or None,
@@ -625,7 +676,7 @@ class NEPPlotter:
         def add(x, y, w, h):
             return fig.add_axes([x / W, y / H, w / W, h / H])
         ax = add(x0, y0, L, L)
-        handles = self._parity_overlay(ax, sets, q, kind, bins=bins)
+        handles = self._parity_overlay(ax, sets, q, kind, bins=bins, cell=cell)
         if not margins:
             return ax, None, handles
         ax_top = add(x0, y0 + L + gap, L, strip)
@@ -661,7 +712,8 @@ class NEPPlotter:
                 for k, (label, ref, pred, sk) in enumerate(sets):
                     ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
                     _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
-                             zorder=2 + k, bins=(bins, max(10, bins // 3)), floor=self.cmap_floor)
+                             zorder=2 + k, cell=cell, cmap_range=self.cmap_range,
+                             bins=bins if cell == "hex" else (bins, max(10, bins // 3)))
             for err, sk in errs:
                 color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
                 dens = _kde(err, grid)
@@ -678,7 +730,7 @@ class NEPPlotter:
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
                quantities=None, size=4.0, shift_energy=None, xyz=None, title=None,
-               exclude=None, natoms=None, bins=80):
+               exclude=None, natoms=None, bins=80, cell="hex"):
         """Parity plots of the run in ``path``: energy, force and stress (the
         last only with stress labels) with training and validation overlaid
         and R^2 / RMSE / MAE per set. ``kind="density"``: log-count 2-D histograms
@@ -693,8 +745,9 @@ class NEPPlotter:
         predicted energies; ``size`` is the side of one panel in cm.
         ``exclude``: frame indices (of the training split) to leave out, e.g.
         an outlier list — needs ``natoms`` (atoms per frame, or the ``xyz``)
-        to drop their force rows too. ``bins``: density cells per axis
-        (default 80; fewer = larger cells, isolated frames easier to see)."""
+        to drop their force rows too. ``bins``: density cells across the x
+        axis (default 80; fewer = larger cells); ``cell``: ``"hex"`` (default)
+        or ``"square"``."""
         import matplotlib.pyplot as plt
         from matplotlib.ticker import LogLocator, NullLocator
         splits = [sp for sp in ("train", "test")
@@ -732,7 +785,7 @@ class NEPPlotter:
             mains, tops, per_block = [], [], []
             for i, q in enumerate(qs):
                 ax, ax_top, h = self._block(fig, (i * block + left, bottom, L),
-                                            self._sets(data, q), q, kind, margins, bins=bins)
+                                            self._sets(data, q), q, kind, margins, bins=bins, cell=cell)
                 mains.append(ax)
                 tops.append(ax_top)
                 per_block.append(h)
@@ -861,7 +914,7 @@ class NEPPlotter:
             fig.tight_layout()
         return self._finish(fig, out)
 
-    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True, bins=80):
+    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True, bins=80, cell="hex"):
         """Training and validation points of one quantity in one panel (full
         range, diagonal). ``sets``: ``(label, ref, pred, set_key)`` tuples,
         ``set_key`` in {"train", "valid"}. ``kind="density"`` draws every set
@@ -884,7 +937,7 @@ class NEPPlotter:
             color = self.colors[sk]
             if kind == "density":
                 handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k,
-                                       bins=bins, floor=self.cmap_floor)
+                                       bins=bins, cell=cell, cmap_range=self.cmap_range)
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
