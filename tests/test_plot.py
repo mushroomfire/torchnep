@@ -87,7 +87,7 @@ def test_all_figures(tmp_path):
     from torchnep.plot import element_errors
     err = element_errors(tmp_path, tmp_path / "data.xyz")
     assert set(err["F"]) == {"Cr", "Ni"} and err["n_atoms"]["Ni"] == 40 * 3
-    p.periodic_table(values={"x": {"Fe": 1.0, "Cu": 2.5}}, vmax=2.0, out=tmp_path / "ptable2.png")
+    p.periodic_table(values={"x": {"Fe": 1.0, "Cu": 2.5}}, vmax=2.0, families=True, out=tmp_path / "ptable2.png")
     for name in ("dash", "dash_density", "parity_scatter", "parity_density", "pred_scatter",
                  "pred_density", "shift", "loss", "errors", "ptable", "ptable2"):
         assert (tmp_path / f"{name}.png").stat().st_size > 1000

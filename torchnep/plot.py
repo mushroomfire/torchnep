@@ -265,6 +265,22 @@ for _r, _row in enumerate(_PT_ROWS):
             PT_POSITIONS[_sym] = (_r + (0.5 if _r >= 7 else 0), _c)   # half a row of gap before the f-block
 
 
+# Chemical families (for the periodic-table outlines and legend)
+PT_FAMILIES = [
+    ("Alkali metals", "Li Na K Rb Cs Fr", "#1f77b4"),
+    ("Alkaline-earth metals", "Be Mg Ca Sr Ba Ra", "#17becf"),
+    ("3d transition metals", "Sc Ti V Cr Mn Fe Co Ni Cu Zn", "#2ca02c"),
+    ("4d transition metals", "Y Zr Nb Mo Tc Ru Rh Pd Ag Cd", "#98df8a"),
+    ("5d transition metals", "Hf Ta W Re Os Ir Pt Au Hg", "#bcbd22"),
+    ("Post-transition metals", "Al Ga In Sn Tl Pb Bi", "#ff7f0e"),
+    ("Metalloids", "B Si Ge As Sb Te", "#9467bd"),
+    ("Non-metals", "H C N O F P S Cl Se Br I", "#d62728"),
+    ("Noble gases", "He Ne Ar Kr Xe Rn", "#7f7f7f"),
+    ("Lanthanides (4f)", "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu", "#e377c2"),
+    ("Actinides (5f)", "Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr", "#c49c94"),
+]
+
+
 def element_errors(path, xyz, split="train"):
     """Per-element RMSEs of the ``*_<split>.out`` outputs of ``path`` for the
     frames of ``xyz``: ``{"E": {el: meV/atom}, "F": {el: meV/A},
@@ -660,13 +676,14 @@ class NEPPlotter:
 
     def periodic_table(self, values=None, path=None, xyz=None, split="train",
                        quantities=("E", "F"), out=None, cmap="YlOrRd", vmax=None,
-                       title=None, size=0.62):
+                       title=None, size=0.62, families=False):
         """Periodic table coloured by a per-element number: either the
         per-element RMSEs of a run (``path`` + ``xyz`` -> :func:`element_errors`,
         one table per entry of ``quantities``) or your own ``values``
         (``{label: {element: value}}``). Elements without a value are grey.
         ``vmax``: colour-scale top (default: the largest value); ``size``: cell
-        side in cm."""
+        side in cm; ``families=True`` outlines the chemical families of the
+        elements that carry a value (``PT_FAMILIES``) with a legend below."""
         import matplotlib.pyplot as plt
         from matplotlib import colors as mcolors
         from matplotlib.patches import Rectangle
@@ -679,7 +696,7 @@ class NEPPlotter:
         panels = list(values.items())
         ncol, nrow = 18, 9.5
         w = ncol * size + 0.4
-        h = len(panels) * (nrow * size + 1.2)
+        h = len(panels) * (nrow * size + 1.2 + (1.4 if families else 0.0))
         with plt.rc_context(self.rc):
             fig, axes = plt.subplots(len(panels), 1, figsize=_cm(w, h), squeeze=False)
             for ax, (label, vals) in zip(axes.ravel(), panels):
@@ -702,6 +719,19 @@ class NEPPlotter:
                         ax.add_patch(Rectangle((x, y), 1, 1, facecolor="#ececec", edgecolor="white", lw=0.6))
                         ax.text(x + 0.5, y + 0.5, sym, ha="center", va="center", color="#9a9a9a",
                                 fontsize=self.rc["font.size"] - 1)
+                if families:
+                    handles = []
+                    for name, syms, color in PT_FAMILIES:
+                        members = [t for t in syms.split() if t in vals]
+                        if not members:
+                            continue
+                        for t in members:
+                            r, c = PT_POSITIONS[t]
+                            ax.add_patch(Rectangle((c + 0.06, nrow - 1 - r + 0.06), 0.88, 0.88, fill=False,
+                                                   edgecolor=color, lw=1.6, zorder=5))
+                        handles.append(Rectangle((0, 0), 1, 1, fill=False, edgecolor=color, lw=1.6, label=name))
+                    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, -0.01), ncol=4,
+                              frameon=False, handlelength=1.2, labelspacing=0.4, columnspacing=1.2)
                 ax.set_xlim(0, ncol)
                 ax.set_ylim(0, nrow)
                 ax.set_aspect("equal")
