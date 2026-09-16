@@ -794,9 +794,9 @@ class NEPPlotter:
             if kind == "density":
                 for i, h in enumerate(per_block):
                     keys = [k for k in ("train", "valid") if k in h]
-                    bw = (L - 0.3 * (len(keys) - 1)) / max(1, len(keys))
+                    bw = (L - 0.6 * (len(keys) - 1)) / max(1, len(keys))
                     for j, k in enumerate(keys):
-                        x = (i * block + left + j * (bw + 0.3)) / W
+                        x = (i * block + left + j * (bw + 0.6)) / W
                         cax = fig.add_axes([x, 0.5 / H, bw / W, 0.14 / H])
                         cb = fig.colorbar(h[k], cax=cax, orientation="horizontal")
                         cb.set_label("Training count" if k == "train" else "Validation count",
