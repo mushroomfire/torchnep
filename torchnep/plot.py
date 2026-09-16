@@ -262,20 +262,25 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=150):
                          rasterized=True, zorder=zorder, shading="flat")
 
 
-def _kde(x, grid, n_max=100_000, rng=np.random.default_rng(0)):
-    """Gaussian kernel density of ``x`` on ``grid`` (Silverman bandwidth),
-    on a random subsample of at most ``n_max`` points."""
+def _kde(x, grid):
+    """Gaussian kernel density of ``x`` on the uniform ``grid`` (Silverman
+    bandwidth, at least one grid step). Every point is used: the data are
+    binned on the grid and the histogram is smoothed with the kernel, so the
+    cost is O(N) and rare outliers are not lost to subsampling."""
     x = np.asarray(x, float).ravel()
-    if len(x) > n_max:
-        x = x[rng.choice(len(x), n_max, replace=False)]
+    if len(x) == 0:
+        return np.zeros_like(grid)
     sd = float(x.std())
+    step = float(grid[1] - grid[0])
     if sd <= 0:
         return np.zeros_like(grid)
-    h = 1.06 * sd * len(x) ** (-0.2)
-    out = np.zeros_like(grid)
-    for i in range(0, len(x), 20_000):
-        z = (grid[:, None] - x[None, i:i + 20_000]) / h
-        out += np.exp(-0.5 * z * z).sum(1)
+    h = max(1.06 * sd * len(x) ** (-0.2), step)
+    edges = np.concatenate([grid - step / 2, [grid[-1] + step / 2]])
+    counts, _ = np.histogram(x, bins=edges)
+    half = int(np.ceil(4 * h / step))
+    k = np.exp(-0.5 * (np.arange(-half, half + 1) * step / h) ** 2)
+    out = np.convolve(counts.astype(float), k, mode="same")[:len(grid)] if len(k) <= len(grid) \
+        else np.convolve(counts.astype(float), k, mode="full")[half:half + len(grid)]
     return out / (len(x) * h * np.sqrt(2 * np.pi))
 
 
