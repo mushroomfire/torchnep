@@ -247,13 +247,18 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=150):
     2-D histogram drawn with pcolormesh — O(N) and memory-light, so it
     works for hundreds of millions of points where hexbin does not. Empty
     bins are transparent. Returns the mappable (for a colorbar)."""
+    import matplotlib.pyplot as plt
     from matplotlib import colors as mcolors
     x0, x1, y0, y1 = extent
     nb = (bins, bins) if np.isscalar(bins) else bins
     h, xe, ye = np.histogram2d(np.asarray(x, float), np.asarray(y, float), bins=nb,
                                range=[[x0, x1], [y0, y1]])
     h = np.ma.masked_less(h.T, 1)
-    return ax.pcolormesh(xe, ye, h, cmap=cmap, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
+    # drop the near-white start of the colormap so that single-count bins
+    # (the outliers one looks for) stay visible on a white background
+    base = plt.get_cmap(cmap)
+    cm = mcolors.ListedColormap(base(np.linspace(0.3, 1.0, 256)), name=f"{base.name}_trunc")
+    return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
                          rasterized=True, zorder=zorder, shading="flat")
 
 
@@ -678,7 +683,7 @@ class NEPPlotter:
         an outlier list — needs ``natoms`` (atoms per frame, or the ``xyz``)
         to drop their force rows too."""
         import matplotlib.pyplot as plt
-        from matplotlib.ticker import LogLocator, NullFormatter
+        from matplotlib.ticker import LogLocator, NullLocator
         splits = [sp for sp in ("train", "test")
                   if os.path.exists(os.path.join(path, f"energy_{sp}.out"))]
         if not splits:
@@ -731,10 +736,8 @@ class NEPPlotter:
                         cb.set_label("Training count" if k == "train" else "Validation count",
                                      labelpad=1)
                         cb.ax.xaxis.set_major_locator(LogLocator(base=10, numticks=4))
-                        cb.ax.xaxis.set_minor_locator(LogLocator(base=10, subs="auto", numticks=6))
-                        cb.ax.xaxis.set_minor_formatter(NullFormatter())
+                        cb.ax.xaxis.set_minor_locator(NullLocator())
                         cb.ax.tick_params(length=1.5, pad=1, labelsize=self.rc["font.size"] - 1)
-                        cb.ax.tick_params(which="minor", length=1.0)
             if title:
                 fig.suptitle(title)
         return self._finish(fig, out)
