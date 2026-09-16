@@ -169,11 +169,21 @@ def _mae(a, b):
     return float(np.mean(np.abs(np.asarray(a, float) - np.asarray(b, float)))) if len(a) else float("nan")
 
 
-def _font_family(font):
-    """``font`` if matplotlib can find it, else None (matplotlib's default)."""
+def _font_family(font, font_dir=None):
+    """``font`` if matplotlib can find it, else None (matplotlib's default).
+    ``font_dir`` (or ``$TORCHNEP_FONT_DIR``): a folder of .ttf/.otf files
+    registered first — for machines without the font installed."""
     if not font:
         return None
     from matplotlib import font_manager as fm
+    font_dir = font_dir or os.environ.get("TORCHNEP_FONT_DIR")
+    if font_dir and os.path.isdir(font_dir):
+        for name in sorted(os.listdir(font_dir)):
+            if name.lower().endswith((".ttf", ".otf")):
+                try:
+                    fm.fontManager.addfont(os.path.join(font_dir, name))
+                except Exception:
+                    pass
     try:
         fm.findfont(fm.FontProperties(family=font), fallback_to_default=False)
         return font
@@ -344,15 +354,19 @@ class NEPPlotter:
     frame : bool
         ``False`` (default): only the left and bottom spines; ``True``: the
         full box with ticks on all four sides.
+    font_dir : str
+        Folder of .ttf/.otf files to register before looking up ``font``
+        (default: the ``TORCHNEP_FONT_DIR`` environment variable).
     rc : dict
         Extra matplotlib rcParams applied on top of the built-in style.
     """
 
     def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
-                 label_format="{}", label_weight="bold", frame=False, rc=None):
+                 label_format="{}", label_weight="bold", frame=False, rc=None,
+                 font_dir=None):
         import matplotlib  # noqa: F401  (fail early with a clear message)
-        fam = _font_family(font)
+        fam = _font_family(font, font_dir)
         fs = float(fontsize)
         self.rc = {
             "font.family": fam or "sans-serif",
