@@ -80,10 +80,20 @@ def test_all_figures(tmp_path):
         p.parity(tmp_path, kind=kind, margins=True, out=tmp_path / f"pred_{kind}.png")
     p.parity(tmp_path, quantities=("E", "F", "V", "S"), shift_energy="element",
              xyz=tmp_path / "data.xyz", out=tmp_path / "shift.png")
+    from torchnep.plot import exclude_frames
+    d = exclude_frames(read_outputs(tmp_path, "train"), [0, 5], [8] * 40)
+    assert len(d["E"]["ref"]) == 38 and len(d["F"]["ref"]) == 38 * 8 and d["V"]["mask"].sum() == 32   # frames 0, 5 carried no virial
+    p.parity(tmp_path, kind="density", exclude=[0, 5], xyz=tmp_path / "data.xyz", out=tmp_path / "excl.png")
     p.loss(tmp_path / "loss.out", out=tmp_path / "loss.png")
     p.errors(tmp_path, xyz=tmp_path / "data.xyz", out=tmp_path / "errors.png")
+    fig = p.periodic_table(path=tmp_path, xyz=tmp_path / "data.xyz", out=tmp_path / "ptable.png")
+    assert len(fig.axes) >= 2                                          # E and F tables
+    from torchnep.plot import element_errors
+    err = element_errors(tmp_path, tmp_path / "data.xyz")
+    assert set(err["F"]) == {"Cr", "Ni"} and err["n_atoms"]["Ni"] == 40 * 3
+    p.periodic_table(values={"x": {"Fe": 1.0, "Cu": 2.5}}, vmax=2.0, families=True, out=tmp_path / "ptable2.png")
     for name in ("dash", "dash_density", "parity_scatter", "parity_density", "pred_scatter",
-                 "pred_density", "shift", "loss", "errors"):
+                 "pred_density", "shift", "excl", "loss", "errors", "ptable", "ptable2"):
         assert (tmp_path / f"{name}.png").stat().st_size > 1000
 
 

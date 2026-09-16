@@ -414,7 +414,7 @@ p = NEPPlotter()
 p.dashboard("run", out="dashboard.png")                 # loss curves + E/F/stress parity, train and valid
 p.loss("run", out="loss.png")                            # the loss panel alone
 p.parity("run", out="parity.png")                        # E/F/stress parity plots (virial=True for the virial)
-p.parity("run", kind="density", margins=True,            # hexbin density + error distributions
+p.parity("run", kind="density", margins=True,            # hexagon density + error distributions
          out="parity_density.png")
 p.parity("pred", shift_energy="element", xyz="test.xyz", # data of another DFT reference: remove
          out="pred.png")                                 # the per-element energy offset first

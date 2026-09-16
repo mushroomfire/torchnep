@@ -28,3 +28,5 @@
 /test_stream/
 /TorchNEP_models/
 /bench_scaling/
+# macOS Finder metadata, in any folder
+.DS_Store

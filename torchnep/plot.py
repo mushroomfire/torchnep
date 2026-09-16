@@ -113,6 +113,27 @@ def read_outputs(path=".", split="train"):
     return out
 
 
+def exclude_frames(d, exclude, natoms):
+    """Copy of a :func:`read_outputs` dict without the frames in ``exclude``
+    (frame indices); ``natoms`` (atoms per frame) maps them to force rows."""
+    natoms = np.asarray(natoms, dtype=np.int64)
+    n = len(natoms)
+    keep = np.ones(n, bool)
+    keep[np.asarray(list(exclude), dtype=np.int64)] = False
+    out = {}
+    for key, v in d.items():
+        if key == "F":
+            if len(v["ref"]) != natoms.sum():
+                raise ValueError(f"force rows {len(v['ref'])} != sum of natoms {natoms.sum()}")
+            m = np.repeat(keep, natoms)
+        else:
+            if len(v["ref"]) != n:
+                raise ValueError(f"{key} rows {len(v['ref'])} != frames {n}")
+            m = keep
+        out[key] = {"pred": v["pred"][m], "ref": v["ref"][m], "mask": v["mask"][m]}
+    return out
+
+
 def stage2_epoch(path="."):
     """Epoch at which stage 2 started, from ``output.log`` ("Stage 2 from
     epoch N") or ``nep.in`` (``start_stage2``, else half of ``epoch`` when
@@ -169,11 +190,21 @@ def _mae(a, b):
     return float(np.mean(np.abs(np.asarray(a, float) - np.asarray(b, float)))) if len(a) else float("nan")
 
 
-def _font_family(font):
-    """``font`` if matplotlib can find it, else None (matplotlib's default)."""
+def _font_family(font, font_dir=None):
+    """``font`` if matplotlib can find it, else None (matplotlib's default).
+    ``font_dir`` (or ``$TORCHNEP_FONT_DIR``): a folder of .ttf/.otf files
+    registered first — for machines without the font installed."""
     if not font:
         return None
     from matplotlib import font_manager as fm
+    font_dir = font_dir or os.environ.get("TORCHNEP_FONT_DIR")
+    if font_dir and os.path.isdir(font_dir):
+        for name in sorted(os.listdir(font_dir)):
+            if name.lower().endswith((".ttf", ".otf")):
+                try:
+                    fm.fontManager.addfont(os.path.join(font_dir, name))
+                except Exception:
+                    pass
     try:
         fm.findfont(fm.FontProperties(family=font), fallback_to_default=False)
         return font
@@ -211,20 +242,98 @@ def _dark(cmap_name):
     return matplotlib.colormaps[cmap_name](0.85)
 
 
-def _kde(x, grid, n_max=100_000, rng=np.random.default_rng(0)):
-    """Gaussian kernel density of ``x`` on ``grid`` (Silverman bandwidth),
-    on a random subsample of at most ``n_max`` points."""
+def _hex_counts(x, y, extent, sx, sy, chunk=20_000_000):
+    """Counts of (x, y) in the regular hexagonal lattice with spacing ``sx``
+    (x) and ``sy`` (y) over ``extent`` — the two offset rectangular lattices
+    of matplotlib's hexbin, binned in chunks (O(N), little memory). Returns
+    (centres (M, 2), counts (M,)) of the occupied cells."""
+    x0, x1, y0, y1 = extent
+    nx, ny = int(np.ceil((x1 - x0) / sx)), int(np.ceil((y1 - y0) / sy))
+    n1 = (nx + 1) * (ny + 1)
+    counts = np.zeros(n1 + nx * ny, dtype=np.int64)
+    x, y = np.ravel(x), np.ravel(y)
+    for i in range(0, len(x), chunk):
+        u = (np.asarray(x[i:i + chunk], float) - x0) / sx
+        v = (np.asarray(y[i:i + chunk], float) - y0) / sy
+        ok = (u >= 0) & (u <= nx) & (v >= 0) & (v <= ny)
+        u, v = u[ok], v[ok]
+        i1, j1 = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
+        i2 = np.clip(np.floor(u).astype(np.int64), 0, nx - 1)
+        j2 = np.clip(np.floor(v).astype(np.int64), 0, ny - 1)
+        d1 = (u - i1) ** 2 + 3.0 * (v - j1) ** 2
+        d2 = (u - i2 - 0.5) ** 2 + 3.0 * (v - j2 - 0.5) ** 2
+        idx = np.where(d1 < d2, i1 * (ny + 1) + j1, n1 + i2 * ny + j2)
+        counts += np.bincount(idx, minlength=len(counts))
+    occ = np.nonzero(counts)[0]
+    first = occ < n1
+    cx = np.where(first, occ // (ny + 1), (occ - n1) // ny + 0.5)
+    cy = np.where(first, occ % (ny + 1), (occ - n1) % ny + 0.5)
+    return np.column_stack([x0 + cx * sx, y0 + cy * sy]), counts[occ]
+
+
+def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), cell="hex"):
+    """Log-count density of (x, y) over ``extent`` (x0, x1, y0, y1), binned
+    in O(N) with little memory (hundreds of millions of points are fine).
+    ``cell="hex"``: regular hexagons (regular on screen, whatever the axes'
+    aspect), ``bins`` of them across the x range; ``"square"``: a 2-D
+    histogram with ``bins`` cells per axis (or ``(nx, ny)``). Empty cells
+    are transparent. Returns the mappable (for a colorbar)."""
+    import matplotlib.pyplot as plt
+    from matplotlib import colors as mcolors
+    from matplotlib.collections import PolyCollection
+    x0, x1, y0, y1 = extent
+    # reversed colormap: sparse cells (the outliers one looks for) get the
+    # dark end, crowded cells on the diagonal the light end; cmap_range keeps
+    # clear of the colormap's white and black extremes
+    lo_c, hi_c = cmap_range
+    base = plt.get_cmap(cmap)
+    cm = mcolors.ListedColormap(base(np.linspace(float(hi_c), float(lo_c), 256)), name=f"{base.name}_rev")
+    if cell == "square":
+        nb = (bins, bins) if np.isscalar(bins) else bins
+        h, xe, ye = np.histogram2d(np.ravel(x).astype(float), np.ravel(y).astype(float), bins=nb,
+                                   range=[[x0, x1], [y0, y1]])
+        h = np.ma.masked_less(h.T, 1)
+        return ax.pcolormesh(xe, ye, h, cmap=cm, norm=mcolors.LogNorm(vmin=1, vmax=max(float(h.max()), 2)),
+                             rasterized=True, zorder=zorder, shading="flat")
+    if cell != "hex":
+        raise ValueError(f"cell must be 'hex' or 'square', got {cell!r}")
+    nx = int(bins if np.isscalar(bins) else bins[0])
+    sx = (x1 - x0) / nx
+    # y spacing for hexagons that are regular in display space
+    fw, fh = ax.figure.get_size_inches()
+    pos = ax.get_position()
+    w_in, h_in = pos.width * fw, pos.height * fh
+    sy = np.sqrt(3.0) * sx * ((y1 - y0) / h_in) / ((x1 - x0) / w_in)
+    centres, c = _hex_counts(x, y, extent, sx, sy)
+    hexagon = np.array([[0.5, -0.5], [0.5, 0.5], [0.0, 1.0], [-0.5, 0.5], [-0.5, -0.5], [0.0, -1.0]]) \
+        * [sx, sy / 3.0]
+    verts = centres[:, None, :] + hexagon[None, :, :]
+    col = PolyCollection(verts, array=c.astype(float), cmap=cm,
+                         norm=mcolors.LogNorm(vmin=1, vmax=max(float(c.max()) if len(c) else 2.0, 2.0)),
+                         edgecolors="face", linewidths=0.2, rasterized=True, zorder=zorder)
+    ax.add_collection(col)
+    return col
+
+
+def _kde(x, grid):
+    """Gaussian kernel density of ``x`` on the uniform ``grid`` (Silverman
+    bandwidth, at least one grid step). Every point is used: the data are
+    binned on the grid and the histogram is smoothed with the kernel, so the
+    cost is O(N) and rare outliers are not lost to subsampling."""
     x = np.asarray(x, float).ravel()
-    if len(x) > n_max:
-        x = x[rng.choice(len(x), n_max, replace=False)]
+    if len(x) == 0:
+        return np.zeros_like(grid)
     sd = float(x.std())
+    step = float(grid[1] - grid[0])
     if sd <= 0:
         return np.zeros_like(grid)
-    h = 1.06 * sd * len(x) ** (-0.2)
-    out = np.zeros_like(grid)
-    for i in range(0, len(x), 20_000):
-        z = (grid[:, None] - x[None, i:i + 20_000]) / h
-        out += np.exp(-0.5 * z * z).sum(1)
+    h = max(1.06 * sd * len(x) ** (-0.2), step)
+    edges = np.concatenate([grid - step / 2, [grid[-1] + step / 2]])
+    counts, _ = np.histogram(x, bins=edges)
+    half = int(np.ceil(4 * h / step))
+    k = np.exp(-0.5 * (np.arange(-half, half + 1) * step / h) ** 2)
+    out = np.convolve(counts.astype(float), k, mode="same")[:len(grid)] if len(k) <= len(grid) \
+        else np.convolve(counts.astype(float), k, mode="full")[half:half + len(grid)]
     return out / (len(x) * h * np.sqrt(2 * np.pi))
 
 
@@ -245,6 +354,74 @@ DEFAULT_COLORS = {"train": PALETTE["blue"], "valid": PALETTE["pink"],
 DEFAULT_CMAPS = {"train": "Blues", "valid": "Reds"}
 
 
+# Periodic-table layout: symbol -> (row, column), 18 columns, lanthanides and
+# actinides in two extra rows (rows 9 and 10, columns 4-18 in the usual way).
+_PT_ROWS = [
+    "H . . . . . . . . . . . . . . . . He",
+    "Li Be . . . . . . . . . . B C N O F Ne",
+    "Na Mg . . . . . . . . . . Al Si P S Cl Ar",
+    "K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr",
+    "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe",
+    "Cs Ba * Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn",
+    "Fr Ra ** Rf Db Sg Bh Hs Mt Ds Rg Cn Nh Fl Mc Lv Ts Og",
+    ". . . La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu",
+    ". . . Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr",
+]
+PT_POSITIONS = {}
+for _r, _row in enumerate(_PT_ROWS):
+    for _c, _sym in enumerate(_row.split()):
+        if _sym not in (".", "*", "**"):
+            PT_POSITIONS[_sym] = (_r + (0.5 if _r >= 7 else 0), _c)   # half a row of gap before the f-block
+
+
+# Chemical families (for the periodic-table outlines and legend)
+PT_FAMILIES = [
+    ("Alkali metals", "Li Na K Rb Cs Fr", "#1f77b4"),
+    ("Alkaline-earth metals", "Be Mg Ca Sr Ba Ra", "#17becf"),
+    ("3d transition metals", "Sc Ti V Cr Mn Fe Co Ni Cu Zn", "#2ca02c"),
+    ("4d transition metals", "Y Zr Nb Mo Tc Ru Rh Pd Ag Cd", "#98df8a"),
+    ("5d transition metals", "Hf Ta W Re Os Ir Pt Au Hg", "#bcbd22"),
+    ("Post-transition metals", "Al Ga In Sn Tl Pb Bi", "#ff7f0e"),
+    ("Metalloids", "B Si Ge As Sb Te", "#9467bd"),
+    ("Non-metals", "H C N O F P S Cl Se Br I", "#d62728"),
+    ("Noble gases", "He Ne Ar Kr Xe Rn", "#7f7f7f"),
+    ("Lanthanides (4f)", "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu", "#e377c2"),
+    ("Actinides (5f)", "Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr", "#c49c94"),
+]
+
+
+def element_errors(path, xyz, split="train"):
+    """Per-element RMSEs of the ``*_<split>.out`` outputs of ``path`` for the
+    frames of ``xyz``: ``{"E": {el: meV/atom}, "F": {el: meV/A},
+    "n_atoms": {el: count}, "n_frames": {el: count}}``. The force RMSE is
+    over the atoms of the element; the energy RMSE over the frames that
+    contain it (per-atom energies, every frame weighted once)."""
+    d = read_outputs(path, split)
+    natoms, species, _ = frame_meta(xyz)
+    out = {"E": {}, "F": {}, "n_atoms": {}, "n_frames": {}}
+    if "F" in d:
+        sym = np.concatenate([np.asarray(s) for s in species])
+        if len(sym) != len(d["F"]["ref"]):
+            raise ValueError(f"{xyz} has {len(sym)} atoms, the force file {len(d['F']['ref'])} rows")
+        err2 = ((d["F"]["pred"] - d["F"]["ref"]) ** 2).sum(1)
+        for e in np.unique(sym):
+            m = sym == e
+            out["F"][str(e)] = float(np.sqrt(err2[m].sum() / (3 * m.sum())) * 1e3)
+            out["n_atoms"][str(e)] = int(m.sum())
+    if "E" in d:
+        if len(natoms) != len(d["E"]["ref"]):
+            raise ValueError(f"{xyz} has {len(natoms)} frames, the energy file {len(d['E']['ref'])} rows")
+        de2 = (d["E"]["pred"] - d["E"]["ref"]) ** 2
+        frames_of = {}
+        for i, s in enumerate(species):
+            for e in set(s):
+                frames_of.setdefault(e, []).append(i)
+        for e, idx in frames_of.items():
+            out["E"][e] = float(np.sqrt(de2[idx].mean()) * 1e3)
+            out["n_frames"][e] = len(idx)
+    return out
+
+
 def _cm(*v):
     return tuple(x / 2.54 for x in v)
 
@@ -259,10 +436,14 @@ class NEPPlotter:
     fontsize : float
         Base font size in points (labels; ticks and legends one point smaller).
     dpi : int
-        Figure / saved-file resolution.
+        Figure / saved-file resolution (default 300).
     cmaps : dict
         Colormaps of the density (hexbin) panels per set, overrides of
         ``DEFAULT_CMAPS`` (``train``: Blues, ``valid``: Reds).
+    cmap_range : (float, float)
+        Part of each density colormap used (default ``(0.1, 0.9)``), applied
+        reversed: cells with few points (the outliers) take the dark end,
+        crowded cells the light end; the limits keep clear of pure white.
     max_points : int
         Scatter panels draw at most this many points (a fixed random
         subsample); metrics always use every point.
@@ -276,15 +457,19 @@ class NEPPlotter:
     frame : bool
         ``False`` (default): only the left and bottom spines; ``True``: the
         full box with ticks on all four sides.
+    font_dir : str
+        Folder of .ttf/.otf files to register before looking up ``font``
+        (default: the ``TORCHNEP_FONT_DIR`` environment variable).
     rc : dict
         Extra matplotlib rcParams applied on top of the built-in style.
     """
 
-    def __init__(self, font="Arial", fontsize=7, dpi=200, cmaps=None,
+    def __init__(self, font="Arial", fontsize=7, dpi=300, cmaps=None,
                  max_points=300_000, colors=None, panel_labels="abcdefghijkl",
-                 label_format="{}", label_weight="bold", frame=False, rc=None):
+                 label_format="{}", label_weight="bold", frame=False, rc=None,
+                 font_dir=None, cmap_range=(0.1, 0.9)):
         import matplotlib  # noqa: F401  (fail early with a clear message)
-        fam = _font_family(font)
+        fam = _font_family(font, font_dir)
         fs = float(fontsize)
         self.rc = {
             "font.family": fam or "sans-serif",
@@ -306,6 +491,7 @@ class NEPPlotter:
         self.colors = dict(DEFAULT_COLORS, **(colors or {}))
         self.cmaps = dict(DEFAULT_CMAPS, **(cmaps or {}))
         self.cmap = self.cmaps["train"]
+        self.cmap_range = (float(cmap_range[0]), float(cmap_range[1]))
         self.max_points = int(max_points)
         self.panel_labels = list(panel_labels) if panel_labels else []
         self.label_format = label_format
@@ -478,7 +664,7 @@ class NEPPlotter:
             self._rmse_curves(ax, d, stage2, keys)
         return self._finish(fig, out)
 
-    def _block(self, fig, box, sets, q, kind, margins):
+    def _block(self, fig, box, sets, q, kind, margins, bins=80, cell="hex"):
         """One quantity: square parity panel at ``box = (x0, y0, L)`` (cm) and,
         with ``margins``, the error against the DFT value on top and the
         error density on the right. Returns (main axes, top axes or None,
@@ -490,7 +676,7 @@ class NEPPlotter:
         def add(x, y, w, h):
             return fig.add_axes([x / W, y / H, w / W, h / H])
         ax = add(x0, y0, L, L)
-        handles = self._parity_overlay(ax, sets, q, kind)
+        handles = self._parity_overlay(ax, sets, q, kind, bins=bins, cell=cell)
         if not margins:
             return ax, None, handles
         ax_top = add(x0, y0 + L + gap, L, strip)
@@ -503,8 +689,7 @@ class NEPPlotter:
             errs.append((err, sk))
             color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
             if kind == "density":
-                ax_top.hexbin(ref, err, gridsize=(90, 22), mincnt=1, bins="log",
-                              cmap=self.cmaps[sk], rasterized=True, linewidths=0.1, zorder=2 + k)
+                pass                                    # drawn below, once the error range is known
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
@@ -522,6 +707,13 @@ class NEPPlotter:
                 lo, hi = lo - 0.5, hi + 0.5
             lo, hi = lo - 0.04 * (hi - lo), hi + 0.04 * (hi - lo)
             grid = np.linspace(lo, hi, 300)
+            if kind == "density":
+                xl = ax.get_xlim()
+                for k, (label, ref, pred, sk) in enumerate(sets):
+                    ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
+                    _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
+                             zorder=2 + k, cell=cell, cmap_range=self.cmap_range,
+                             bins=bins if cell == "hex" else (bins, max(10, bins // 3)))
             for err, sk in errs:
                 color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
                 dens = _kde(err, grid)
@@ -537,10 +729,11 @@ class NEPPlotter:
         return ax, ax_top, handles
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
-               quantities=None, size=4.0, shift_energy=None, xyz=None, title=None):
+               quantities=None, size=4.0, shift_energy=None, xyz=None, title=None,
+               exclude=None, natoms=None, bins=80, cell="hex"):
         """Parity plots of the run in ``path``: energy, force and stress (the
         last only with stress labels) with training and validation overlaid
-        and R^2 / RMSE / MAE per set. ``kind="density"``: log-count hexbins
+        and R^2 / RMSE / MAE per set. ``kind="density"``: log-count 2-D histograms
         (training Blues, validation Reds) with a small horizontal colorbar
         under every panel. ``margins=True`` adds the error distribution
         around each panel: NEP − DFT against the DFT value on top, a kernel
@@ -549,14 +742,25 @@ class NEPPlotter:
         ``quantities`` overrides the panels altogether (any of ``E F V S``);
         ``shift_energy`` (``"mean"`` /
         ``"element"``, needs ``xyz``) removes a reference offset from the
-        predicted energies; ``size`` is the side of one panel in cm."""
+        predicted energies; ``size`` is the side of one panel in cm.
+        ``exclude``: frame indices (of the training split) to leave out, e.g.
+        an outlier list — needs ``natoms`` (atoms per frame, or the ``xyz``)
+        to drop their force rows too. ``bins``: density cells across the x
+        axis (default 80; fewer = larger cells); ``cell``: ``"hex"`` (default)
+        or ``"square"``."""
         import matplotlib.pyplot as plt
-        from matplotlib.ticker import LogLocator, NullFormatter
+        from matplotlib.ticker import LogLocator, NullLocator
         splits = [sp for sp in ("train", "test")
                   if os.path.exists(os.path.join(path, f"energy_{sp}.out"))]
         if not splits:
             raise FileNotFoundError(f"no energy_train.out / energy_test.out in {path}")
         data = {sp: read_outputs(path, sp) for sp in splits}
+        if exclude is not None and "train" in data:
+            if natoms is None:
+                if xyz is None:
+                    raise ValueError("exclude= needs natoms= (atoms per frame) or xyz=")
+                natoms = frame_meta(xyz)[0]
+            data["train"] = exclude_frames(data["train"], exclude, natoms)
         if shift_energy:
             meta = frame_meta(xyz) if xyz else None
             for sp in splits:
@@ -581,7 +785,7 @@ class NEPPlotter:
             mains, tops, per_block = [], [], []
             for i, q in enumerate(qs):
                 ax, ax_top, h = self._block(fig, (i * block + left, bottom, L),
-                                            self._sets(data, q), q, kind, margins)
+                                            self._sets(data, q), q, kind, margins, bins=bins, cell=cell)
                 mains.append(ax)
                 tops.append(ax_top)
                 per_block.append(h)
@@ -590,20 +794,92 @@ class NEPPlotter:
             if kind == "density":
                 for i, h in enumerate(per_block):
                     keys = [k for k in ("train", "valid") if k in h]
-                    bw = (L - 0.3 * (len(keys) - 1)) / max(1, len(keys))
+                    bw = (L - 0.6 * (len(keys) - 1)) / max(1, len(keys))
                     for j, k in enumerate(keys):
-                        x = (i * block + left + j * (bw + 0.3)) / W
+                        x = (i * block + left + j * (bw + 0.6)) / W
                         cax = fig.add_axes([x, 0.5 / H, bw / W, 0.14 / H])
                         cb = fig.colorbar(h[k], cax=cax, orientation="horizontal")
                         cb.set_label("Training count" if k == "train" else "Validation count",
                                      labelpad=1)
                         cb.ax.xaxis.set_major_locator(LogLocator(base=10, numticks=4))
-                        cb.ax.xaxis.set_minor_locator(LogLocator(base=10, subs="auto", numticks=6))
-                        cb.ax.xaxis.set_minor_formatter(NullFormatter())
+                        cb.ax.xaxis.set_minor_locator(NullLocator())
                         cb.ax.tick_params(length=1.5, pad=1, labelsize=self.rc["font.size"] - 1)
-                        cb.ax.tick_params(which="minor", length=1.0)
             if title:
                 fig.suptitle(title)
+        return self._finish(fig, out)
+
+    def periodic_table(self, values=None, path=None, xyz=None, split="train",
+                       quantities=("E", "F"), out=None, cmap="YlOrRd", vmax=None,
+                       title=None, size=0.62, families=False):
+        """Periodic table coloured by a per-element number: either the
+        per-element RMSEs of a run (``path`` + ``xyz`` -> :func:`element_errors`,
+        one table per entry of ``quantities``) or your own ``values``
+        (``{label: {element: value}}``). Elements without a value are grey.
+        ``vmax``: colour-scale top (default: the largest value); ``size``: cell
+        side in cm; ``families=True`` outlines the chemical families of the
+        elements that carry a value (``PT_FAMILIES``) with a legend below."""
+        import matplotlib.pyplot as plt
+        from matplotlib import colors as mcolors
+        from matplotlib.patches import Rectangle
+        if values is None:
+            if path is None or xyz is None:
+                raise ValueError("periodic_table needs values= or path= and xyz=")
+            errs = element_errors(path, xyz, split)
+            units = {"E": "Energy RMSE (meV/atom)", "F": "Force RMSE (meV/Å)"}
+            values = {units[q]: errs[q] for q in quantities if errs.get(q)}
+        panels = list(values.items())
+        ncol, nrow = 18, 9.5
+        w = ncol * size + 0.4
+        h = len(panels) * (nrow * size + 1.2 + (1.4 if families else 0.0))
+        with plt.rc_context(self.rc):
+            fig, axes = plt.subplots(len(panels), 1, figsize=_cm(w, h), squeeze=False)
+            for ax, (label, vals) in zip(axes.ravel(), panels):
+                vmax_ = vmax or (max(vals.values()) if vals else 1.0)
+                norm = mcolors.Normalize(vmin=0.0, vmax=vmax_)
+                cm_ = plt.get_cmap(cmap)
+                for sym, (r, c) in PT_POSITIONS.items():
+                    x, y = c, nrow - 1 - r
+                    if sym in vals:
+                        v = vals[sym]
+                        fc = cm_(norm(v))
+                        lum = 0.299 * fc[0] + 0.587 * fc[1] + 0.114 * fc[2]
+                        tc = "white" if lum < 0.5 else "black"
+                        ax.add_patch(Rectangle((x, y), 1, 1, facecolor=fc, edgecolor="white", lw=0.6))
+                        ax.text(x + 0.5, y + 0.62, sym, ha="center", va="center", color=tc,
+                                fontsize=self.rc["font.size"], fontweight="bold")
+                        ax.text(x + 0.5, y + 0.24, f"{v:.0f}" if v >= 10 else f"{v:.1f}",
+                                ha="center", va="center", color=tc, fontsize=self.rc["font.size"] - 1.5)
+                    else:
+                        ax.add_patch(Rectangle((x, y), 1, 1, facecolor="#ececec", edgecolor="white", lw=0.6))
+                        ax.text(x + 0.5, y + 0.5, sym, ha="center", va="center", color="#9a9a9a",
+                                fontsize=self.rc["font.size"] - 1)
+                if families:
+                    handles = []
+                    for name, syms, color in PT_FAMILIES:
+                        members = [t for t in syms.split() if t in vals]
+                        if not members:
+                            continue
+                        for t in members:
+                            r, c = PT_POSITIONS[t]
+                            ax.add_patch(Rectangle((c + 0.06, nrow - 1 - r + 0.06), 0.88, 0.88, fill=False,
+                                                   edgecolor=color, lw=1.6, zorder=5))
+                        handles.append(Rectangle((0, 0), 1, 1, fill=False, edgecolor=color, lw=1.6, label=name))
+                    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.0, -0.01), ncol=4,
+                              frameon=False, handlelength=1.2, labelspacing=0.4, columnspacing=1.2)
+                ax.set_xlim(0, ncol)
+                ax.set_ylim(0, nrow)
+                ax.set_aspect("equal")
+                ax.axis("off")
+                sm = plt.cm.ScalarMappable(norm=norm, cmap=cm_)
+                cax = ax.inset_axes([3.2 / ncol, (nrow - 1.9) / nrow, 8.0 / ncol, 0.32 / nrow])
+                cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+                cb.set_label(label, labelpad=2)
+                cb.ax.tick_params(length=1.5, pad=1)
+                if vmax is not None and max(vals.values(), default=0) > vmax:
+                    cb.ax.set_title(f"> {vmax:g} saturated", fontsize=self.rc["font.size"] - 1, pad=1)
+            if title:
+                fig.suptitle(title)
+            fig.tight_layout(pad=0.3)
         return self._finish(fig, out)
 
     def errors(self, path, split="train", out=None, xyz=None,
@@ -638,7 +914,7 @@ class NEPPlotter:
             fig.tight_layout()
         return self._finish(fig, out)
 
-    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True):
+    def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True, bins=80, cell="hex"):
         """Training and validation points of one quantity in one panel (full
         range, diagonal). ``sets``: ``(label, ref, pred, set_key)`` tuples,
         ``set_key`` in {"train", "valid"}. ``kind="density"`` draws every set
@@ -660,9 +936,8 @@ class NEPPlotter:
                 continue
             color = self.colors[sk]
             if kind == "density":
-                handles[sk] = ax.hexbin(ref, pred, gridsize=110, extent=(lo, hi, lo, hi), mincnt=1,
-                                        bins="log", cmap=self.cmaps[sk], rasterized=True,
-                                        linewidths=0.1, zorder=2 + k)
+                handles[sk] = _density(ax, ref, pred, (lo, hi, lo, hi), self.cmaps[sk], zorder=2 + k,
+                                       bins=bins, cell=cell, cmap_range=self.cmap_range)
             else:
                 if len(ref) > self.max_points:
                     sel = self._rng.choice(len(ref), self.max_points, replace=False)
