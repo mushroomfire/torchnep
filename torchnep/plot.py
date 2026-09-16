@@ -731,7 +731,17 @@ class NEPPlotter:
             ax_right.set_xlim(0, None)
         ax_right.set_xlabel("Density")
         ax_right.set_xticks([])
-        ax_right.tick_params(labelleft=False)
+        # the error axis of the density strip is labelled on its own right side (the left side faces the parity
+        # panel, whose y axis is the NEP value, not the error): same range and ticks as the error strip on top
+        ax_right.spines["left"].set_visible(False)
+        ax_right.spines["right"].set_visible(True)
+        ax_right.yaxis.tick_right()
+        ax_right.yaxis.set_label_position("right")
+        ax_right.tick_params(axis="y", left=False, labelleft=False, right=True, labelright=True)
+        if ax_top is not None:
+            ax_right.set_yticks(ax_top.get_yticks())
+            ax_right.set_ylim(ax_top.get_ylim())
+        ax_right.set_ylabel("Error", rotation=270, labelpad=8)
         return ax, ax_top, handles
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
@@ -780,7 +790,7 @@ class NEPPlotter:
         L = float(size)
         left, top, gap = 1.25, 0.55, 0.12                  # margins in cm
         strip = 0.3 * L if margins else 0.0
-        right = 0.35 + (strip + gap if margins else 0.0)
+        right = 0.35 + (strip + gap + 0.9 if margins else 0.0)     # + room for the error ticks/label of the density strip
         cbar_h = 0.75 if kind == "density" else 0.0         # bar + its label
         bottom = 0.95 + cbar_h
         block = left + L + right
