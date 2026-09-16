@@ -317,28 +317,6 @@ def _density(ax, x, y, extent, cmap, zorder=2, bins=80, cmap_range=(0.1, 0.9), c
     return col
 
 
-def _kde(x, grid):
-    """Gaussian kernel density of ``x`` on the uniform ``grid`` (Silverman
-    bandwidth, at least one grid step). Every point is used: the data are
-    binned on the grid and the histogram is smoothed with the kernel, so the
-    cost is O(N) and rare outliers are not lost to subsampling."""
-    x = np.asarray(x, float).ravel()
-    if len(x) == 0:
-        return np.zeros_like(grid)
-    sd = float(x.std())
-    step = float(grid[1] - grid[0])
-    if sd <= 0:
-        return np.zeros_like(grid)
-    h = max(1.06 * sd * len(x) ** (-0.2), step)
-    edges = np.concatenate([grid - step / 2, [grid[-1] + step / 2]])
-    counts, _ = np.histogram(x, bins=edges)
-    half = int(np.ceil(4 * h / step))
-    k = np.exp(-0.5 * (np.arange(-half, half + 1) * step / h) ** 2)
-    out = np.convolve(counts.astype(float), k, mode="same")[:len(grid)] if len(k) <= len(grid) \
-        else np.convolve(counts.astype(float), k, mode="full")[half:half + len(grid)]
-    return out / (len(x) * h * np.sqrt(2 * np.pi))
-
-
 _QTY = {   # key: (title, unit, error unit, error scale)
     "E": ("Energy", "eV/atom", "meV/atom", 1e3),
     "F": ("Force", "eV/Å", "meV/Å", 1e3),
@@ -390,6 +368,15 @@ PT_FAMILIES = [
     ("Lanthanides (4f)", "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu", "#e377c2"),
     ("Actinides (5f)", "Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr", "#c49c94"),
 ]
+
+
+def _equal_ticks(ax, lo, hi, nbins=5):
+    """Parity panel: the same limits and the same tick positions on the DFT (x) and NEP (y) axes."""
+    from matplotlib.ticker import MaxNLocator
+    t = MaxNLocator(nbins=nbins, steps=[1, 2, 2.5, 5, 10]).tick_values(lo, hi)
+    t = t[(t >= lo - 1e-9 * (hi - lo)) & (t <= hi + 1e-9 * (hi - lo))]
+    ax.set_xticks(t); ax.set_yticks(t)
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
 
 
 def element_errors(path, xyz, split="train"):
@@ -563,8 +550,7 @@ class NEPPlotter:
             ax.scatter(r, p, s=4, alpha=0.5, color=color, edgecolors="none",
                        rasterized=True)
         ax.plot([lo, hi], [lo, hi], "--", color="0.3", lw=0.8, zorder=0)
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
+        _equal_ticks(ax, lo, hi)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(f"DFT {title.lower()} ({unit})")
         ax.set_ylabel(f"NEP {title.lower()} ({unit})")
@@ -672,9 +658,8 @@ class NEPPlotter:
 
     def _block(self, fig, box, sets, q, kind, margins, bins=80, cell="hex"):
         """One quantity: square parity panel at ``box = (x0, y0, L)`` (cm) and,
-        with ``margins``, the error against the DFT value on top and the
-        error density on the right. Returns (main axes, top axes or None,
-        hexbin handles)."""
+        with ``margins``, the error (NEP − DFT) against the DFT value in a strip
+        on top. Returns (main axes, top axes or None, density handles)."""
         W, H = fig.get_size_inches() * 2.54
         x0, y0, L = box
         gap, strip = 0.12, 0.3 * L
@@ -686,8 +671,6 @@ class NEPPlotter:
         if not margins:
             return ax, None, handles
         ax_top = add(x0, y0 + L + gap, L, strip)
-        ax_right = add(x0 + L + gap, y0, strip, L)
-        title, unit, _, _ = _QTY[q]
         errs = []
         for k, (label, ref, pred, sk) in enumerate(sets):
             ref, pred = np.ravel(ref).astype(float), np.ravel(pred).astype(float)
@@ -703,6 +686,7 @@ class NEPPlotter:
                 ax_top.scatter(ref, err, s=2, alpha=0.5, color=color, edgecolors="none",
                                rasterized=True, zorder=2 + k)
         ax_top.axhline(0.0, color="grey", lw=0.7, ls="--", zorder=1)
+        ax_top.set_xticks(ax.get_xticks())
         ax_top.set_xlim(ax.get_xlim())
         ax_top.set_ylabel("Error")               # same unit as the axes below
         ax_top.tick_params(labelbottom=False)
@@ -712,7 +696,6 @@ class NEPPlotter:
             if hi - lo < 1e-12:
                 lo, hi = lo - 0.5, hi + 0.5
             lo, hi = lo - 0.04 * (hi - lo), hi + 0.04 * (hi - lo)
-            grid = np.linspace(lo, hi, 300)
             if kind == "density":
                 xl = ax.get_xlim()
                 for k, (label, ref, pred, sk) in enumerate(sets):
@@ -720,28 +703,7 @@ class NEPPlotter:
                     _density(ax_top, ref, pred - ref, (xl[0], xl[1], lo, hi), self.cmaps[sk],
                              zorder=2 + k, cell=cell, cmap_range=self.cmap_range, cmap_reverse=self.cmap_reverse,
                              bins=bins if cell == "hex" else (bins, max(10, bins // 3)))
-            for err, sk in errs:
-                color = self.colors[sk] if kind != "density" else _dark(self.cmaps[sk])
-                dens = _kde(err, grid)
-                ax_right.fill_betweenx(grid, 0, dens, color=color, alpha=0.35, lw=0)
-                ax_right.plot(dens, grid, color=color, lw=0.9)
-            ax_right.axhline(0.0, color="grey", lw=0.7, ls="--", zorder=1)
             ax_top.set_ylim(lo, hi)
-            ax_right.set_ylim(lo, hi)
-            ax_right.set_xlim(0, None)
-        ax_right.set_xlabel("Density")
-        ax_right.set_xticks([])
-        # the error axis of the density strip is labelled on its own right side (the left side faces the parity
-        # panel, whose y axis is the NEP value, not the error): same range and ticks as the error strip on top
-        ax_right.spines["left"].set_visible(False)
-        ax_right.spines["right"].set_visible(True)
-        ax_right.yaxis.tick_right()
-        ax_right.yaxis.set_label_position("right")
-        ax_right.tick_params(axis="y", left=False, labelleft=False, right=True, labelright=True)
-        if ax_top is not None:
-            ax_right.set_yticks(ax_top.get_yticks())
-            ax_right.set_ylim(ax_top.get_ylim())
-        ax_right.set_ylabel("Error", rotation=270, labelpad=8)
         return ax, ax_top, handles
 
     def parity(self, path, kind="scatter", margins=False, virial=False, out=None,
@@ -751,9 +713,9 @@ class NEPPlotter:
         last only with stress labels) with training and validation overlaid
         and R^2 / RMSE / MAE per set. ``kind="density"``: log-count 2-D histograms
         (training Blues, validation Reds) with a small horizontal colorbar
-        under every panel. ``margins=True`` adds the error distribution
-        around each panel: NEP − DFT against the DFT value on top, a kernel
-        density estimate of the error on the right. ``virial=True`` shows the
+        under every panel. ``margins=True`` adds a strip on top of each panel
+        with the error NEP − DFT against the DFT value. The DFT and NEP axes
+        share limits and ticks. ``virial=True`` shows the
         virial (eV/atom) instead of the stress in the third panel;
         ``quantities`` overrides the panels altogether (any of ``E F V S``);
         ``shift_energy`` (``"mean"`` /
@@ -790,7 +752,7 @@ class NEPPlotter:
         L = float(size)
         left, top, gap = 1.25, 0.55, 0.12                  # margins in cm
         strip = 0.3 * L if margins else 0.0
-        right = 0.35 + (strip + gap + 0.9 if margins else 0.0)     # + room for the error ticks/label of the density strip
+        right = 0.35
         cbar_h = 0.75 if kind == "density" else 0.0         # bar + its label
         bottom = 0.95 + cbar_h
         block = left + L + right
@@ -976,8 +938,7 @@ class NEPPlotter:
                         transform=ax.transAxes, ha=c["ha"], va=c["va"], color=tcolor,
                         fontsize=self.rc["font.size"], linespacing=1.3, zorder=10)
         ax.plot([lo, hi], [lo, hi], "--", color="grey", lw=0.8, zorder=1)
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
+        _equal_ticks(ax, lo, hi)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(f"DFT {title.lower()} ({unit})")
         ax.set_ylabel(f"NEP {title.lower()} ({unit})")

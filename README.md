@@ -414,7 +414,7 @@ p = NEPPlotter()
 p.dashboard("run", out="dashboard.png")                 # loss curves + E/F/stress parity, train and valid
 p.loss("run", out="loss.png")                            # the loss panel alone
 p.parity("run", out="parity.png")                        # E/F/stress parity plots (virial=True for the virial)
-p.parity("run", kind="density", margins=True,            # hexagon density + error distributions
+p.parity("run", kind="density", margins=True,            # hexagon density + error strip on top
          out="parity_density.png")
 p.parity("pred", shift_energy="element", xyz="test.xyz", # data of another DFT reference: remove
          out="pred.png")                                 # the per-element energy offset first
@@ -429,7 +429,7 @@ style for every figure.
   <sub><em><code>p.dashboard("run")</code></em></sub>
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_margins_density.png" alt="parity plots with error distributions" width="95%">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/plot_parity_margins_density.png" alt="parity plots with error strips" width="95%">
   <br>
   <sub><em><code>p.parity("run", kind="density", margins=True)</code></em></sub>
 </p>
