@@ -22,4 +22,4 @@
 
 - [ ] `pytest` passes locally
 - [ ] New behaviour is covered by a test
-- [ ] README updated if user-facing (leave `releaseNotes.md` and the version number to the maintainers)
+- [ ] Documentation (`docs/`) updated if user-facing (leave `docs/release-notes.md` and the version number to the maintainers)
