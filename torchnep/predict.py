@@ -90,14 +90,15 @@ class _Progress:
     """Frames-done progress line for predict_dataset: tqdm when installed,
     otherwise a dependency-free single-line bar. Silent when verbose=False."""
 
-    def __init__(self, total, enabled):
+    def __init__(self, total, enabled, desc="predict"):
         self.total, self.enabled, self.n, self.t0 = total, enabled, 0, time.time()
+        self.desc = desc
         self.bar = None
         if enabled:
             try:
                 from tqdm import tqdm
                 self.bar = tqdm(total=total, unit="frame", unit_scale=True,
-                                desc="  predict", dynamic_ncols=True, leave=True)
+                                desc=f"  {desc}", dynamic_ncols=True, leave=True)
             except Exception:
                 self.bar = None
                 self._draw()
@@ -115,7 +116,7 @@ class _Progress:
         frac = self.n / max(1, self.total); el = time.time() - self.t0
         eta = el / frac - el if frac > 0 else 0.0
         width = 30; done = int(width * frac)
-        print(f"\r  predict [{'#' * done}{'-' * (width - done)}] {self.n}/{self.total} frames "
+        print(f"\r  {self.desc} [{'#' * done}{'-' * (width - done)}] {self.n}/{self.total} frames "
               f"{100 * frac:5.1f}%  {el:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
 
     def close(self):
