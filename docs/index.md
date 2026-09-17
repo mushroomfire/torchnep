@@ -1,5 +1,4 @@
 ---
-title: TorchNEP
 hide:
   - navigation
   - toc
