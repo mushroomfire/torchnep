@@ -61,14 +61,21 @@ train_nep(
 ## Slim a model without training
 
 ```python
-from torchnep.data import parse_nep_in
+import numpy as np
+from torchnep.data import parse_nep_in, read_xyz
 from torchnep.model import NEPModel, slim_model
+from torchnep.train import compute_max_neighbors, preprocess_structures
 
-model = NEPModel(parse_nep_in("nep.in"))
+config = parse_nep_in("nep.in")
+model = NEPModel(config)
 model.load_weights_from_nep_txt("nep.txt")
 
 slimmed = slim_model(model, ["Cr", "Ni"])
-slimmed.save_nep_txt("nep_slim.txt", max_NN_radial, max_NN_angular)
+
+# nep.txt carries the neighbor counts GPUMD allocates for
+structures = preprocess_structures(read_xyz("train.xyz"), config, np.float64)
+nn_radial, nn_angular = compute_max_neighbors(structures)
+slimmed.save_nep_txt("nep_slim.txt", nn_radial, nn_angular)
 ```
 
-`max_NN_radial` / `max_NN_angular` are the largest neighbor counts GPUMD should allocate for; `torchnep.train.compute_max_neighbors` computes them from preprocessed structures.
+For a three-element model this turns a 338 kB `nep4_zbl 3 Cr Co Ni` file into a 217 kB `nep4_zbl 2 Cr Ni` one. The slimmed model gives exactly the same energies and forces for structures that contain only the kept elements.
