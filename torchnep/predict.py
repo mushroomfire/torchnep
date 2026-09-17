@@ -513,7 +513,8 @@ def predict_dataset(
 
     The format mirrors GPUMD's *_train.out files, so the two can be diffed
     column by column. When reference labels are present, a summary of the
-    energy/force/virial RMSE and MAE is printed at the end.
+    energy/force/virial RMSE and MAE is printed at the end. The contraction
+    backend is chosen automatically (see ``torchnep.ops.resolve_backend``).
 
     Parameters
     ----------
@@ -530,9 +531,6 @@ def predict_dataset(
         0 — disabled (default).
         1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
         2 — write per-atom ``q * q_scaler`` to descriptor.out.
-
-    The contraction backend is chosen automatically (see
-    ``torchnep.ops.resolve_backend``).
     """
     from .train import _default_alloc_conf
     from .data import index_xyz
