@@ -327,7 +327,11 @@ class _Element:
         the subspace. Returns the kept column mask."""
         keep = torch.ones(x.shape[1], dtype=torch.bool, device=x.device)
         while True:
-            LU, piv = torch.linalg.lu_factor(x[:, keep])
+            try:
+                LU, piv = torch.linalg.lu_factor(x[:, keep])
+            except RuntimeError:              # backends without rectangular LU
+                LU, piv = torch.linalg.lu_factor(x[:, keep].cpu())
+                LU = LU.to(x.device)
             diag = torch.diagonal(LU).abs()
             bad = diag <= 1e-9 * diag.max()
             if not bool(bad.any()):
