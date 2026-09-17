@@ -1,11 +1,11 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mushroomfire/torchnep/master/docs/assets/logo-mark-dark.png">
     <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/docs/assets/logo-mark.png" alt="TorchNEP logo" width="110">
   </picture>
-</p>
-
-<h1 align="center">TorchNEP</h1>
+  <br>
+  TorchNEP
+</h1>
 
 <p align="center">Train NEP machine-learned interatomic potentials in PyTorch — the models run directly in GPUMD.</p>
 
@@ -25,7 +25,7 @@
   <a href="https://mushroomfire.github.io/torchnep/citation/">Citation</a>
 </p>
 
-TorchNEP is a pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (neuroevolution potential) training framework. Trained models are written as GPUMD `nep.txt` files.
+TorchNEP is a from-scratch implementation of [NEP4](https://gpumd.org/theory/nep.html), the neuroevolution potential architecture.
 
 - **GPUMD-compatible** — `nep.txt` files load directly into GPUMD for molecular dynamics
 - **Two-stage training** — a force-focused stage, then an energy-focused stage
