@@ -81,18 +81,17 @@ p.parity("pred", shift_energy="element", xyz="other_data.xyz", out="parity_shift
 ## Error distributions
 
 ```python
-p.errors("run", xyz="train.xyz", out="errors.png")
+p.errors("run", out="errors.png")
 ```
 
-Histograms of NEP − DFT for E / F / V and the force error against the force magnitude; with the `xyz` the outputs belong to, also the force RMSE per element and the energy RMSE per `config_type`.
+One histogram of NEP − DFT per quantity on a log count axis, training and validation overlaid in the parity colours, each annotated with its RMSE, MAE and largest error; the last panel shows the force error against the force magnitude.
 
 <figure markdown>
 ![Error distributions](../assets/plot_errors.png)
-<figcaption><code>p.errors("run", xyz="train.xyz")</code></figcaption>
+<figcaption><code>p.errors("run")</code></figcaption>
 </figure>
 
-!!! note "Which xyz belongs to the outputs"
-    `*_train.out` holds the training split. With `valid_ratio`, write that split out with [`export_valid_split`](training.md#validation) (same `run_seed` and `valid_strategy`) and pass its `train.xyz`; `*_test.out` pairs with the `test.xyz` of the same call.
+`quantities` picks the panels, `force_magnitude=False` drops the last one, `bins` sets the histogram bins and `shift_energy` works as in `parity`. Errors per element have their own figure, below.
 
 ## Errors per element
 
@@ -101,6 +100,9 @@ p.periodic_table(path="pred", xyz="test.xyz", families=True, out="table.png")
 ```
 
 Each element is coloured by its energy and force RMSE; elements without data stay grey, and `families=True` outlines the chemical families. `element_errors(path, xyz)` returns the same numbers as a dict.
+
+!!! note "Which xyz belongs to the outputs"
+    `*_train.out` holds the training split. With `valid_ratio`, write that split out with [`export_valid_split`](training.md#validation) (same `run_seed` and `valid_strategy`) and pass its `train.xyz`; `*_test.out` pairs with the `test.xyz` of the same call.
 
 <figure markdown>
 ![Periodic table of per-element errors](../assets/plot_periodic_table.png){ width="620" }

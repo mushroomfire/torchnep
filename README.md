@@ -35,7 +35,7 @@ TorchNEP is a pure PyTorch implementation of the [NEP4](https://gpumd.org/theory
 - **Fine-tuning, ZBL, plots** — start from any `nep.txt`, add short-range repulsion, plot every run
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
+  <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/docs/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
 </p>
 
 ## Installation
