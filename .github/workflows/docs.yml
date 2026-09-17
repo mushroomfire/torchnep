@@ -1,0 +1,45 @@
+name: docs
+
+# Builds the documentation site (MkDocs Material) on every pull request and
+# publishes it to GitHub Pages (branch gh-pages) on every push to master.
+# One-time setup: Settings -> Pages -> Source "Deploy from a branch", gh-pages / (root).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MkDocs
+        run: pip install ".[docs]"
+
+      - name: Build (pull requests)
+        if: github.event_name == 'pull_request'
+        run: mkdocs build --strict
+
+      - name: Publish to GitHub Pages
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdocs gh-deploy --force --strict

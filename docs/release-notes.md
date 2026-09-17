@@ -1,5 +1,19 @@
 # Release Notes
 
+## 1.0.6a1
+
+- **Documentation site**: the full documentation now lives at
+  <https://mushroomfire.github.io/torchnep/> (sources in `docs/`, built with
+  MkDocs Material); the README is a short overview and these release notes
+  moved to `docs/release-notes.md`.
+- **Error figure redesigned** (`NEPPlotter.errors`): one histogram of
+  NEP − DFT per quantity with training and validation overlaid and annotated
+  with RMSE / MAE / max, plus the force error against the force magnitude, in
+  the style of the parity panels. New `quantities`, `force_magnitude` and
+  `bins` arguments; the per-element and per-`config_type` bars are gone
+  (`periodic_table` draws the per-element errors) and with them the `split`
+  argument.
+
 ## 1.0.5
 
 - **Plots**: `torchnep.plot.NEPPlotter` (`pip install torchnep[plot]`) — loss curves, E/F/V parity plots (scatter or hexagonal density), error distributions per element and config type, a training dashboard and periodic-table error maps.

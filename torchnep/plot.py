@@ -17,15 +17,15 @@ Everything is read from the files torchnep (and GPUMD) write:
 ``loss.out`` and ``energy_train.out`` / ``force_train.out`` /
 ``virial_train.out`` / ``stress_train.out`` (``*_test.out`` for the
 validation set; ``predict_dataset`` writes the same files). Optionally the
-extended-XYZ the outputs were computed for, to break errors down by element
-and ``config_type`` and to shift energies per element.
+extended-XYZ the outputs were computed for, to break errors down per
+element and to shift energies per element.
 
     from torchnep.plot import NEPPlotter
     p = NEPPlotter()                                  # Arial if installed
     p.loss("run/loss.out", out="loss.png")
     p.parity("run", split="train", kind="density", out="parity.png")
     p.dashboard("run", out="dashboard.png")           # loss + train/test parity
-    p.prediction("pred", xyz="test.xyz", out="pred.png")
+    p.errors("run", out="errors.png")                 # error distributions
 
 Every method returns the matplotlib Figure; with ``out`` it is also saved
 (and closed). Axis ranges always cover the full data, so outliers stay
@@ -34,7 +34,6 @@ visible.
 import os
 import re
 import warnings
-from collections import Counter
 
 import numpy as np
 
@@ -560,81 +559,60 @@ class NEPPlotter:
                 transform=ax.transAxes, ha="left", va="top", fontsize=self._small(),
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.75))
 
-    def _hist_panel(self, ax, err, key, color=None, bins=120):
-        """Histogram of ``pred - ref`` in the error unit, with RMSE / MAE / max."""
-        err = np.asarray(err, float).ravel() * _QTY[key][3]
-        title, _, eunit, _ = _QTY[key]
-        ax.set_title(f"{title} error")
-        if len(err) == 0:
+    def _hist_panel(self, ax, sets, key, bins=120):
+        """Histograms of ``pred - ref`` of every set in the error unit, log
+        counts, each annotated with RMSE / MAE / max in its own top corner."""
+        title, _, eunit, scale = _QTY[key]
+        errs = [(label, (np.ravel(pred).astype(float) - np.ravel(ref).astype(float)) * scale, sk)
+                for label, ref, pred, sk in sets if len(np.ravel(ref))]
+        ax.set_xlabel(f"NEP \N{MINUS SIGN} DFT {title.lower()} ({eunit})")
+        ax.set_ylabel("Count")
+        if not errs:
             ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
             return
-        lo, hi = float(err.min()), float(err.max())
+        allerr = np.concatenate([e for _, e, _ in errs])
+        lo, hi = float(allerr.min()), float(allerr.max())
         if hi - lo < 1e-9:                      # constant error: one finite bin
             lo, hi = lo - 0.5, hi + 0.5
-        ax.hist(err, bins=bins, range=(lo, hi), color=color or self.c_train, alpha=0.75)
-        ax.axvline(0.0, color="0.3", lw=0.8, ls="--")
-        ax.set_xlabel(f"NEP − DFT {title.lower()} ({eunit})")
-        ax.set_ylabel("count")
+        corners = {"train": dict(x=0.03, y=0.97, ha="left"),
+                   "valid": dict(x=0.97, y=0.97, ha="right")}
+        for k, (label, err, sk) in enumerate(errs):
+            color = self.colors[sk]
+            ax.hist(err, bins=bins, range=(lo, hi), color=color, alpha=0.35 if len(errs) > 1 else 0.6,
+                    zorder=2 + k)
+            ax.hist(err, bins=bins, range=(lo, hi), histtype="step", color=color, lw=0.7,
+                    zorder=4 + k)
+            c = corners[sk]
+            ax.text(c["x"], c["y"],
+                    f"{label}\nRMSE = {np.sqrt(np.mean(err ** 2)):.1f}\n"
+                    f"MAE = {np.mean(np.abs(err)):.1f}\nmax = {np.abs(err).max():.1f}",
+                    transform=ax.transAxes, ha=c["ha"], va="top", color=color,
+                    fontsize=self.rc["font.size"], linespacing=1.3, zorder=10)
+        ax.axvline(0.0, color="grey", lw=0.7, ls="--", zorder=1)
         ax.set_yscale("log")
-        ax.text(0.97, 0.96,
-                f"RMSE {np.sqrt(np.mean(err ** 2)):.1f}\nMAE {np.mean(np.abs(err)):.1f}\n"
-                f"max {np.abs(err).max():.1f} {eunit}",
-                transform=ax.transAxes, ha="right", va="top", fontsize=self._small(),
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.75))
+        ax.set_xlim(lo, hi)
+        top = ax.get_ylim()[1]
+        ax.set_ylim(0.7, top ** 1.35)           # headroom for the annotations (log axis)
 
-    def _force_vs_magnitude(self, ax, d):
-        fref = np.linalg.norm(d["F"]["ref"], axis=1)
-        ferr = np.linalg.norm(d["F"]["pred"] - d["F"]["ref"], axis=1)
-        ax.hexbin(fref, ferr, gridsize=100, mincnt=1, bins="log", cmap=self.cmap,
-                  rasterized=True)
+    def _force_vs_magnitude(self, ax, sets):
+        """|NEP - DFT force| against |DFT force|, one colour per set."""
         ax.set_xlabel("|DFT force| (eV/Å)")
-        ax.set_ylabel("|NEP − DFT force| (eV/Å)")
-        ax.set_title("Force error vs magnitude")
-
-    def _bar_panel(self, ax, names, values, counts, ylabel, title, color):
-        ax.bar(range(len(names)), values, color=color, alpha=0.8)
-        ax.set_xticks(range(len(names)))
-        ax.set_xticklabels(names, rotation=90 if len(names) > 8 else 0)
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        top = max(values) if len(values) else 1.0
-        ax.set_ylim(0, top * 1.25)
-        for i, (v, c) in enumerate(zip(values, counts)):
-            ax.text(i, v + 0.02 * top, f"{c:,}", ha="center", va="bottom",
-                    fontsize=self._small(3), rotation=90 if len(names) > 8 else 0)
-
-    def _breakdown_panels(self, d, meta, e_pred=None):
-        """(name, draw_fn) list: force RMSE per element and, when the xyz has
-        several config_types, energy RMSE per config_type."""
-        natoms, species, ctypes = meta
-        panels = []
-        if "F" in d:
-            sym = np.concatenate([np.asarray(s) for s in species])
-            if len(sym) != len(d["F"]["ref"]):
-                raise ValueError(f"xyz has {len(sym)} atoms, the force file {len(d['F']['ref'])}")
-            err2 = ((d["F"]["pred"] - d["F"]["ref"]) ** 2).sum(1)
-            els = sorted(set(sym))
-            rm = np.array([np.sqrt(err2[sym == e].sum() / (3 * (sym == e).sum())) * 1e3 for e in els])
-            cnt = [int((sym == e).sum()) for e in els]
-            order = np.argsort(rm)[::-1]
-            names_e = [els[i] for i in order]
-            vals_e, cnt_e = list(rm[order]), [cnt[i] for i in order]
-            panels.append(lambda ax, n=names_e, v=vals_e, c=cnt_e: self._bar_panel(
-                ax, n, v, c, "force RMSE (meV/Å)", "Force RMSE per element (atom count)",
-                self.c_train))
-        if "E" in d and len(set(ctypes)) > 1:
-            if len(natoms) != len(d["E"]["ref"]):
-                raise ValueError(f"xyz has {len(natoms)} frames, the energy file {len(d['E']['ref'])}")
-            ct = np.asarray(ctypes)
-            pred = d["E"]["pred"] if e_pred is None else e_pred
-            de = (pred - d["E"]["ref"]) * 1e3
-            names = [c for c, _ in Counter(ctypes).most_common(30)]
-            rm = [float(np.sqrt(np.mean(de[ct == c] ** 2))) for c in names]
-            cnt = [int((ct == c).sum()) for c in names]
-            panels.append(lambda ax, n=names, v=rm, c=cnt: self._bar_panel(
-                ax, n, v, c, "energy RMSE (meV/atom)",
-                "Energy RMSE per config_type (frame count)", self.c_test))
-        return panels
+        ax.set_ylabel("|NEP \N{MINUS SIGN} DFT force| (eV/Å)")
+        for k, (label, ref, pred, sk) in enumerate(sets):
+            ref, pred = np.atleast_2d(ref), np.atleast_2d(pred)
+            if ref.size == 0:
+                continue
+            x = np.linalg.norm(ref, axis=1)
+            y = np.linalg.norm(pred - ref, axis=1)
+            if len(x) > self.max_points:
+                sel = self._rng.choice(len(x), self.max_points, replace=False)
+                x, y = x[sel], y[sel]
+            ax.scatter(x, y, s=2, alpha=0.5, color=self.colors[sk], edgecolors="none",
+                       rasterized=True, label=label, zorder=2 + k)
+        if len(sets) > 1:
+            leg = ax.legend(loc="upper right", frameon=True, facecolor="white",
+                            edgecolor="none", framealpha=1.0, borderpad=0.3, handletextpad=0.3)
+            leg.set_zorder(20)
 
     def loss(self, path, out=None, stage2="auto", stress=False, figsize=None):
         """Training curves from ``loss.out``: the E / F / V RMSEs against the
@@ -860,36 +838,46 @@ class NEPPlotter:
             fig.tight_layout(pad=0.3)
         return self._finish(fig, out)
 
-    def errors(self, path, split="train", out=None, xyz=None,
-               quantities=("E", "F", "V"), shift_energy=None):
-        """Error distributions of the ``*_<split>.out`` files: histograms of
-        NEP − DFT for E / F / V, the force error against the force magnitude
-        and — with the ``xyz`` the outputs belong to — the force RMSE per
-        element and the energy RMSE per ``config_type``."""
+    def errors(self, path, out=None, quantities=("E", "F", "V"), shift_energy=None,
+               xyz=None, force_magnitude=True, bins=120, figsize=None):
+        """Error distributions of the run in ``path``: one panel per quantity
+        with the histogram of NEP − DFT on a log count axis, training and
+        validation overlaid in the parity colours and annotated with
+        RMSE / MAE / max, plus a last panel with the force error against the
+        force magnitude.
+
+        ``quantities``: any of ``E F V S``. ``shift_energy`` (``"mean"`` /
+        ``"element"``, the latter needs ``xyz``) removes a reference offset
+        from the predicted energies first — for predictions of a set labelled
+        with other DFT settings. ``force_magnitude=False`` drops the last
+        panel, ``bins`` sets the histogram bins and ``figsize`` (cm) the
+        figure size. Per-element errors have their own figure,
+        :meth:`periodic_table`."""
         import matplotlib.pyplot as plt
-        d = read_outputs(path, split)
-        qs = [q for q in quantities if q in d]
-        meta = frame_meta(xyz) if xyz else None
-        e_pred = shift_energy_fn(d, shift_energy, meta) if "E" in d else None
-        extra = self._breakdown_panels(d, meta, e_pred) if meta else []
-        n_cols = len(qs) + (1 if "F" in d else 0)
-        n_rows = 1 + (1 if extra else 0)
+        splits = [sp for sp in ("train", "test")
+                  if os.path.exists(os.path.join(path, f"energy_{sp}.out"))]
+        if not splits:
+            raise FileNotFoundError(f"no energy_train.out / energy_test.out in {path}")
+        data = {sp: read_outputs(path, sp) for sp in splits}
+        if shift_energy:
+            meta = frame_meta(xyz) if xyz else None
+            for sp in splits:
+                data[sp]["E"]["pred"] = shift_energy_fn(data[sp], shift_energy, meta)
+        qs = [q for q in quantities
+              if any(q in data[sp] and data[sp][q]["mask"].any() for sp in splits)]
+        show_f = bool(force_magnitude) and any("F" in data[sp] for sp in splits)
+        n = len(qs) + (1 if show_f else 0)
+        if n == 0:
+            raise ValueError(f"none of {quantities} is in the outputs of {path}")
         with plt.rc_context(self.rc):
-            fig = plt.figure(figsize=(3.7 * n_cols, 3.3 * n_rows))
-            gs = fig.add_gridspec(n_rows, n_cols)
-            col = 0
-            for q in qs:
-                m = d[q]["mask"]
-                pred = e_pred if q == "E" else d[q]["pred"]
-                self._hist_panel(fig.add_subplot(gs[0, col]), pred[m] - d[q]["ref"][m], q)
-                col += 1
-            if "F" in d:
-                self._force_vs_magnitude(fig.add_subplot(gs[0, col]), d)
-            if extra:
-                bounds = np.linspace(0, n_cols, len(extra) + 1).astype(int)
-                for k, draw in enumerate(extra):
-                    draw(fig.add_subplot(gs[1, bounds[k]:bounds[k + 1]]))
-            fig.tight_layout()
+            fig, axes = plt.subplots(1, n, figsize=_cm(*(figsize or (5.0 * n, 4.9))),
+                                     constrained_layout=True, squeeze=False)
+            axes = list(axes[0])
+            for ax, q in zip(axes, qs):
+                self._hist_panel(ax, self._sets(data, q), q, bins=bins)
+            if show_f:
+                self._force_vs_magnitude(axes[-1], self._sets(data, "F"))
+            self._label_panels(axes, dx=-26, dy=2)
         return self._finish(fig, out)
 
     def _parity_overlay(self, ax, sets, key, kind="scatter", annotate=True, bins=80, cell="hex"):
