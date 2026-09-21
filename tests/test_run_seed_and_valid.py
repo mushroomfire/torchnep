@@ -16,8 +16,6 @@
 selection on the validation loss, GPUMD-style *_test.out outputs, and
 split preservation across resume (the checkpoint's seed wins).
 """
-import os
-
 import numpy as np
 import pytest
 import torch

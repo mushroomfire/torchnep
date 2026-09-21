@@ -44,7 +44,8 @@ def _store(cfg, n=20, dtype=torch.float64):
 
 
 def _cfg_from_nepin(tmp_path=None):
-    import tempfile, os
+    import os
+    import tempfile
     d = tmp_path or tempfile.mkdtemp()
     p = os.path.join(str(d), "nep.in")
     with open(p, "w") as f:

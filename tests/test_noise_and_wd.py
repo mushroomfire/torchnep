@@ -27,7 +27,6 @@ def _store(tmp_path, n=10):
 def _run(tmp_path, out, extra, seed=5):
     nepin = tmp_path / f"nep_{out}.in"
     nepin.write_text(NEP_IN + "epoch 3\nbatch 4\n" + extra)
-    frames = read_xyz(str(XYZ))[:12]
     xyz = tmp_path / "train.xyz"
     raw = XYZ.read_text().splitlines()
     keep, i, k = [], 0, 0
@@ -187,7 +186,6 @@ def test_swa_start_window(tmp_path):
     run must produce no nep_average.txt (with the run otherwise fine)."""
     nepin = tmp_path / "nep_swa.in"
     nepin.write_text(NEP_IN + "epoch 4\nbatch 4\nstage2 1\nstart_stage2 2\n")
-    frames = read_xyz(str(XYZ))[:8]
     raw = XYZ.read_text().splitlines()
     keep, i, k = [], 0, 0
     while i < len(raw) and k < 8:
@@ -218,7 +216,6 @@ def test_default_alloc_conf(monkeypatch):
     """expandable_segments is defaulted only when the user set nothing,
     on CUDA, before the context exists."""
     from torchnep.train import _default_alloc_conf
-    import torchnep.train as T
 
     monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)

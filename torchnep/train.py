@@ -43,7 +43,7 @@ from torch.optim.swa_utils import AveragedModel
 from .model import NEPModel, slim_model, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices, build_neighbor_list_np,
-                   build_neighbor_list_np_ex, wrap_positions, image_repeats,
+                   build_neighbor_list_np_ex, wrap_positions,
                    cutoff_pair_table, pair_cutoff_np)
 from . import ops
 from . import __version__
@@ -258,12 +258,11 @@ def search_neighbors_batched(pos, cell_b, nat, off, rc, dtype):
                 break
             g = cand; k += 1
         g = np.asarray(g)
-        G = len(g); nmax = int(nat_a[g].max())
+        nmax = int(nat_a[g].max())
         rmax = nrep_h[g].max(axis=0)
         ranges = [torch.arange(-int(r), int(r) + 1, device=dev) for r in rmax]
         shifts_int = torch.stack(torch.meshgrid(*ranges, indexing="ij"),
                                  dim=-1).reshape(-1, 3)             # (S, 3)
-        S = shifts_int.shape[0]
         zero_shift = (shifts_int == 0).all(dim=1)
         g_t = torch.as_tensor(g, device=dev)
         cells = cell_b[g_t]                                          # (G, 3, 3)

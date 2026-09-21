@@ -58,6 +58,18 @@ train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
 
 The best model is written to `output/nep_best.txt`. The [documentation](https://mushroomfire.github.io/torchnep/) covers `nep.in`, the training data format, multi-GPU training, restart and fine-tuning, prediction, the ASE calculator and plotting.
 
+## Building the documentation
+
+The site is built from `docs/` with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/). In a clone of the repository:
+
+```bash
+pip install "mkdocs>=1.6,<2" mkdocs-material "mkdocstrings[python]"
+mkdocs serve    # preview at http://127.0.0.1:8000/torchnep/, reloaded on every edit
+mkdocs build    # static site in site/
+```
+
+The API reference is read from the source files, so TorchNEP itself does not need to be installed. MkDocs stays below 2.0, which the Material theme does not support.
+
 ## Citation
 
 ```bibtex

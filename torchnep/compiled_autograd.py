@@ -286,7 +286,8 @@ class CompiledAutogradForce:
             return
         # Trace a plain closure — make_fx on the bound method would count
         # ``self`` as an input.
-        fn = lambda *a: self._raw(*a)
+        def fn(*a):
+            return self._raw(*a)
         gm = make_fx(fn, tracing_mode="symbolic",
                      _allow_non_fake_inputs=True)(*self._prime_args(args))
         strip_detach(gm)

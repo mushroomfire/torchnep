@@ -54,6 +54,16 @@ filterwarnings = [
     "ignore:.*argument is deprecated, use '.*:Warning",
 ]
 
+[tool.ruff.lint]
+# Short related statements share a line (``a = ...; b = ...``), and ``l`` is
+# the angular-momentum index of the NEP formulas.
+ignore = ["E702", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test scripts put the repository on sys.path, or skip on a missing optional
+# dependency, before importing torchnep.
+"tests/*" = ["E402"]
+
 [project.urls]
 Homepage = "https://github.com/mushroomfire/torchnep"
 Repository = "https://github.com/mushroomfire/torchnep"
