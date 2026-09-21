@@ -21,5 +21,6 @@
 ---
 
 - [ ] `pytest` passes locally
+- [ ] `ruff check .` reports no warnings
 - [ ] New behaviour is covered by a test
 - [ ] Documentation (`docs/`) updated if user-facing (leave `docs/release-notes.md` and the version number to the maintainers)

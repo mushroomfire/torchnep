@@ -9,6 +9,10 @@
   grades any structures; multi-GPU variants, and export to GPUMD's
   `compute_extrapolation`. See the
   [guide](https://mushroomfire.github.io/torchnep/guide/extrapolation/).
+- **Lint-clean code**: `ruff check .` reports no warnings (rules in
+  `pyproject.toml`), and pull requests must keep it so (`CONTRIBUTING.md`);
+  unused imports and variables removed. The README explains how to build the
+  documentation locally.
 
 ## 1.0.6a1
 
