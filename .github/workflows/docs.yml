@@ -1,0 +1,57 @@
+name: docs
+
+# Builds the documentation site (MkDocs Material) on every pull request and
+# publishes it to GitHub Pages on every push to master. The built site travels
+# as a workflow artifact, so there is no gh-pages branch and no deploy commits.
+# One-time setup: Settings -> Pages -> Source "GitHub Actions".
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install MkDocs
+        run: pip install ".[docs]"
+
+      - name: Build
+        run: mkdocs build --strict
+
+      - name: Upload the site
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  # Publishes what `build` uploaded; skipped on pull requests, which only build.
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

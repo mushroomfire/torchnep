@@ -21,8 +21,6 @@
 /scratch/
 # Local-only benchmarks (compile / autograd vs analytical speed tests).
 /bench_test/
-# Local-only docs / notes (diagrams, LaTeX, markdown explanations).
-/docs/
 # Local-only learning playground (from-scratch pedagogical NEP reimplementation).
 /learn/
 /test_stream/
@@ -30,3 +28,5 @@
 /bench_scaling/
 # macOS Finder metadata, in any folder
 .DS_Store
+# MkDocs build output
+/site/
