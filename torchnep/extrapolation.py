@@ -38,14 +38,23 @@ part of b outside the subspace divided by the largest such norm met in the
 training set (> 1: more weight outside the training subspace than any
 training atom).
 
-Workflow: :func:`build_active_set` (training set -> active set file),
-:func:`compute_gamma` (grades of any structures) and
-:func:`select_structures` (greedy D-optimal choice of new structures:
-candidates are visited from the highest grade down, and a structure is taken
-only if it still extends the active set after the structures taken before
-it were added, so near-duplicates are skipped). The ``*_sharded`` variants
-run the same on several GPUs / nodes (``torchrun`` or ``srun``) and give the
+Workflow: :func:`build_active_set` (training set -> active set file, once
+per model), then :func:`select_structures` (greedy D-optimal choice of new
+structures: it grades the candidate frames itself, visits them from the
+highest grade down and takes a structure only if it still extends the active
+set after the structures taken before it were added, so near-duplicates are
+skipped). :func:`compute_gamma` only grades, to inspect structures (per
+frame, per atom, gamma_res) without choosing. The ``*_sharded`` variants run
+the same on several GPUs / nodes (``torchrun`` or ``srun``) and give the
 same guarantees; with one process they are the plain functions.
+
+Theory: Podryabinkin & Shapeev, Comput. Mater. Sci. 140, 171 (2017);
+Gubaev et al., Comput. Mater. Sci. 156, 148 (2019); Podryabinkin et al.,
+J. Chem. Phys. 159, 084112 (2023); Lysogorskiy et al., Phys. Rev. Materials
+7, 043801 (2023); MaxVol: Goreinov et al., in Matrix Methods: Theory,
+Algorithms and Applications (2010). The subspace / gamma_res treatment and
+the re-graded greedy choice are this implementation's own. Not compatible
+with GPUMD's ``compute_extrapolation`` (see the guide).
 """
 
 import copy
@@ -1303,7 +1312,9 @@ def compute_gamma(
 ):
     """Extrapolation grades of every frame of ``xyz_file``.
 
-    ``active_set``: an :class:`ActiveSet` or the path of a saved one. Returns
+    Grades only, to inspect structures; :func:`select_structures` grades the
+    candidates itself when choosing. ``active_set``: an :class:`ActiveSet` or
+    the path of a saved one. Returns
     a dict of numpy arrays: ``gamma`` / ``gamma_res`` (per frame, maximum over
     its atoms), ``atom`` (atom with the largest gamma), ``natoms``, and with
     ``per_atom=True`` also ``gamma_atoms`` / ``gamma_res_atoms`` (every atom,
@@ -1476,7 +1487,9 @@ def select_structures(
     recomputed against the active set extended by the frames taken before it,
     still exceeds ``gamma_min``, and its atoms then enter the active set by
     MaxVol swaps. Near-duplicates of a taken frame fall below the threshold
-    and are skipped. Stops after ``max_frames``.
+    and are skipped. Stops after ``max_frames``. The frames are graded here
+    (no :func:`compute_gamma` call is needed first), by gamma only: frames
+    with gamma <= ``gamma_min`` are not candidates whatever their gamma_res.
 
     Writes the chosen frames verbatim to ``output_xyz`` and, if given, the
     extended active set to ``output_active_set``. Returns a dict with
