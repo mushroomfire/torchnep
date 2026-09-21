@@ -41,3 +41,21 @@ from torchnep import train_nep, train_nep_sharded, predict_dataset, predict_data
       members: [dashboard, loss, parity, errors, periodic_table]
 
 ::: torchnep.plot.element_errors
+
+## Extrapolation grade (experimental)
+
+::: torchnep.extrapolation.build_active_set
+
+::: torchnep.extrapolation.build_active_set_sharded
+
+::: torchnep.extrapolation.compute_gamma
+
+::: torchnep.extrapolation.compute_gamma_sharded
+
+::: torchnep.extrapolation.select_structures
+
+::: torchnep.extrapolation.select_structures_sharded
+
+::: torchnep.extrapolation.ActiveSet
+    options:
+      members: [load, save, gamma]
