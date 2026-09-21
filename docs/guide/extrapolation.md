@@ -93,19 +93,7 @@ and add to GPUMD's `run.in`, for example
 compute_extrapolation asi_file active_set.asi gamma_low 2 gamma_high 50 check_interval 100 dump_interval 100
 ```
 
-(recent GPUMD versions also need `nep_file nep.txt`; see the GPUMD documentation of your version). Every `check_interval` steps GPUMD grades all atoms, writes the frames with γ ≥ `gamma_low` to `extrapolation_dump.xyz`, and stops the run when γ exceeds `gamma_high`.
-
-A check with the Cr-Co-Ni model above: 5 ps NPT runs of a 256-atom cell in GPUMD, graded every 250 steps.
-
-| | 300 K | 2500 K |
-|---|---|---|
-| largest γ of a frame, GPUMD | 0.66 – 0.83 | 0.69 – 1.19 |
-| largest γ of a frame, `compute_gamma` on the dumped frames | 0.66 – 0.83 | 0.68 – 1.20 |
-| per-atom difference, median / largest | 0.02 % / 0.4 % | 0.08 % / 1.2 % |
-| frames above 1.01 | 0 of 20 | 8 of 20 |
-| chosen by `select_structures` from the dump | none | 6 |
-
-At 2500 K the cell melts during the run (the potential energy rises by 0.2 eV/atom and the box by 5 % in length at constant temperature); the frames chosen are all from 2.25 ps on. GPUMD computes `b` in single precision, hence the small per-atom differences. `select_structures` reads `extrapolation_dump.xyz` as it is.
+Every `check_interval` steps GPUMD grades all atoms, writes the frames with γ ≥ `gamma_low` to `extrapolation_dump.xyz`, and stops the run when γ exceeds `gamma_high`.
 
 What differs from TorchNEP's own grading:
 
