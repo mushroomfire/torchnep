@@ -100,6 +100,20 @@ def b_vectors(q, w0, b0, w1):
     return out.view(n, H * (D + 2))
 
 
+def _pick_device_f64(device=None):
+    """Device for the active set. The subspace, the whitening and the MaxVol
+    inverses are float64 throughout and MPS has no float64, so the automatic
+    choice falls back to the CPU on Apple Silicon; an explicit ``"mps"`` is
+    refused instead of failing deep inside the model parser."""
+    if device is not None:
+        if torch.device(device).type == "mps":
+            raise ValueError("the extrapolation grade is computed in float64, which the MPS "
+                             "backend does not support; use device='cpu' or a CUDA device")
+        return torch.device(_pick_device(device))
+    chosen = torch.device(_pick_device(None))
+    return torch.device("cpu") if chosen.type == "mps" else chosen
+
+
 def _check_precision(precision):
     if precision not in ("float32", "float64"):
         raise ValueError(f"precision must be 'float32' or 'float64', not {precision!r}")
@@ -249,7 +263,7 @@ def _comm_setup(device):
     single-process comm and the requested device."""
     world = int(os.environ.get("WORLD_SIZE", 1))
     if world <= 1:
-        return _Comm(), torch.device(_pick_device(device))
+        return _Comm(), _pick_device_f64(device)
     import torch.distributed as dist
     from .train_sharded import _register_pg_atexit
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -757,7 +771,7 @@ class ActiveSet:
     def load(cls, path, model_file, device=None, precision="float32"):
         """Load an active set for ``model_file`` (the model it was built with);
         ``precision``: of the descriptors and grades computed with it."""
-        device = torch.device(_pick_device(device))
+        device = _pick_device_f64(device)
         d = torch.load(path, map_location="cpu", weights_only=False)
         if d.get("format") != _FORMAT:
             raise ValueError(f"{path} is not a torchnep active set")
@@ -1199,7 +1213,7 @@ def build_active_set(
     Saves the :class:`ActiveSet` to ``output_file`` (and, with ``asi_file``,
     in GPUMD's format, see :meth:`ActiveSet.save_gpumd`) and returns it.
     """
-    comm, dev = _Comm(), torch.device(_pick_device(device))
+    comm, dev = _Comm(), _pick_device_f64(device)
     return _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_rows,
                   max_passes, dev, _check_precision(precision), chunk_atoms, energy_key,
                   seed, verbose, comm, asi_file)

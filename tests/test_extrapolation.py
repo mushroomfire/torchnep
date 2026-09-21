@@ -270,6 +270,16 @@ def test_element_without_training_data_is_infinite(tmp_path):
     assert written == ["Cr", "Co", "Ni"]
 
 
+def test_mps_is_never_chosen_automatically(monkeypatch):
+    """Everything here is float64, which MPS does not support: the automatic
+    choice falls back to the CPU and an explicit device='mps' is refused."""
+    import torchnep.extrapolation as ex
+    monkeypatch.setattr(ex, "_pick_device", lambda d=None: "mps" if d is None else d)
+    assert ex._pick_device_f64().type == "cpu"
+    with pytest.raises(ValueError, match="float64"):
+        ex._pick_device_f64("mps")
+
+
 _SHARDED_RUNNER = """
 import sys
 import numpy as np
