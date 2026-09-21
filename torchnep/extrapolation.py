@@ -40,21 +40,23 @@ training atom).
 
 Workflow: :func:`build_active_set` (training set -> active set file, once
 per model), then :func:`select_structures` (greedy D-optimal choice of new
-structures: it grades the candidate frames itself, visits them from the
-highest grade down and takes a structure only if it still extends the active
-set after the structures taken before it were added, so near-duplicates are
-skipped). :func:`compute_gamma` only grades, to inspect structures (per
-frame, per atom, gamma_res) without choosing. The ``*_sharded`` variants run
-the same on several GPUs / nodes (``torchrun`` or ``srun``) and give the
-same guarantees; with one process they are the plain functions.
+structures, ranked by the grade max(gamma, gamma_res): it grades the
+candidate frames itself, visits them from the highest grade down and takes
+a structure only if it still extends the training data after the
+structures taken before it were added, so near-duplicates are skipped).
+:func:`compute_gamma` only grades, to inspect structures (per frame, per
+atom). :meth:`ActiveSet.save_gpumd` (or ``build_active_set(asi_file=...)``)
+writes the active set for GPUMD's ``compute_extrapolation``, which then
+computes the same gamma during MD. The ``*_sharded`` variants run the same
+on several GPUs / nodes (``torchrun`` or ``srun``) and give the same
+guarantees; with one process they are the plain functions.
 
 Theory: Podryabinkin & Shapeev, Comput. Mater. Sci. 140, 171 (2017);
 Gubaev et al., Comput. Mater. Sci. 156, 148 (2019); Podryabinkin et al.,
 J. Chem. Phys. 159, 084112 (2023); Lysogorskiy et al., Phys. Rev. Materials
 7, 043801 (2023); MaxVol: Goreinov et al., in Matrix Methods: Theory,
 Algorithms and Applications (2010). The subspace / gamma_res treatment and
-the re-graded greedy choice are this implementation's own. Not compatible
-with GPUMD's ``compute_extrapolation`` (see the guide).
+the re-graded greedy choice are this implementation's own.
 """
 
 import copy
@@ -98,12 +100,18 @@ def b_vectors(q, w0, b0, w1):
     return out.view(n, H * (D + 2))
 
 
-def _load_calculators(model_file, device, dtype):
-    """(float64 calculator, calculator for descriptors in ``dtype``): the
-    network weights and the model fingerprint always come from the float64
-    parse, the descriptors may run in float32."""
+def _check_precision(precision):
+    if precision not in ("float32", "float64"):
+        raise ValueError(f"precision must be 'float32' or 'float64', not {precision!r}")
+    return precision
+
+
+def _load_calculators(model_file, device, precision):
+    """(float64 calculator, calculator for the descriptors in ``precision``):
+    the network weights and the model fingerprint always come from the
+    float64 parse."""
     calc = NEPCalculator(model_file, dtype=_F64, device=device)
-    dt = _F64 if dtype == "float64" else torch.float32
+    dt = _F64 if _check_precision(precision) == "float64" else torch.float32
     if dt == _F64:
         return calc, calc
     desc = copy.copy(calc)
@@ -603,18 +611,18 @@ class _Element:
         return x @ self.Ainv
 
     def grade32(self, q):
-        """(gamma, out-of-subspace norm) of rows in float32: one product with
-        R = V diag(scale) A^-1 for the grade (within 1e-4 relative of the
-        float64 grade), and the residual b - b V V^T built explicitly (within
-        a few 1e-3; the float64 shortcut |b|^2 - |b V|^2 would cancel every digit)."""
+        """(gamma, out-of-subspace norm) of rows in float32: y = b V, the grade
+        from y diag(scale) A^-1 (within 1e-4 relative of the float64 grade)
+        and the residual b - y V^T built explicitly (within a few 1e-3; the
+        float64 shortcut |b|^2 - |y|^2 would cancel every digit)."""
         if self._f32 is None:
-            R = (self.V * self.scale) @ self.Ainv
-            self._f32 = (R.float(), self.V.float(), self.w0.float(), self.b0.float(),
-                         self.w1.float())
-        R, V, w0, b0, w1 = self._f32
+            self._f32 = (self.V.float(), (self.scale[:, None] * self.Ainv).float(),
+                         self.w0.float(), self.b0.float(), self.w1.float())
+        V, SA, w0, b0, w1 = self._f32
         B = b_vectors(q.float(), w0, b0, w1)
-        g = (B @ R).abs().amax(1)
-        res = torch.linalg.vector_norm(B - (B @ V) @ V.T, dim=1)
+        y = B @ V
+        g = (y @ SA).abs().amax(1)
+        res = torch.linalg.vector_norm(B - y @ V.T, dim=1)
         return g.to(_F64), res.to(_F64)
 
     def reinvert(self):
@@ -719,11 +727,13 @@ class ActiveSet:
     """MaxVol active sets of every element of a NEP model.
 
     Built by :func:`build_active_set`, reloaded with :meth:`load`; grades of
-    descriptors with :meth:`gamma`. ``calc`` holds the float64 weights,
-    ``desc_calc`` computes the descriptors (float64 or float32)."""
+    descriptors with :meth:`gamma`, GPUMD's format with :meth:`save_gpumd`.
+    ``calc`` holds the float64 weights, ``desc_calc`` computes the
+    descriptors in ``precision`` (float32 or float64)."""
 
     def __init__(self, calc, desc_calc, rcond, tol):
         self.calc, self.desc_calc = calc, desc_calc
+        self.precision = "float32" if desc_calc.dtype == torch.float32 else "float64"
         self.device = calc.device
         self.rcond, self.tol = float(rcond), float(tol)
         self.fingerprint = _model_fingerprint(calc)
@@ -744,13 +754,14 @@ class ActiveSet:
         }, path)
 
     @classmethod
-    def load(cls, path, model_file, device=None, dtype="float64"):
-        """Load an active set for ``model_file`` (the model it was built with)."""
+    def load(cls, path, model_file, device=None, precision="float32"):
+        """Load an active set for ``model_file`` (the model it was built with);
+        ``precision``: of the descriptors and grades computed with it."""
         device = torch.device(_pick_device(device))
         d = torch.load(path, map_location="cpu", weights_only=False)
         if d.get("format") != _FORMAT:
             raise ValueError(f"{path} is not a torchnep active set")
-        self = cls(*_load_calculators(model_file, device, dtype), d["rcond"], d["tol"])
+        self = cls(*_load_calculators(model_file, device, precision), d["rcond"], d["tol"])
         if d["fingerprint"] != self.fingerprint:
             raise ValueError(f"{path} was built with a different model than {model_file}")
         self.meta = d.get("meta", {})
@@ -773,17 +784,19 @@ class ActiveSet:
         return max(256, min(1 << 20, int(0.2 * _free_bytes(self.device) / per_row)))
 
     @torch.no_grad()
-    def gamma(self, types, q, precision="float64"):
+    def gamma(self, types, q, precision=None):
         """Per-atom grades of scaled descriptors ``q`` (N, D) with ``types`` (N,).
 
         Returns ``(gamma, gamma_res)`` (N,) float64 tensors; atoms of elements
-        without an active set get ``inf``. ``precision="float32"`` grades in
-        float32 (gamma within 1e-4, gamma_res within a few 1e-3 relative; faster
-        on GPUs with slow float64)."""
+        without an active set get ``inf``. ``precision`` (default: the active
+        set's) ``"float32"`` grades in float32 — gamma within 1e-4, gamma_res
+        within a few 1e-3 relative of the float64 grades."""
+        precision = _check_precision(precision or self.precision)
         N = types.shape[0]
         g = torch.full((N,), float("inf"), dtype=_F64, device=self.device)
         gr = torch.full((N,), float("inf"), dtype=_F64, device=self.device)
-        q = q.to(_F64)
+        if precision == "float64":
+            q = q.to(_F64)
         for t in torch.unique(types).tolist():
             e = self.elements[t]
             if e.r == 0:
@@ -799,6 +812,36 @@ class ActiveSet:
                     g[sub] = e.coefficients(x).abs().amax(1)
                 gr[sub] = res / e.res_max if e.res_max > 0 else res
         return g, gr
+
+    @torch.no_grad()
+    def save_gpumd(self, path, digits=12):
+        """Write the active set in the ASI format read by GPUMD's
+        ``compute_extrapolation`` (plain text; per element its symbol, K, K and
+        a K x K matrix M, row by row). GPUMD grades an atom with row b as
+        max |b M|; M = [V diag(scale) A^-1, 0] (K x r, zero-padded to K
+        columns) makes that exactly gamma (not gamma_res). Elements without an
+        active set are left out, with a warning: GPUMD cannot grade their
+        atoms, so the MD must not contain them. Returns the elements written."""
+        import warnings
+        K = self.K
+        written, missing = [], []
+        with open(path, "w") as f:
+            for e in self.elements:
+                if e.r == 0:
+                    missing.append(e.name)
+                    continue
+                M = ((e.V * e.scale) @ e.Ainv).cpu().numpy()          # (K, r)
+                zeros = "0\n" * (K - e.r)
+                fmt = f"{{:.{digits}g}}".format
+                f.write(f"{e.name} {K} {K}\n")
+                for row in M:
+                    f.write("\n".join(map(fmt, row.tolist())) + "\n" + zeros)
+                written.append(e.name)
+        if missing:
+            warnings.warn(f"{path}: no active set for {', '.join(missing)} (no atoms in the "
+                          "training set); GPUMD cannot grade these elements, keep them out "
+                          "of the MD", stacklevel=2)
+        return written
 
 
 def _bcast_element(comm, e, src, K, D):
@@ -986,14 +1029,14 @@ def _merge_rows(aset, comm, rows, D):
 
 
 def _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_rows,
-           max_passes, device, dtype, chunk_atoms, energy_key, seed, verbose, comm,
-           precision="float64"):
+           max_passes, device, precision, chunk_atoms, energy_key, seed, verbose, comm,
+           asi_file=None):
     from .train import _default_alloc_conf
     _default_alloc_conf()
     main = comm.rank == 0
     _log = _log_fn(verbose and main)
     t_total = time.time()
-    aset = ActiveSet(*_load_calculators(model_file, device, dtype), rcond, tol)
+    aset = ActiveSet(*_load_calculators(model_file, device, precision), rcond, tol)
     calc = aset.calc
     T, K, D = calc.num_types, aset.K, calc.dim
     offsets, natoms = _index(comm, xyz_file)
@@ -1001,7 +1044,7 @@ def _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_ro
                                index=(offsets, natoms), workers=_parse_workers(comm))
     n_frames = len(offsets)
     _log(f"  active set: {n_frames} frames, {int(natoms.sum())} atoms, {T} elements, "
-         f"K = {calc.num_neurons} x ({D} + 2) = {K}, rcond {rcond:g}, tol {tol:g}"
+         f"K = {calc.num_neurons} x ({D} + 2) = {K}, rcond {rcond:g}, tol {tol:g}, {precision}"
          + (f", {comm.world} processes" if comm.active else ""))
 
     # ---- pass 1: Gram matrices and a row sample (on a frame sample) --------
@@ -1101,8 +1144,11 @@ def _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_ro
                  "converged": converged, "train_gamma_max": g_train}
     if main:
         aset.save(output_file)
+        if asi_file is not None:
+            aset.save_gpumd(asi_file)
     comm.barrier()
-    _log(f"  TOTAL: {time.time() - t_total:.1f}s -> {output_file}")
+    _log(f"  TOTAL: {time.time() - t_total:.1f}s -> {output_file}"
+         + (f", {asi_file} (GPUMD)" if asi_file is not None else ""))
     return aset
 
 
@@ -1116,8 +1162,8 @@ def build_active_set(
     init_rows: int = 4,
     max_passes: int = 10,
     device: str = None,
-    dtype: str = "float64",
-    precision: str = "float64",
+    precision: str = "float32",
+    asi_file: str = None,
     chunk_atoms: int = None,
     energy_key: str = "energy",
     seed: int = 0,
@@ -1143,17 +1189,20 @@ def build_active_set(
     when they fit in 25% of the free memory (``TORCHNEP_GAMMA_CACHE_GB`` sets
     another budget, 0 disables it).
 
-    ``dtype`` is the descriptor precision; subspaces and MaxVol always run
-    in float64. ``precision="float32"`` screens the rows of passes 2 and 3 in
-    float32 and regrades in float64 only those near or above the threshold —
-    the same decisions, many times faster on GPUs with slow float64 (most
-    consumer cards). Saves the :class:`ActiveSet` to ``output_file`` and
-    returns it.
+    ``precision="float32"`` (default) computes the descriptors and screens
+    the rows of passes 2 and 3 in float32, regrading in float64 those near
+    or above the threshold; ``"float64"`` does everything in float64. The
+    Gram matrices, subspaces and MaxVol always run in float64. Either way
+    every training atom ends with a grade <= ``tol``; the active sets of the
+    two precisions differ slightly, as any two MaxVol runs over rounded data.
+
+    Saves the :class:`ActiveSet` to ``output_file`` (and, with ``asi_file``,
+    in GPUMD's format, see :meth:`ActiveSet.save_gpumd`) and returns it.
     """
     comm, dev = _Comm(), torch.device(_pick_device(device))
     return _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_rows,
-                  max_passes, dev, dtype, chunk_atoms, energy_key, seed, verbose, comm,
-                  precision)
+                  max_passes, dev, _check_precision(precision), chunk_atoms, energy_key,
+                  seed, verbose, comm, asi_file)
 
 
 def build_active_set_sharded(
@@ -1165,8 +1214,8 @@ def build_active_set_sharded(
     sample_frames: int = 50_000,
     init_rows: int = 4,
     max_passes: int = 10,
-    dtype: str = "float64",
-    precision: str = "float64",
+    precision: str = "float32",
+    asi_file: str = None,
     chunk_atoms: int = None,
     energy_key: str = "energy",
     seed: int = 0,
@@ -1182,61 +1231,65 @@ def build_active_set_sharded(
     ranks then run MaxVol on their shares, the owners merge the ranks' active
     rows and the check passes run as in :func:`build_active_set`, so the same
     guarantee holds: every training atom has a grade <= ``tol``. Rank 0 writes
-    ``output_file``; every rank returns the same :class:`ActiveSet`. With one
+    ``output_file`` (and ``asi_file``); every rank returns the same :class:`ActiveSet`. With one
     process this is :func:`build_active_set`.
     """
     comm, dev = _comm_setup(None)
     return _build(model_file, xyz_file, output_file, rcond, tol, sample_frames, init_rows,
-                  max_passes, dev, dtype, chunk_atoms, energy_key, seed, verbose, comm,
-                  precision)
+                  max_passes, dev, _check_precision(precision), chunk_atoms, energy_key,
+                  seed, verbose, comm, asi_file)
 
 
 # ---------------------------------------------------------------------------
 # Grades of structures
 # ---------------------------------------------------------------------------
 
-def _as_active_set(active_set, model_file, device, dtype):
+def _as_active_set(active_set, model_file, device, precision):
     if isinstance(active_set, ActiveSet):
         return active_set
-    return ActiveSet.load(active_set, model_file, device=device, dtype=dtype)
+    return ActiveSet.load(active_set, model_file, device=device, precision=precision)
 
 
-def _grade_frames(aset, stream, frames, per_atom, progress, window=None, precision="float64"):
+def _grade_frames(aset, stream, frames, per_atom, progress, window=None, precision=None):
     """Grades of ``frames``: dict of numpy arrays ``frames``, ``gamma``,
-    ``gamma_res``, ``atom`` (per frame) and, with ``per_atom``, ``gamma_atoms``
-    / ``gamma_res_atoms`` (the frames' atoms in order). ``window`` =
-    (gamma_min, gamma_max): also the rows of the frames whose grade lies in
-    (gamma_min, gamma_max] — ``rows_q``, ``rows_t``, ``rows_src`` (CPU tensors)."""
+    ``gamma_res``, ``grade`` (= max of the two), ``atom`` (per frame) and,
+    with ``per_atom``, ``gamma_atoms`` / ``gamma_res_atoms`` (the frames'
+    atoms in order). ``window`` = (grade_min, grade_max): also the rows of
+    the frames whose grade lies in (grade_min, grade_max] — ``rows_q``,
+    ``rows_t``, ``rows_src`` (CPU tensors)."""
     dev = aset.device
-    out = {k: [] for k in ("frames", "gamma", "gamma_res", "atom", "gamma_atoms",
+    out = {k: [] for k in ("frames", "gamma", "gamma_res", "grade", "atom", "gamma_atoms",
                            "gamma_res_atoms", "rows_q", "rows_t", "rows_src")}
     for ids, nat, types, q in stream.chunks(frames, progress):
         g, gr = aset.gamma(types, q, precision)
-        gmax, frame = _frame_max(g, nat, dev)
+        c = torch.maximum(g, gr)                          # per-atom grade
+        cmax, frame = _frame_max(c, nat, dev)
+        gmax, _ = _frame_max(g, nat, dev)
         grmax, _ = _frame_max(gr, nat, dev)
         nat_t = torch.from_numpy(np.asarray(nat)).to(dev)
         first = torch.cumsum(nat_t, 0) - nat_t
-        hit = torch.nonzero(g == gmax[frame]).squeeze(1)
+        hit = torch.nonzero(c == cmax[frame]).squeeze(1)
         arg = torch.zeros(len(ids), dtype=torch.long, device=dev)
         arg.scatter_reduce_(0, frame[hit], hit, "amin", include_self=False)
         out["frames"].append(np.asarray(ids))
         out["gamma"].append(gmax.cpu().numpy())
         out["gamma_res"].append(grmax.cpu().numpy())
+        out["grade"].append(cmax.cpu().numpy())
         out["atom"].append((arg - first).cpu().numpy())
         if per_atom:
             out["gamma_atoms"].append(g.cpu().numpy())
             out["gamma_res_atoms"].append(gr.cpu().numpy())
         if window is not None:
-            ok = gmax > window[0]
+            ok = cmax > window[0]
             if window[1] is not None:
-                ok &= gmax <= window[1]
+                ok &= cmax <= window[1]
             rows = ok[frame]
             if bool(rows.any()):
                 out["rows_q"].append(q[rows].to(_F64).cpu())
                 out["rows_t"].append(types[rows].cpu())
                 out["rows_src"].append(_atom_sources(ids, nat, dev)[rows].cpu())
     res = {}
-    for k in ("frames", "gamma", "gamma_res", "atom", "gamma_atoms", "gamma_res_atoms"):
+    for k in ("frames", "gamma", "gamma_res", "grade", "atom", "gamma_atoms", "gamma_res_atoms"):
         if out[k]:
             res[k] = np.concatenate(out[k])
     if window is not None:
@@ -1248,7 +1301,7 @@ def _grade_frames(aset, stream, frames, per_atom, progress, window=None, precisi
 def _assemble_gamma(parts, natoms, per_atom):
     """Per-frame (and per-atom) arrays in file order from graded parts."""
     n = len(natoms)
-    out = {"gamma": np.empty(n), "gamma_res": np.empty(n),
+    out = {"gamma": np.empty(n), "gamma_res": np.empty(n), "grade": np.empty(n),
            "atom": np.empty(n, dtype=np.int64), "natoms": np.asarray(natoms).copy()}
     if per_atom:
         n_atoms = int(np.sum(natoms))
@@ -1258,8 +1311,8 @@ def _assemble_gamma(parts, natoms, per_atom):
         if "frames" not in p:
             continue
         ids = p["frames"]
-        out["gamma"][ids], out["gamma_res"][ids], out["atom"][ids] = \
-            p["gamma"], p["gamma_res"], p["atom"]
+        out["gamma"][ids], out["gamma_res"][ids], out["grade"][ids], out["atom"][ids] = \
+            p["gamma"], p["gamma_res"], p["grade"], p["atom"]
         if per_atom:
             nat = natoms[ids]
             dst = np.repeat(atom_start[ids], nat) + (np.arange(int(nat.sum()))
@@ -1269,12 +1322,12 @@ def _assemble_gamma(parts, natoms, per_atom):
     return out
 
 
-def _gamma(model_file, active_set, xyz_file, output_file, per_atom, device, dtype,
-           chunk_atoms, energy_key, verbose, comm, precision="float64"):
+def _gamma(model_file, active_set, xyz_file, output_file, per_atom, device, precision,
+           chunk_atoms, energy_key, verbose, comm):
     main = comm.rank == 0
     _log = _log_fn(verbose and main)
     t_total = time.time()
-    aset = _as_active_set(active_set, model_file, device, dtype)
+    aset = _as_active_set(active_set, model_file, device, precision)
     offsets, natoms = _index(comm, xyz_file)
     stream = _DescriptorStream(aset.desc_calc, xyz_file, chunk_atoms, energy_key,
                                index=(offsets, natoms), workers=_parse_workers(comm))
@@ -1291,9 +1344,10 @@ def _gamma(model_file, active_set, xyz_file, output_file, per_atom, device, dtyp
     if output_file is not None:
         np.savez(output_file, **out)
     comm.barrier()
-    _log(f"  gamma: {len(offsets)} frames in {time.time() - t_total:.1f}s; frames with gamma > "
-         f"{aset.tol:g}: {int((out['gamma'] > aset.tol).sum())}, median "
-         f"{np.median(out['gamma']):.3g}, max {out['gamma'].max():.3g}")
+    _log(f"  grades: {len(offsets)} frames in {time.time() - t_total:.1f}s; frames with grade > "
+         f"{aset.tol:g}: {int((out['grade'] > aset.tol).sum())} (gamma > {aset.tol:g}: "
+         f"{int((out['gamma'] > aset.tol).sum())}), median grade {np.median(out['grade']):.3g}, "
+         f"max {out['grade'].max():.3g}")
     return out
 
 
@@ -1304,8 +1358,7 @@ def compute_gamma(
     output_file: str = None,
     per_atom: bool = False,
     device: str = None,
-    dtype: str = "float64",
-    precision: str = "float64",
+    precision: str = "float32",
     chunk_atoms: int = None,
     energy_key: str = "energy",
     verbose: bool = True,
@@ -1314,18 +1367,19 @@ def compute_gamma(
 
     Grades only, to inspect structures; :func:`select_structures` grades the
     candidates itself when choosing. ``active_set``: an :class:`ActiveSet` or
-    the path of a saved one. Returns
-    a dict of numpy arrays: ``gamma`` / ``gamma_res`` (per frame, maximum over
-    its atoms), ``atom`` (atom with the largest gamma), ``natoms``, and with
-    ``per_atom=True`` also ``gamma_atoms`` / ``gamma_res_atoms`` (every atom,
-    file order). Saved as ``.npz`` when ``output_file`` is given.
+    the path of a saved one. Returns a dict of numpy arrays, per frame the
+    maximum over its atoms of ``gamma`` / ``gamma_res`` / ``grade`` (the
+    larger of the two, what :func:`select_structures` ranks by), ``atom``
+    (the atom with the largest grade), ``natoms``, and with ``per_atom=True``
+    also ``gamma_atoms`` / ``gamma_res_atoms`` (every atom, file order).
+    Saved as ``.npz`` when ``output_file`` is given.
 
-    ``dtype`` is the descriptor precision; ``precision="float32"`` also grades
-    in float32 — gamma within 1e-4 and gamma_res within a few 1e-3 relative of the
-    float64 values, much faster on GPUs with slow float64 (consumer cards).
+    ``precision="float32"`` (default) computes the descriptors and grades in
+    float32 — gamma within 1e-4 and gamma_res within a few 1e-3 relative of
+    ``"float64"``.
     """
-    return _gamma(model_file, active_set, xyz_file, output_file, per_atom, device, dtype,
-                  chunk_atoms, energy_key, verbose, _Comm(), precision)
+    return _gamma(model_file, active_set, xyz_file, output_file, per_atom, device,
+                  _check_precision(precision), chunk_atoms, energy_key, verbose, _Comm())
 
 
 def compute_gamma_sharded(
@@ -1334,8 +1388,7 @@ def compute_gamma_sharded(
     xyz_file: str,
     output_file: str = None,
     per_atom: bool = False,
-    dtype: str = "float64",
-    precision: str = "float64",
+    precision: str = "float32",
     chunk_atoms: int = None,
     energy_key: str = "energy",
     verbose: bool = True,
@@ -1346,21 +1399,53 @@ def compute_gamma_sharded(
     the dict — the other ranks return None. The result is identical to
     :func:`compute_gamma`."""
     comm, dev = _comm_setup(None)
-    return _gamma(model_file, active_set, xyz_file, output_file, per_atom, dev, dtype,
-                  chunk_atoms, energy_key, verbose, comm, precision)
+    return _gamma(model_file, active_set, xyz_file, output_file, per_atom, dev,
+                  _check_precision(precision), chunk_atoms, energy_key, verbose, comm)
 
 
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
 
-def _greedy_select(aset, rows, gamma, n_frames, max_frames, gamma_min, block_rows, log):
+def _extra_proj2(e, q, U, nb):
+    """Squared norm of the rows' components along ``U`` (K, m), directions
+    orthogonal to the subspace (so b . u is the residual's component)."""
+    out = torch.empty(q.shape[0], dtype=_F64, device=q.device)
+    for a in range(0, q.shape[0], nb):
+        B = b_vectors(q[a:a + nb], e.w0, e.b0, e.w1)
+        out[a:a + nb] = ((B @ U) ** 2).sum(1)
+    return out
+
+
+def _new_directions(e, q, U, rmax):
+    """Orthonormal directions (K, m) of the rows' residuals outside the
+    subspace and outside ``U`` (the directions taken before), or None."""
+    B = b_vectors(q, e.w0, e.b0, e.w1)
+    R = B - (B @ e.V) @ e.V.T
+    if U is not None:
+        R = R - (R @ U) @ U.T
+    _, sv, Vh = torch.linalg.svd(R, full_matrices=False)
+    W = Vh[sv > 1e-3 * rmax].T
+    if W.shape[1] == 0:
+        return None
+    W = W - e.V @ (e.V.T @ W)                   # once more, against round-off
+    if U is not None:
+        W = W - U @ (U.T @ W)
+    return torch.linalg.qr(W)[0]
+
+
+def _greedy_select(aset, rows, grade, n_frames, max_frames, grade_min, block_rows, log):
     """The greedy D-optimal choice over the candidate rows (q, types, src) of
-    the frames whose grade is ``gamma``. Returns (chosen frames, grade at choice)."""
+    the frames whose grade is ``grade``. An atom's grade is the larger of its
+    gamma (against the active set, which the atoms of each chosen frame
+    enter by MaxVol swaps) and its gamma_res (against the subspace, which the
+    out-of-subspace directions of each chosen frame's atoms with gamma_res > 1
+    extend); atoms of elements without an active set grade inf. Returns
+    (chosen frames, grade at choice)."""
     dev, tol = aset.device, aset.tol
     cq, ct, csrc = rows
     frames = np.unique(csrc[:, 0].numpy())
-    frames = frames[np.argsort(-gamma[frames], kind="stable")]     # visiting order
+    frames = frames[np.argsort(-grade[frames], kind="stable")]     # visiting order
     rank = np.full(n_frames, -1, dtype=np.int64)
     rank[frames] = np.arange(len(frames))
     row_rank = rank[csrc[:, 0].numpy()]
@@ -1371,7 +1456,8 @@ def _greedy_select(aset, rows, gamma, n_frames, max_frames, gamma_min, block_row
     if block_rows is None:                     # rows whose x and C fit in ~30% of free memory
         r_max = max(e.r for e in aset.elements)
         block_rows = max(1000, int(0.3 * _free_bytes(dev) / (8 * (2 * r_max + 64))))
-    chosen, gamma_at = [], []
+    extra = {}                                 # element -> (K, m) directions added outside the subspace
+    chosen, grade_at = [], []
     f0 = 0
     with torch.no_grad():
         while f0 < len(frames) and (max_frames is None or len(chosen) < max_frames):
@@ -1380,16 +1466,23 @@ def _greedy_select(aset, rows, gamma, n_frames, max_frames, gamma_min, block_row
             r0, r1 = int(frame_row0[f0]), int(frame_row0[f1])
             bt = ct[r0:r1]
             blocks = []                       # per element: rows sorted by frame rank
+            unseen = torch.zeros(f1 - f0, dtype=torch.bool, device=dev)
             for t in torch.unique(bt).tolist():
                 e = aset.elements[t]
-                if e.r == 0:
-                    continue
                 idx = torch.nonzero(bt == t).squeeze(1) + r0
                 ranks = row_rank[idx.numpy()] - f0
+                if e.r == 0:                  # element without an active set: grade inf
+                    unseen[torch.from_numpy(np.unique(ranks)).to(dev)] = True
+                    continue
                 q_e = cq[idx].to(dev)
-                x, _ = e.project(q_e, aset.row_batch(e.r))
-                blocks.append({"e": e, "x": x, "q": q_e, "src": csrc[idx].to(dev),
-                               "C": e.coefficients(x),
+                nb = aset.row_batch(e.r)
+                x, res = e.project(q_e, nb)
+                res2 = res * res
+                if t in extra:
+                    res2 = torch.clamp(res2 - _extra_proj2(e, q_e, extra[t], nb), min=0.0)
+                blocks.append({"t": t, "e": e, "x": x, "q": q_e, "src": csrc[idx].to(dev),
+                               "C": e.coefficients(x), "res2": res2, "nb": nb,
+                               "rmax": e.res_max if e.res_max > 0 else 1.0,
                                "ranks": torch.from_numpy(ranks).to(dev),
                                "start": np.searchsorted(ranks, np.arange(f1 - f0 + 1))})
             f = 0                              # next frame of the block to visit
@@ -1398,18 +1491,30 @@ def _greedy_select(aset, rows, gamma, n_frames, max_frames, gamma_min, block_row
                 for b in blocks:
                     a = int(b["start"][f])
                     if a < b["C"].shape[0]:
-                        cur.scatter_reduce_(0, b["ranks"][a:], b["C"][a:].abs().amax(1), "amax")
+                        g = torch.maximum(b["C"][a:].abs().amax(1),
+                                          torch.sqrt(b["res2"][a:]) / b["rmax"])
+                        cur.scatter_reduce_(0, b["ranks"][a:], g, "amax")
+                cur[unseen] = float("inf")
                 cur_np = cur[f:].cpu().numpy()
-                hit = np.nonzero(cur_np > gamma_min)[0]
+                hit = np.nonzero(cur_np > grade_min)[0]
                 if len(hit) == 0:
                     break
                 f += int(hit[0])
                 for b in blocks:
                     a, z = int(b["start"][f]), int(b["start"][f + 1])
-                    if z > a:
-                        b["e"].maxvol(b["x"], b["q"], b["src"], tol, C=b["C"], pivot=(a, z))
+                    if z == a:
+                        continue
+                    e, t = b["e"], b["t"]
+                    out = torch.nonzero(b["res2"][a:z] > b["rmax"] ** 2).squeeze(1) + a
+                    if out.numel():            # extend the subspace by these atoms' directions
+                        W = _new_directions(e, b["q"][out], extra.get(t), b["rmax"])
+                        if W is not None:
+                            extra[t] = W if t not in extra else torch.cat([extra[t], W], 1)
+                            b["res2"][z:] = torch.clamp(
+                                b["res2"][z:] - _extra_proj2(e, b["q"][z:], W, b["nb"]), min=0.0)
+                    e.maxvol(b["x"], b["q"], b["src"], tol, C=b["C"], pivot=(a, z))
                 chosen.append(int(frames[f0 + f]))
-                gamma_at.append(float(cur_np[hit[0]]))
+                grade_at.append(float(cur_np[hit[0]]))
                 f += 1
                 if max_frames is not None and len(chosen) >= max_frames:
                     break
@@ -1421,45 +1526,46 @@ def _greedy_select(aset, rows, gamma, n_frames, max_frames, gamma_min, block_row
     if len(chosen):
         sel = torch.from_numpy(np.isin(csrc[:, 0].numpy(), chosen))
         _maxvol_rows(aset, cq[sel], ct[sel], csrc[sel])
-    return chosen, np.asarray(gamma_at)
+    return chosen, np.asarray(grade_at)
 
 
-def _select(model_file, active_set, xyz_file, output_xyz, max_frames, gamma_min, gamma_max,
-            block_rows, output_active_set, device, dtype, chunk_atoms, energy_key, verbose,
+def _select(model_file, active_set, xyz_file, output_xyz, max_frames, grade_min, grade_max,
+            block_rows, output_active_set, device, precision, chunk_atoms, energy_key, verbose,
             comm):
     main = comm.rank == 0
     _log = _log_fn(verbose and main)
     t_total = time.time()
-    aset = _as_active_set(active_set, model_file, device, dtype)
-    if gamma_min is None:
-        gamma_min = aset.tol
+    aset = _as_active_set(active_set, model_file, device, precision)
+    if grade_min is None:
+        grade_min = aset.tol
     offsets, natoms = _index(comm, xyz_file)
     n = len(offsets)
     stream = _DescriptorStream(aset.desc_calc, xyz_file, chunk_atoms, energy_key,
                                index=(offsets, natoms), workers=_parse_workers(comm))
     mine = _split_by_atoms(np.arange(n), natoms, comm.world)[comm.rank]
-    progress = _Progress(len(mine), verbose and main, "gamma")
-    part = _grade_frames(aset, stream, mine, False, progress, window=(gamma_min, gamma_max))
+    progress = _Progress(len(mine), verbose and main, "grades")
+    part = _grade_frames(aset, stream, mine, False, progress, window=(grade_min, grade_max),
+                         precision=precision)
     progress.close()
     stream.close()
     parts = comm.gather_objects(part)
     result = None
     if main:
-        gamma = _assemble_gamma(parts, natoms, False)["gamma"]
+        grade = _assemble_gamma(parts, natoms, False)["grade"]
         cand = [p["rows"] for p in parts if p.get("rows") is not None]
         if not cand:
-            _log(f"  select: no frame with gamma > {gamma_min}")
-            chosen, gamma_at = np.zeros(0, dtype=np.int64), np.zeros(0)
+            _log(f"  select: no frame with grade > {grade_min}")
+            chosen, grade_at = np.zeros(0, dtype=np.int64), np.zeros(0)
         else:
             rows = tuple(torch.cat([c[k] for c in cand]) for k in range(3))
-            chosen, gamma_at = _greedy_select(aset, rows, gamma, n, max_frames, gamma_min,
+            chosen, grade_at = _greedy_select(aset, rows, grade, n, max_frames, grade_min,
                                               block_rows, _log)
         _log(f"  select: {len(chosen)} frames chosen in {time.time() - t_total:.1f}s")
         if output_xyz is not None:
             _write_frames(xyz_file, offsets, chosen, output_xyz)
         if output_active_set is not None:
             aset.save(output_active_set)
-        result = {"index": chosen, "gamma_at_choice": gamma_at, "gamma": gamma}
+        result = {"index": chosen, "grade_at_choice": grade_at, "grade": grade}
     return comm.bcast_object(result, 0)
 
 
@@ -1469,36 +1575,41 @@ def select_structures(
     xyz_file: str,
     output_xyz: str = None,
     max_frames: int = None,
-    gamma_min: float = None,
-    gamma_max: float = None,
+    grade_min: float = None,
+    grade_max: float = None,
     block_rows: int = None,
     output_active_set: str = None,
     device: str = None,
-    dtype: str = "float64",
+    precision: str = "float32",
     chunk_atoms: int = None,
     energy_key: str = "energy",
     verbose: bool = True,
 ):
-    """Greedy D-optimal choice of structures that extend the active set.
+    """Greedy D-optimal choice of structures that extend the training set.
 
-    Frames of ``xyz_file`` whose grade lies in ``(gamma_min, gamma_max]`` are
-    candidates (``gamma_min`` defaults to the ``tol`` of the active set). They
-    are visited from the highest grade down; a frame is taken when its grade,
-    recomputed against the active set extended by the frames taken before it,
-    still exceeds ``gamma_min``, and its atoms then enter the active set by
-    MaxVol swaps. Near-duplicates of a taken frame fall below the threshold
-    and are skipped. Stops after ``max_frames``. The frames are graded here
-    (no :func:`compute_gamma` call is needed first), by gamma only: frames
-    with gamma <= ``gamma_min`` are not candidates whatever their gamma_res.
+    A frame's grade is the largest over its atoms of max(gamma, gamma_res).
+    Frames of ``xyz_file`` whose grade lies in ``(grade_min, grade_max]``
+    are candidates (``grade_min`` defaults to the ``tol`` of the active set).
+    They are visited from the highest grade down; a frame is taken when its
+    grade, recomputed after the frames taken before it were added (their
+    atoms enter the active set by MaxVol swaps, and their out-of-subspace
+    directions extend the subspace), still exceeds ``grade_min`` — so
+    near-duplicates of a taken frame are skipped. Frames with an element
+    that has no active set grade inf. Stops after ``max_frames``. The frames
+    are graded here, no :func:`compute_gamma` call is needed first.
 
+    ``precision="float32"`` (default) computes the descriptors and the first
+    grades of all frames in float32; the choice itself runs in float64.
     Writes the chosen frames verbatim to ``output_xyz`` and, if given, the
-    extended active set to ``output_active_set``. Returns a dict with
-    ``index`` (chosen frames, in order of choice), ``gamma_at_choice`` and
-    ``gamma`` (grades of all frames against the original active set).
+    active set extended by them to ``output_active_set`` (MaxVol within the
+    subspace; the subspace itself changes only when the active set is
+    rebuilt). Returns a dict with ``index`` (chosen frames, in order of
+    choice), ``grade_at_choice`` and ``grade`` (grades of all frames against
+    the original active set).
     """
-    return _select(model_file, active_set, xyz_file, output_xyz, max_frames, gamma_min,
-                   gamma_max, block_rows, output_active_set, device, dtype, chunk_atoms,
-                   energy_key, verbose, _Comm())
+    return _select(model_file, active_set, xyz_file, output_xyz, max_frames, grade_min,
+                   grade_max, block_rows, output_active_set, device, _check_precision(precision),
+                   chunk_atoms, energy_key, verbose, _Comm())
 
 
 def select_structures_sharded(
@@ -1507,11 +1618,11 @@ def select_structures_sharded(
     xyz_file: str,
     output_xyz: str = None,
     max_frames: int = None,
-    gamma_min: float = None,
-    gamma_max: float = None,
+    grade_min: float = None,
+    grade_max: float = None,
     block_rows: int = None,
     output_active_set: str = None,
-    dtype: str = "float64",
+    precision: str = "float32",
     chunk_atoms: int = None,
     energy_key: str = "energy",
     verbose: bool = True,
@@ -1522,9 +1633,9 @@ def select_structures_sharded(
     the outputs; every rank returns the same dict. The choice is identical to
     :func:`select_structures`."""
     comm, dev = _comm_setup(None)
-    return _select(model_file, active_set, xyz_file, output_xyz, max_frames, gamma_min,
-                   gamma_max, block_rows, output_active_set, dev, dtype, chunk_atoms,
-                   energy_key, verbose, comm)
+    return _select(model_file, active_set, xyz_file, output_xyz, max_frames, grade_min,
+                   grade_max, block_rows, output_active_set, dev, _check_precision(precision),
+                   chunk_atoms, energy_key, verbose, comm)
 
 
 def _maxvol_rows(aset, q, types, src):

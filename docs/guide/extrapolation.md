@@ -7,7 +7,7 @@
     pip install "git+https://github.com/mushroomfire/torchnep.git@feat/extrapolation-gamma"
     ```
 
-With **one** trained model, the extrapolation grade γ tells how far an atomic environment lies outside the model's training set — no committee of models is needed. Its use is active learning: out of many structures, for example the frames of MD runs, choose the few worth computing with DFT and adding to the training set.
+With **one** trained model, the extrapolation grade tells how far an atomic environment lies outside the model's training set — no committee of models is needed. Its use is active learning: out of many structures — MD frames from GPUMD, LAMMPS or anything that writes extended XYZ — choose the few worth computing with DFT and adding to the training set. The grade can also be computed by GPUMD during MD.
 
 ## Choosing structures for DFT
 
@@ -22,65 +22,103 @@ res = select_structures("nep.txt", "active_set.pt", "md.xyz",
                         output_xyz="to_dft.xyz", max_frames=200)
 ```
 
-`to_dft.xyz` receives the chosen frames, copied verbatim from `md.xyz`. Compute them with DFT, add them to the training set and retrain; then rebuild the active set for the new model before choosing from its MD runs. `res["index"]` holds the positions of the chosen frames in `md.xyz`, in order of choice, and `res["gamma"]` the grade of every frame of `md.xyz`.
+`to_dft.xyz` receives the chosen frames, copied verbatim from `md.xyz`. Compute them with DFT, add them to the training set and retrain; then rebuild the active set for the new model before choosing from its MD runs. `res["index"]` holds the positions of the chosen frames in `md.xyz`, in order of choice, and `res["grade"]` the grade of every frame of `md.xyz`.
 
 Output of the two calls for a Cr-Co-Ni model and its training set (3030 frames), choosing from a pool of 2175 structures of another dataset, on one GPU:
 
 ```text
-  active set: 3030 frames, 257880 atoms, 3 elements, K = 80 x (63 + 2) = 5200, rcond 0.0001, tol 1.01
-  pass 1 (Gram matrices, 3030 frames): 2.9s
+  active set: 3030 frames, 257880 atoms, 3 elements, K = 80 x (63 + 2) = 5200, rcond 0.0001, tol 1.01, float32
+  pass 1 (Gram matrices, 3030 frames): 7.4s
     Cr  rows     82288  rank   345 / 5200
     Co  rows     85112  rank   308 / 5200
     Ni  rows     90480  rank   289 / 5200
-  subspaces and seed active sets: 11.3s
-  pass 2 (MaxVol, 3030 frames): 0.6s
-  check 1: 201 atoms above 1.01 (largest 1.7668) -> 87 swaps (0.3s)
-  check 2: 3 atoms above 1.01 (largest 1.0759) -> 18 swaps (0.1s)
-  check 3: every training atom has gamma <= 1.01 (largest 1.0065; 0.1s)
-  TOTAL: 16.3s -> active_set.pt
-  select: 786 candidate frames (89032 atoms)
-  select: 200 frames chosen in 3.3s
+  subspaces and seed active sets: 4.6s
+  pass 2 (MaxVol, 3030 frames): 1.0s
+  check 1: 336 atoms above 1.01 (largest 1.7697) -> 153 swaps (0.5s)
+  check 2: 6 atoms above 1.01 (largest 1.0969) -> 56 swaps (0.3s)
+  check 3: 3 atoms above 1.01 (largest 1.0747) -> 16 swaps (0.3s)
+  check 4: every training atom has gamma <= 1.01 (largest 1.0084; 0.2s)
+  TOTAL: 17.4s -> active_set.pt
+  select: 845 candidate frames (95106 atoms)
+  select: 200 frames chosen in 6.4s
 ```
 
 ### How the choice works
 
-`select_structures` grades every frame against the active set; the frames whose grade lies in (`gamma_min`, `gamma_max`] are the candidates — 786 of the 2175 above. They are visited from the highest grade down, and a frame is taken only if its grade, **recomputed against the active set extended by the frames taken before it**, still exceeds `gamma_min`. Of a group of near-identical frames only the first is taken, since once it is in the active set the others no longer extrapolate. The grades at the time of choice (`res["gamma_at_choice"]`, here 14.2, 5.0, 10.6, 3.3, 7.6, …) therefore do not decrease monotonically.
+A frame's **grade** is the largest grade of its atoms; above 1, the frame lies outside the training set (see [What the grade measures](#what-the-grade-measures)). The frames whose grade lies in (`grade_min`, `grade_max`] are the candidates — 845 of the 2175 above. They are visited from the highest grade down, and a frame is taken only if its grade, **recomputed after the frames taken before it were added to the training data**, still exceeds `grade_min`. Of a group of near-identical frames only the first is taken: once it is in, the others no longer extrapolate. The grades at the time of choice (`res["grade_at_choice"]`, here 20.9, 14.8, 12.4, 7.8, 10.9, …) therefore do not decrease monotonically. A frame with an element that has no atom in the training set has grade ∞ and is always taken.
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `max_frames` | all | Stop after this many frames. |
-| `gamma_min` | `tol` of the active set (1.01) | Frames at or below it are not candidates. |
-| `gamma_max` | none | Frames above it are not candidates either. |
+| `grade_min` | `tol` of the active set (1.01) | Frames at or below it are not candidates. |
+| `grade_max` | none | Frames above it are not candidates either. |
 | `output_xyz` | none | Write the chosen frames here. |
 | `output_active_set` | none | Save the active set extended by the chosen frames. |
+| `precision` | `"float32"` | Descriptors and first grades in float32; the choice itself runs in float64. |
 
-With `max_frames`, the most extrapolating frames are taken first, so the default `gamma_min` is usually fine. The frames with the largest grades lie farthest from anything the model was trained on; they can be unphysical, e.g. MD frames after the simulation went wrong and atoms ran into each other. Look at them before sending them to DFT, and exclude such frames with `gamma_max`.
-
-The choice uses γ only, not γ_res (see [What γ measures](#what-measures)): a frame with γ ≤ `tol` whose atoms point into directions outside the training subspace is not a candidate. In the pool above, 36 of the 2175 frames were of this kind (γ_res up to 2.1). `compute_gamma` reports γ_res for such checks.
+With `max_frames`, the most extrapolating frames are taken first, so the default `grade_min` is usually fine. The frames with the largest grades lie farthest from anything the model was trained on; they can be unphysical, e.g. MD frames after the simulation went wrong and atoms ran into each other. Look at them before sending them to DFT, and exclude such frames with `grade_max`.
 
 ### Do I need `compute_gamma`?
 
 Not for choosing: `select_structures` grades the frames itself. `compute_gamma` only grades, which is useful to look at the grades before or instead of choosing:
 
-- how much an MD run extrapolates, e.g. the fraction of frames with γ > 1 — it should shrink from one round of active learning to the next;
-- the distribution of the grades, to set `gamma_min` or `gamma_max`;
-- per-atom grades (`per_atom=True`) and the atom with the largest grade in each frame: where a large structure extrapolates (a surface, a defect, one species), e.g. to cut out a smaller cell around it for DFT;
-- γ_res, which the choice does not use.
+- how much an MD run extrapolates, e.g. the fraction of frames with grade > 1 — it should shrink from one round of active learning to the next;
+- the distribution of the grades, to set `grade_min` or `grade_max`;
+- per-atom grades (`per_atom=True`) and the atom with the largest grade in each frame: where a large structure extrapolates (a surface, a defect, one species), e.g. to cut out a smaller cell around it for DFT.
 
 ```python
 from torchnep.extrapolation import compute_gamma
 
-g = compute_gamma("nep.txt", "active_set.pt", "md.xyz", output_file="gamma.npz")
-print((g["gamma"] > 1).mean())          # fraction of extrapolating frames
+g = compute_gamma("nep.txt", "active_set.pt", "md.xyz", output_file="grades.npz")
+print((g["grade"] > 1).mean())          # fraction of extrapolating frames
 ```
 
-For the pool above, its log line reads `gamma: 2175 frames in 1.5s; frames with gamma > 1.01: 786, median 0.882, max 14.2`. See [Grade structures](#grade-structures) for the returned arrays.
+For the pool above it prints 0.399, after the log line `grades: 2175 frames in 1.2s; frames with grade > 1.01: 845 (gamma > 1.01: 805), median grade 0.887, max 20.9`. See [Grade structures](#grade-structures) for the returned arrays.
 
-## What γ measures
+## Grades during MD with GPUMD
+
+GPUMD computes the same grade γ during MD with its [`compute_extrapolation`](https://gpumd.org/dev/gpumd/input_parameters/compute_extrapolation.html) keyword. Write the active set in GPUMD's format when building it, or later from the saved one:
+
+```python
+build_active_set("nep.txt", "train.xyz", "active_set.pt", asi_file="active_set.asi")
+
+# or, for an active set built before
+from torchnep.extrapolation import ActiveSet
+ActiveSet.load("active_set.pt", "nep.txt").save_gpumd("active_set.asi")
+```
+
+and add to GPUMD's `run.in`, for example
+
+```text
+compute_extrapolation asi_file active_set.asi gamma_low 2 gamma_high 50 check_interval 100 dump_interval 100
+```
+
+(recent GPUMD versions also need `nep_file nep.txt`; see the GPUMD documentation of your version). Every `check_interval` steps GPUMD grades all atoms, writes the frames with γ ≥ `gamma_low` to `extrapolation_dump.xyz`, and stops the run when γ exceeds `gamma_high`.
+
+A check with the Cr-Co-Ni model above: 5 ps NPT runs of a 256-atom cell in GPUMD, graded every 250 steps.
+
+| | 300 K | 2500 K |
+|---|---|---|
+| largest γ of a frame, GPUMD | 0.66 – 0.83 | 0.69 – 1.19 |
+| largest γ of a frame, `compute_gamma` on the dumped frames | 0.66 – 0.83 | 0.68 – 1.20 |
+| per-atom difference, median / largest | 0.02 % / 0.4 % | 0.08 % / 1.2 % |
+| frames above 1.01 | 0 of 20 | 8 of 20 |
+| chosen by `select_structures` from the dump | none | 6 |
+
+At 2500 K the cell melts during the run (the potential energy rises by 0.2 eV/atom and the box by 5 % in length at constant temperature); the frames chosen are all from 2.25 ps on. GPUMD computes `b` in single precision, hence the small per-atom differences. `select_structures` reads `extrapolation_dump.xyz` as it is.
+
+What differs from TorchNEP's own grading:
+
+- GPUMD computes γ only, not γ_res (the part of the grade outside the subspace), and writes every frame above `gamma_low`, near-duplicates included. To choose from its dump, run `select_structures` on `extrapolation_dump.xyz`.
+- Elements without atoms in the training set (e.g. the other elements of a model fine-tuned from a many-element one) have no active set and are left out of the `.asi` file, with a warning; keep them out of the GPUMD run.
+- GPUMD keeps a K × K matrix per element on the GPU and applies it to every atom at each check, so the checks cost more for large models and many atoms; the file is large as well (230 MB for the Cr-Co-Ni model above, K = 5200).
+- Active sets made by other tools for GPUMD (`.asi` files) cannot be read by TorchNEP.
+
+## What the grade measures
 
 The method is the D-optimality (MaxVol) active learning developed for moment tensor potentials [[1–3]](#references) and used for the atomic cluster expansion [[4]](#references), with the MaxVol algorithm of [[5]](#references); see these papers for the theory. In short:
 
-Every atom is represented by the gradient of its NEP energy with respect to its element's network weights, `b = dE_i / d(w0, b0, w1)` (K = neurons × (descriptor size + 2) numbers) — the model linearised in its parameters. From the training set, TorchNEP keeps for every element the **active set**: the training atoms whose rows span the largest volume. A new atom is written in the basis of the active rows, `b = c A`, and its grade is
+Every atom is represented by the gradient of its NEP energy with respect to its element's network weights, `b = dE_i / d(w0, b0, w1)` (K = neurons × (descriptor size + 2) numbers) — the model linearised in its parameters. From the training set, TorchNEP keeps for every element the **active set**: the training atoms whose rows span the largest volume. A new atom is written in the basis of the active rows, `b = c A`, and
 
 ```text
 gamma = max_j |c_j|
@@ -88,9 +126,8 @@ gamma = max_j |c_j|
 
 - **γ ≤ 1**: the environment lies inside the region spanned by the training set (interpolation). Every training atom has γ ≤ `tol` (1.01) by construction.
 - **γ > 1**: it lies outside; putting it into the active set would multiply the spanned volume by γ.
-- A structure's grade is the largest grade of its atoms.
 
-Two choices are specific to this implementation. The rows are numerically far from full rank — their singular values decay smoothly over many orders of magnitude — so γ is computed in the leading subspace of each element, the directions whose singular value is above `rcond` × the largest; the rows are projected onto it and whitened, which leaves γ unchanged (γ does not depend on the basis) and keeps the matrices well conditioned. What lies outside the subspace is reported separately as **γ_res**: the out-of-subspace norm of the atom's row divided by the largest one met in the training set (> 1: more weight outside the training subspace than any training atom). The choice of structures (above) is a greedy, re-graded variant of choosing by MaxVol.
+Two choices are specific to this implementation. The rows are numerically far from full rank — their singular values decay smoothly over many orders of magnitude — so γ is computed in the leading subspace of each element, the directions whose singular value is above `rcond` × the largest; the rows are projected onto it and whitened, which leaves γ unchanged (γ does not depend on the basis) and keeps the matrices well conditioned. The part of `b` outside the subspace is measured by **γ_res**: its norm divided by the largest one met in the training set (> 1: more weight outside the training subspace than any training atom). An atom's **grade** is the larger of γ and γ_res — both scale with how far the atom lies outside, and both are ≤ 1 for every training atom. The choice of structures (above) is a greedy, re-graded variant of choosing by MaxVol, in which a chosen frame's atoms enter the active set and their directions outside the subspace are added to it.
 
 ## Build the active set
 
@@ -98,7 +135,7 @@ Two choices are specific to this implementation. The rows are numerically far fr
 
 1. on a random sample of frames, the Gram matrix of every element's rows — its leading eigenvectors give the subspace — and a random sample of rows that seeds the active set;
 2. on all frames, MaxVol swaps of every atom whose grade exceeds `tol`;
-3. check passes over all frames: the atoms still above `tol` (a row passed early can exceed it after later swaps) are swapped in, until a pass finds none — after 3 to 9 passes on the training sets we tried. The log reports the result and the largest training grade, e.g. `check 3: every training atom has gamma <= 1.01`; if `max_passes` runs out first, a last check reports how many atoms remain above `tol` (typically a handful, with grades just above it).
+3. check passes over all frames: the atoms still above `tol` (a row passed early can exceed it after later swaps) are swapped in, until a pass finds none — after 3 to 9 passes on the training sets we tried. The log reports the result and the largest training grade, e.g. `check 4: every training atom has gamma <= 1.01`; if `max_passes` runs out first, a last check reports how many atoms remain above `tol` (typically a handful, with grades just above it).
 
 `rank` in the log is the dimension of the element's subspace, i.e. its number of active rows, out of K. The descriptors are kept in host memory between passes when they fit in 25 % of the free memory, so the check passes cost only the projection (`TORCHNEP_GAMMA_CACHE_GB` sets another budget, `0` disables it).
 
@@ -109,8 +146,8 @@ Two choices are specific to this implementation. The rows are numerically far fr
 | `sample_frames` | `50000` | Frames used for the Gram matrices and the seed (all frames if fewer). |
 | `init_rows` | `4` | Seed: LU pivoting over `init_rows` × r sampled rows. |
 | `max_passes` | `10` | Check passes (with swaps) at most. |
-| `dtype` | `"float64"` | Descriptor precision; the subspace and MaxVol always run in float64. |
-| `precision` | `"float64"` | `"float32"`: grade the rows of passes 2 and 3 in float32 first and regrade in float64 only those near or above `tol`. The swaps, and so the active set, are the same; much faster on GPUs with slow float64 (most consumer cards). |
+| `precision` | `"float32"` | Descriptors and screening in float32 (see [float32 or float64](#float32-or-float64)); the Gram matrices, subspaces and MaxVol always run in float64. |
+| `asi_file` | none | Also write the active set for GPUMD. |
 | `chunk_atoms` | 200 000 | Atoms read per chunk (host memory). |
 | `seed` | `0` | Random sample of frames and rows. |
 
@@ -122,15 +159,23 @@ The active set belongs to one model: it stores a fingerprint of the model's para
 
 | Key | Shape | Meaning |
 |---|---|---|
-| `gamma` | frames | largest γ of the frame's atoms |
+| `grade` | frames | largest grade of the frame's atoms, max(γ, γ_res) — what `select_structures` ranks by |
+| `gamma` | frames | largest γ of the frame's atoms (what GPUMD computes) |
 | `gamma_res` | frames | largest γ_res of the frame's atoms |
-| `atom` | frames | index (in the frame) of the atom with the largest γ (of atoms with equal grades, e.g. symmetric sites, any may come out) |
+| `atom` | frames | index (in the frame) of the atom with the largest grade (of atoms with equal grades, e.g. symmetric sites, any may come out) |
 | `natoms` | frames | atoms per frame |
 | `gamma_atoms`, `gamma_res_atoms` | atoms | every atom, in file order (`per_atom=True`) |
 
 Atoms of an element that has no atom in the training set get γ = ∞.
 
-`precision="float32"` grades in float32: γ stays within 1e-4 and γ_res within a few 1e-3 (relative) of the float64 values, and grading runs several times faster on GPUs whose float64 throughput is low (most consumer cards); on GPUs with fast float64 it brings nothing. `dtype` sets the precision of the descriptors themselves.
+## float32 or float64
+
+All functions take `precision="float32"` (default) or `"float64"`. In float32 the descriptors and the grades of the streamed frames are computed in float32; every decision that depends on the threshold is checked in float64, and the Gram matrices, subspaces and MaxVol always run in float64. Measured differences:
+
+- **Grades** of the same structures with the same active set: γ within 7 × 10⁻⁵ (relative; median 1.4 × 10⁻⁶), γ_res within 2 × 10⁻³, over 105 464 frames.
+- **Active sets** built in float32 and float64 differ, as any two MaxVol runs over slightly different numbers do, but both keep every training atom within `tol` (largest training γ 1.0094 and 1.0099, whichever precision grades them); the subspace dimensions were identical.
+- **Choices**: with the same active set, float32 and float64 chose the same 200 frames of the Cr-Co-Ni pool; with the two active sets, 178 of the 200 chosen frames, and the first ten, were the same.
+- **Speed**: float32 grading was 1.3 × faster on a GPU with fast float64 (V100); on GPUs with slow float64 (most consumer cards) the gain is several-fold. Building took the same time in both, since the float64 Gram matrices dominate.
 
 ## Several GPUs
 
@@ -164,36 +209,20 @@ Every rank streams its own share of the frames. For the active set, the Gram mat
 
 ## Performance
 
-The file is read by worker processes one chunk ahead while the GPU computes the neighbor lists, the descriptors and the grades of the current chunk: about 2 × 10⁵ atoms per second per GPU. Measured with a 16-element model (K = 80 × (35 + 2) = 2960) and its training set of 105 464 frames (6.9 million atoms), on GPUs with fast float64:
+The file is read by worker processes one chunk ahead while the GPU computes the neighbor lists, the descriptors and the grades of the current chunk. Measured with a 16-element model (K = 80 × (35 + 2) = 2960) and its training set of 105 464 frames (6.9 million atoms), in float64:
 
 | | 1 GPU | 8 GPUs |
 |---|---|---|
 | `build_active_set` (converged) | 212 s | 62 s |
 | `compute_gamma`, all 105 464 frames | 29 – 36 s | 9 – 20 s |
 
-The upper figures of `compute_gamma` include the start-up of a fresh run. On one GPU the build spends 13 s in pass 1 (50 000 sampled frames), 45 s on the subspaces and seeds — mostly the eigendecompositions of the K × K Gram matrices, about 2.5 s per element, which the sharded build divides among the GPUs — 83 s in pass 2 and 6 – 11 s per check pass (9 passes). Choosing 200 of the 2175 frames of the example above takes 3.3 s.
-
-## Relation to GPUMD's `compute_extrapolation`
-
-GPUMD computes an extrapolation grade during MD with its [`compute_extrapolation`](https://gpumd.org/dev/gpumd/input_parameters/compute_extrapolation.html) keyword, from an active-set file made by separate Python scripts linked from its documentation. TorchNEP's implementation was written independently, from the papers below, and is **not compatible** with it: `active_set.pt` cannot be used by GPUMD, an `.asi` file cannot be read by TorchNEP, and the grades of the two differ. At the time of writing:
-
-| | TorchNEP | GPUMD `compute_extrapolation` |
-|---|---|---|
-| Vector per atom | `b = dE_i / d(w0, b0, w1)` of the atom's element | the same |
-| Active set of an element | r rows spanning the leading subspace (singular values above `rcond` × the largest; r of a few hundred to about 1600 for the models above, out of K = 2960 – 5200) | K rows, the full `b` (at least K atoms of the element needed), inverted with a pseudo-inverse |
-| Grade | γ in the subspace, and γ_res for the rest | γ on the full `b` |
-| When | after MD, on saved structures (xyz), on one or several GPUs | during MD, every `check_interval` steps |
-| Output | a greedy, re-graded choice of up to `max_frames` frames | the frames with γ ≥ `gamma_low` are written to `extrapolation_dump.xyz`; the MD stops when γ exceeds `gamma_high` |
-| File | `active_set.pt` (PyTorch: subspace, whitening, active rows and their inverse, model fingerprint) | `active_set.asi` (text: a K × K matrix per element) |
-
-Since the active sets are built differently, γ thresholds tuned for one (e.g. `gamma_low` / `gamma_high` in GPUMD) do not carry over to the other.
+The upper figures of `compute_gamma` include the start-up of a fresh run. On one GPU the build spends 13 s in pass 1 (50 000 sampled frames), 45 s on the subspaces and seeds — mostly the eigendecompositions of the K × K Gram matrices, about 2.5 s per element, which the sharded build divides among the GPUs — 83 s in pass 2 and 6 – 11 s per check pass (9 passes). On one V100, building took 244 s and grading all frames 32 s in float32. Choosing 200 of the 2175 frames of the Cr-Co-Ni example takes about 6 s.
 
 ## Limitations
 
 - **Experimental.** On one test (a Cr-Co-Ni model and a pool of structures from another dataset), choosing frames by γ reduced the error on held-out structures as much as choosing them by a committee of four models, and much more than choosing them at random. It has not been used in production active learning yet.
-- **After MD only:** the grades are computed on saved structures, not during a simulation.
 - **Memory while building:** the Gram matrices take K² × 8 bytes per element on the GPU (70 MB for K = 2960). With the sharded build, each element's matrix is summed on one rank.
-- **γ_res** is computed as `|b|² − |b V|²`, which costs digits: it is accurate to about 1e-8 relative, plenty for a grade.
+- **γ_res** in float64 is computed as `|b|² − |b V|²`, which costs digits: it is accurate to about 1e-8 relative, plenty for a grade.
 - The active set depends on the model; rebuild it after retraining.
 
 ## References

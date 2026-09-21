@@ -98,18 +98,22 @@ def test_maxvol_gives_dominant_rows():
 def test_build_grade_reload(tmp_path):
     model = _small_model(tmp_path / "nep.txt")
     out = tmp_path / "as.pt"
-    aset = build_active_set(model, TRAIN, str(out), device="cpu", verbose=False)
+    aset = build_active_set(model, TRAIN, str(out), device="cpu", precision="float64",
+                            verbose=False)
     for e in aset.elements:
         assert 0 < e.r <= aset.K
-    g = compute_gamma(model, str(out), TRAIN, per_atom=True, device="cpu", verbose=False)
+    g = compute_gamma(model, str(out), TRAIN, per_atom=True, device="cpu", precision="float64",
+                      verbose=False)
     assert g["gamma"].shape == (24,) and g["gamma_atoms"].shape == (24 * 108,)
     assert g["gamma"].max() <= aset.tol + 1e-6          # converged MaxVol on its training set
     assert np.all(g["gamma_res"] <= 1 + 1e-9)
     per_frame = g["gamma_atoms"].reshape(24, 108)
     assert np.allclose(per_frame.max(1), g["gamma"])
-    assert np.all(per_frame[np.arange(24), g["atom"]] == g["gamma"])
-    # float32 descriptors grade the same structures almost identically
-    g32 = compute_gamma(model, str(out), TRAIN, device="cpu", dtype="float32", verbose=False)
+    assert np.array_equal(g["grade"], np.maximum(g["gamma"], g["gamma_res"]))
+    grade_atoms = np.maximum(per_frame, g["gamma_res_atoms"].reshape(24, 108))
+    assert np.all(grade_atoms[np.arange(24), g["atom"]] == g["grade"])
+    # float32 grades the same structures almost identically
+    g32 = compute_gamma(model, str(out), TRAIN, device="cpu", verbose=False)
     assert np.allclose(g32["gamma"], g["gamma"], rtol=1e-3)
     # an active set only loads with its own model
     other = _small_model(tmp_path / "other.txt", seed=1)
@@ -119,7 +123,8 @@ def test_build_grade_reload(tmp_path):
 
 def test_select_skips_near_duplicates(tmp_path):
     model = _small_model(tmp_path / "nep.txt")
-    aset = build_active_set(model, TRAIN, str(tmp_path / "as.pt"), device="cpu", verbose=False)
+    aset = build_active_set(model, TRAIN, str(tmp_path / "as.pt"), device="cpu",
+                            precision="float64", verbose=False)
     rng = np.random.default_rng(0)
     frames = read_xyz(TRAIN)[:6]
     cand = []
@@ -136,11 +141,11 @@ def test_select_skips_near_duplicates(tmp_path):
     chosen = res["index"]
     assert len(chosen) > 0
     assert len(set(i // 2 for i in chosen)) == len(chosen)        # never both copies
-    assert np.all(res["gamma_at_choice"] > aset.tol)
+    assert np.all(res["grade_at_choice"] > aset.tol)
     assert len(read_xyz(str(tmp_path / "chosen.xyz"))) == len(chosen)
     # against the extended active set nothing chosen extrapolates any more
     g2 = compute_gamma(model, str(tmp_path / "as2.pt"), str(tmp_path / "chosen.xyz"),
-                       device="cpu", verbose=False)
+                       device="cpu", precision="float64", verbose=False)
     assert g2["gamma"].max() <= aset.tol + 1e-6
     # a budget stops the choice early
     res1 = select_structures(model, str(tmp_path / "as.pt"), str(path), max_frames=1,
@@ -254,6 +259,15 @@ def test_element_without_training_data_is_infinite(tmp_path):
                       device="cpu", verbose=False)
     assert np.isinf(g["gamma_atoms"][0]) and np.isfinite(g["gamma_atoms"][1:]).all()
     assert np.isinf(g["gamma"][0]) and g["atom"][0] == 0
+    # a frame with an element never trained is always a candidate and chosen
+    res = select_structures(model, str(tmp_path / "as.pt"), str(tmp_path / "fe.xyz"),
+                            device="cpu", verbose=False)
+    assert list(res["index"]) == [0] and np.isinf(res["grade_at_choice"][0])
+    # GPUMD cannot grade Fe: its block is left out, with a warning
+    with pytest.warns(UserWarning, match="Fe"):
+        written = ActiveSet.load(str(tmp_path / "as.pt"), model).save_gpumd(
+            str(tmp_path / "as.asi"))
+    assert written == ["Cr", "Co", "Ni"]
 
 
 _SHARDED_RUNNER = """
@@ -262,10 +276,11 @@ import numpy as np
 from torchnep.extrapolation import (build_active_set_sharded, compute_gamma_sharded,
                                     select_structures_sharded)
 model, train, cand, out = sys.argv[1:5]
-build_active_set_sharded(model, train, out + "/as_ddp.pt", verbose=False)
-g = compute_gamma_sharded(model, out + "/as_ddp.pt", cand, per_atom=True, verbose=False)
+build_active_set_sharded(model, train, out + "/as_ddp.pt", precision="float64", verbose=False)
+g = compute_gamma_sharded(model, out + "/as_ddp.pt", cand, per_atom=True, precision="float64",
+                          verbose=False)
 res = select_structures_sharded(model, out + "/as_ddp.pt", cand, output_xyz=out + "/chosen_ddp.xyz",
-                                verbose=False)
+                                precision="float64", verbose=False)
 if g is not None:
     np.savez(out + "/g_ddp.npz", **g)
     np.save(out + "/index_ddp.npy", res["index"])
@@ -304,10 +319,11 @@ def test_sharded_matches_single_process(tmp_path):
     assert r.returncode == 0, r.stderr[-3000:]
 
     as_ddp = str(tmp_path / "as_ddp.pt")
-    g_train = compute_gamma(model, as_ddp, TRAIN, device="cpu", verbose=False)
+    g_train = compute_gamma(model, as_ddp, TRAIN, device="cpu", precision="float64",
+                            verbose=False)
     assert g_train["gamma"].max() <= 1.01 + 1e-6
     ref = compute_gamma(model, as_ddp, str(tmp_path / "cand.xyz"), per_atom=True,
-                        device="cpu", verbose=False)
+                        device="cpu", precision="float64", verbose=False)
     ddp = np.load(tmp_path / "g_ddp.npz")
     # the ranks batch the descriptors differently: equal up to summation order
     for k in ("gamma", "gamma_res", "gamma_atoms", "gamma_res_atoms"):
@@ -316,14 +332,15 @@ def test_sharded_matches_single_process(tmp_path):
         assert rel.max() <= (1e-10 if k in ("gamma", "gamma_atoms") else 1e-6), k
     assert np.array_equal(ddp["atom"], ref["atom"])
     sel = select_structures(model, as_ddp, str(tmp_path / "cand.xyz"), device="cpu",
-                            verbose=False)
+                            precision="float64", verbose=False)
     assert np.array_equal(np.load(tmp_path / "index_ddp.npy"), sel["index"])
     assert len(read_xyz(str(tmp_path / "chosen_ddp.xyz"))) == len(sel["index"])
 
 
 def test_float32_grades_track_float64(tmp_path):
     model = _small_model(tmp_path / "nep.txt")
-    aset = build_active_set(model, TRAIN, str(tmp_path / "as.pt"), device="cpu", verbose=False)
+    build_active_set(model, TRAIN, str(tmp_path / "as.pt"), device="cpu", precision="float64",
+                     verbose=False)
     rng = np.random.default_rng(2)
     frames = []
     for fr in read_xyz(TRAIN)[:6]:
@@ -331,26 +348,88 @@ def test_float32_grades_track_float64(tmp_path):
         fr["positions"] = fr["positions"] + rng.normal(0, 0.15, fr["positions"].shape)
         frames.append(fr)
     _write_xyz(tmp_path / "cand.xyz", frames)
-    g64 = compute_gamma(model, aset, str(tmp_path / "cand.xyz"), per_atom=True, device="cpu",
-                        verbose=False)
-    g32 = compute_gamma(model, aset, str(tmp_path / "cand.xyz"), per_atom=True, device="cpu",
-                        precision="float32", verbose=False)
+    kw = dict(per_atom=True, device="cpu", verbose=False)
+    g64 = compute_gamma(model, str(tmp_path / "as.pt"), str(tmp_path / "cand.xyz"),
+                        precision="float64", **kw)
+    g32 = compute_gamma(model, str(tmp_path / "as.pt"), str(tmp_path / "cand.xyz"),
+                        precision="float32", **kw)
     for k in ("gamma_atoms", "gamma_res_atoms"):
         rel = np.abs(g32[k] - g64[k]) / np.abs(g64[k])
         assert rel.max() < 1e-3, (k, rel.max())
 
 
-def test_float32_screening_builds_the_same_active_set(tmp_path):
-    """Screening in float32 regrades every row near the threshold in float64,
-    so the swaps — and the active set — are those of the float64 build."""
+def test_float32_build_keeps_the_training_set_inside(tmp_path):
+    """The float32 build (descriptors and screening in float32) converges like
+    the float64 one: every training atom within tol, to float32 round-off."""
     model = _small_model(tmp_path / "nep.txt")
-    a64 = build_active_set(model, TRAIN, str(tmp_path / "a64.pt"), device="cpu", verbose=False)
-    a32 = build_active_set(model, TRAIN, str(tmp_path / "a32.pt"), device="cpu",
-                           precision="float32", verbose=False)
-    for e64, e32 in zip(a64.elements, a32.elements):
-        assert e64.r == e32.r
-        k64 = sorted(map(tuple, e64.src.tolist()))
-        k32 = sorted(map(tuple, e32.src.tolist()))
-        assert k64 == k32, e64.name
-        assert abs(e64.res_max - e32.res_max) <= 1e-3 * e64.res_max
-    assert a64.meta["converged"] == a32.meta["converged"]
+    a32 = build_active_set(model, TRAIN, str(tmp_path / "a32.pt"), device="cpu", verbose=False)
+    a64 = build_active_set(model, TRAIN, str(tmp_path / "a64.pt"), device="cpu",
+                           precision="float64", verbose=False)
+    assert a32.precision == "float32" and a32.meta["converged"] and a64.meta["converged"]
+    for e32, e64 in zip(a32.elements, a64.elements):
+        assert e32.r == e64.r
+    for prec in ("float32", "float64"):
+        g = compute_gamma(model, str(tmp_path / "a32.pt"), TRAIN, device="cpu", precision=prec,
+                          verbose=False)
+        assert g["gamma"].max() <= a32.tol * (1 + 1e-4), (prec, g["gamma"].max())
+
+
+def test_gpumd_export_reproduces_gamma(tmp_path):
+    """GPUMD grades an atom with the ASI matrix M read as a column-major
+    K x K array (gemv, no transpose): max |M_colmajor @ b|. The exported
+    file gives gamma of every atom."""
+    model = _small_model(tmp_path / "nep.txt")
+    aset = build_active_set(model, TRAIN, str(tmp_path / "as.pt"), device="cpu",
+                            precision="float64", verbose=False)
+    assert aset.save_gpumd(str(tmp_path / "as.asi")) == ["Cr", "Co", "Ni"]
+    K = aset.K
+    tokens = open(tmp_path / "as.asi").read().split()
+    blocks, i = {}, 0
+    while i < len(tokens):                         # GPUMD's reader: symbol, shape, values
+        name, n1, n2 = tokens[i], int(tokens[i + 1]), int(tokens[i + 2])
+        assert (n1, n2) == (K, K)
+        blocks[name] = np.asarray(tokens[i + 3:i + 3 + n1 * n2], dtype=np.float64)
+        i += 3 + n1 * n2
+    rng = np.random.default_rng(4)
+    frames = []
+    for fr in read_xyz(TRAIN)[:3]:
+        fr = dict(fr)
+        fr["positions"] = fr["positions"] + rng.normal(0, 0.2, fr["positions"].shape)
+        frames.append(fr)
+    _write_xyz(tmp_path / "md.xyz", frames)
+    g = compute_gamma(model, aset, str(tmp_path / "md.xyz"), per_atom=True, device="cpu",
+                      precision="float64", verbose=False)
+    _, desc = _load_calculators(model, torch.device("cpu"), "float64")
+    stream = _DescriptorStream(desc, str(tmp_path / "md.xyz"))
+    k = 0
+    for ids, nat, types, q in stream.chunks():
+        for t, qa in zip(types.tolist(), q):
+            e = aset.elements[t]
+            b = b_vectors(qa[None], e.w0, e.b0, e.w1)[0].numpy()
+            A = blocks[e.name].reshape(K, K, order="F")        # column-major, lda = K
+            assert np.isclose(np.abs(A @ b).max(), g["gamma_atoms"][k], rtol=1e-9)
+            k += 1
+    stream.close()
+    assert k == len(g["gamma_atoms"]) and g["gamma"].max() > aset.tol   # some atoms extrapolate
+
+
+def test_select_takes_frames_outside_the_subspace(tmp_path):
+    """A frame whose atoms lie within the active set (gamma <= tol) but have
+    more weight outside the subspace than any training atom (gamma_res > 1)
+    is chosen; its exact copy is not, since the directions it added cover it."""
+    model = _small_model(tmp_path / "nep.txt")
+    build_active_set(model, TRAIN, str(tmp_path / "as.pt"), rcond=1e-2, device="cpu",
+                     precision="float64", verbose=False)
+    rng = np.random.default_rng(0)
+    frames = []
+    for fr in read_xyz(TRAIN)[:8]:
+        fr = dict(fr)
+        fr["positions"] = fr["positions"] + rng.normal(0, 0.03, fr["positions"].shape)
+        frames.append(fr)
+    _write_xyz(tmp_path / "pool.xyz", [frames[4], frames[4]])
+    kw = dict(device="cpu", precision="float64", verbose=False)
+    g = compute_gamma(model, str(tmp_path / "as.pt"), str(tmp_path / "pool.xyz"), **kw)
+    assert g["gamma"][0] <= 1.01 < g["gamma_res"][0], (g["gamma"], g["gamma_res"])
+    res = select_structures(model, str(tmp_path / "as.pt"), str(tmp_path / "pool.xyz"), **kw)
+    assert list(res["index"]) == [0]
+    assert np.isclose(res["grade_at_choice"][0], g["gamma_res"][0])

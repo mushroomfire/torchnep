@@ -46,16 +46,16 @@ from torchnep import train_nep, train_nep_sharded, predict_dataset, predict_data
 
 ::: torchnep.extrapolation.build_active_set
 
-::: torchnep.extrapolation.build_active_set_sharded
+::: torchnep.extrapolation.select_structures
 
 ::: torchnep.extrapolation.compute_gamma
 
-::: torchnep.extrapolation.compute_gamma_sharded
-
-::: torchnep.extrapolation.select_structures
+::: torchnep.extrapolation.build_active_set_sharded
 
 ::: torchnep.extrapolation.select_structures_sharded
 
+::: torchnep.extrapolation.compute_gamma_sharded
+
 ::: torchnep.extrapolation.ActiveSet
     options:
-      members: [load, save, gamma]
+      members: [load, save, save_gpumd, gamma]
