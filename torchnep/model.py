@@ -505,7 +505,6 @@ class NEPModel(nn.Module):
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
-        N = batch["N"]
 
         core = core_fn if core_fn is not None else self._cached_core
         Ei, forces, virial = core(batch, need_forces=need_forces,

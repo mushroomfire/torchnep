@@ -48,6 +48,18 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
 from .model import slim_model
+from .train import (
+    _BANNER, _AUTHOR,
+    _backend_info, StreamDataStore, iter_collated,
+    format_config_summary,
+    preprocess_structures, compute_max_neighbors,
+    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
+    _save_checkpoint, _load_checkpoint,
+    _trim_loss_log, _accumulate_true_loss_sums,
+    _make_optimizer, _make_lr_scheduler, _scheduler_step,
+    _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
+    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
+)
 
 
 _PG_ATEXIT_DONE = False
@@ -141,19 +153,6 @@ class _NEPDDPShim(nn.Module):
         return self._compute_cached(
             batch, need_forces=need_forces, need_virial=need_virial,
             backend=backend)
-
-from .train import (
-    _BANNER, _AUTHOR,
-    _backend_info, StreamDataStore, iter_collated,
-    format_config_summary,
-    preprocess_structures, compute_max_neighbors,
-    choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
-    _save_checkpoint, _load_checkpoint,
-    _trim_loss_log, _accumulate_true_loss_sums,
-    _make_optimizer, _make_lr_scheduler, _scheduler_step,
-    _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
-    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
-)
 
 
 # ---------------------------------------------------------------------------

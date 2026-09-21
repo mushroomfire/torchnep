@@ -175,7 +175,6 @@ def test_sharded_run_reproducible(tmp_path):
     Run locally with:  TORCHNEP_TEST_DDP=1 pytest tests/test_stream_mode.py
     """
     import os
-    import shutil
     import subprocess
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")

@@ -106,10 +106,6 @@ def test_modes_match_cached(tmp_path, device, mode):
         # per-pair basis is elementwise: compare it on the matched pair order
         for suf, keys in (("rad", ("fk_rad", "d12inv_rad")),
                           ("ang", ("fk_ang", "d12inv_ang", "blm"))):
-            bi, bj, br = _sorted_pairs(b, suf); ri, rj, rr = _sorted_pairs(r, suf)
-            kb = np.lexsort((np.round(br[:, 2], 4), np.round(br[:, 1], 4),
-                             np.round(br[:, 0], 4), bj, bi))
-            i_b = b["pair_i_" + suf].cpu().numpy(); i_r = r["pair_i_" + suf].cpu().numpy()
             ob = _order(b, suf); orr = _order(r, suf)
             for key in keys:
                 assert torch.allclose(b[key][ob], r[key][orr], atol=1e-5,

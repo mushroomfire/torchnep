@@ -401,7 +401,8 @@ def test_predict_dataset_sharded_matches_single(tmp_path):
     """2-rank predict_dataset_sharded (CPU/gloo via torchrun) writes the same
     *_train.out files as predict_dataset. Opt-in like the DDP training test:
     TORCHNEP_TEST_DDP=1 pytest tests/test_gpumd_parity.py -k sharded"""
-    import os, shutil, subprocess
+    import os
+    import subprocess
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         pytest.skip("multi-process test is local-only (set TORCHNEP_TEST_DDP=1)")
     from _common import torchrun_cmd

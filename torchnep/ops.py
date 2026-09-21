@@ -1438,7 +1438,8 @@ def accumulate_forces_virial(
     virial = torch.zeros(N, 9, dtype=dtype, device=device)
 
     def _acc(pi, pj, r, g):
-        e = lambda idx: idx.unsqueeze(-1).expand_as(g)
+        def e(idx):
+            return idx.unsqueeze(-1).expand_as(g)
         forces.scatter_add_(0, e(pi), g)
         forces.scatter_add_(0, e(pj), -g)
         v9 = -(r.unsqueeze(-1) * g.unsqueeze(-2)).reshape(-1, 9)
