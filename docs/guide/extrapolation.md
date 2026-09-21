@@ -95,12 +95,7 @@ compute_extrapolation asi_file active_set.asi gamma_low 2 gamma_high 50 check_in
 
 Every `check_interval` steps GPUMD grades all atoms, writes the frames with γ ≥ `gamma_low` to `extrapolation_dump.xyz`, and stops the run when γ exceeds `gamma_high`.
 
-What differs from TorchNEP's own grading:
-
-- GPUMD computes γ only, not γ_res (the part of the grade outside the subspace), and writes every frame above `gamma_low`, near-duplicates included. To choose from its dump, run `select_structures` on `extrapolation_dump.xyz`.
-- Elements without atoms in the training set (e.g. the other elements of a model fine-tuned from a many-element one) have no active set and are left out of the `.asi` file, with a warning; keep them out of the GPUMD run.
-- GPUMD keeps a K × K matrix per element on the GPU and applies it to every atom at each check, so the checks cost more for large models and many atoms; the file is large as well (230 MB for the Cr-Co-Ni model above, K = 5200).
-- Active sets made by other tools for GPUMD (`.asi` files) cannot be read by TorchNEP.
+The difference from TorchNEP's own choice: GPUMD grades by γ only, while `select_structures` ranks by the larger of γ and γ_res (see [What the grade measures](#what-the-grade-measures)).
 
 ## What the grade measures
 
