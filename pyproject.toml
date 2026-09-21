@@ -33,7 +33,7 @@ torch = ["torch>=2.0", "numpy>=1.20"]
 ase = ["ase>=3.22"]
 plot = ["matplotlib>=3.5", "polars>=0.20"]
 all = ["ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
-dev = ["pytest", "pytest-xdist", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
+dev = ["pytest", "pytest-xdist", "ruff", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.26", "ruff"]
 
 [tool.pytest.ini_options]
@@ -55,8 +55,11 @@ filterwarnings = [
 ]
 
 [tool.ruff.lint]
-# Short related statements share a line (``a = ...; b = ...``), and ``l`` is
-# the angular-momentum index of the NEP formulas.
+# The rule set is fixed here, so every ruff version checks the same rules
+# (newer releases enable more by default). Short related statements share a
+# line (``a = ...; b = ...``), and ``l`` is the angular-momentum index of the
+# NEP formulas.
+select = ["E4", "E7", "E9", "F"]
 ignore = ["E702", "E741"]
 
 [tool.ruff.lint.per-file-ignores]

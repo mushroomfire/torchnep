@@ -70,9 +70,9 @@ Start from any `nep.txt` or checkpoint, optionally slimmed to the elements of th
 </div>
 
 <div markdown>
-**ZBL**
+**Active learning**
 
-Universal or per-element-pair (GPUMD `zbl.in`) short-range repulsion.
+Choose the MD frames worth computing with DFT, with one model: the MaxVol extrapolation grade.
 </div>
 
 <div markdown>

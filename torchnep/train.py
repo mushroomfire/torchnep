@@ -223,6 +223,84 @@ def format_config_summary(config: dict) -> List[str]:
 # Data store — host-resident, batches streamed to the device
 # ---------------------------------------------------------------------------
 
+def search_neighbors_batched(pos, cell_b, nat, off, rc, dtype):
+    """Batched brute-force neighbor search on the device (the numpy
+    builder's algorithm, vectorised over frames).
+
+    ``pos`` (Ntot, 3) wrapped positions of the batch, ``cell_b`` (B, 3, 3),
+    ``nat`` / ``off`` per-frame atom counts / offsets (host ints).
+    Frames are grouped by size (padding waste bounded by a memory
+    budget); the pair order returned is frame-major, then (i, j, image)
+    — identical to the cached path's order. Returns
+    ``(pair_i, pair_j, rij, d)`` for all pairs within ``rc``;
+    ``rij`` in ``dtype``.
+    """
+    dev = pos.device
+    B = len(nat)
+    inv = torch.linalg.inv(cell_b)                                # (B, 3, 3)
+    # image repeats per frame and direction (as image_repeats(): the
+    # perpendicular plane distance is 1/|inv[:, i]|)
+    nrep = torch.ceil(rc * torch.linalg.norm(inv, dim=1)).to(torch.long)   # (B, 3)
+    nrep_h = nrep.cpu().numpy()
+    nat_a = np.asarray(nat); off_a = np.asarray(off)
+    order = np.argsort(nat_a, kind="stable")
+    budget = 16_000_000 if dev.type != "cpu" else 2_000_000
+    pis, pjs, rijs, fids = [], [], [], []
+    k = 0
+    while k < B:
+        # group of consecutive (size-sorted) frames within the budget
+        g = [order[k]]; k += 1
+        while k < B:
+            cand = g + [order[k]]
+            nmax = int(nat_a[cand].max())
+            srep = (2 * nrep_h[cand].max(axis=0) + 1).prod()
+            if len(cand) * nmax * nmax * srep > budget:
+                break
+            g = cand; k += 1
+        g = np.asarray(g)
+        nmax = int(nat_a[g].max())
+        rmax = nrep_h[g].max(axis=0)
+        ranges = [torch.arange(-int(r), int(r) + 1, device=dev) for r in rmax]
+        shifts_int = torch.stack(torch.meshgrid(*ranges, indexing="ij"),
+                                 dim=-1).reshape(-1, 3)             # (S, 3)
+        zero_shift = (shifts_int == 0).all(dim=1)
+        g_t = torch.as_tensor(g, device=dev)
+        cells = cell_b[g_t]                                          # (G, 3, 3)
+        sc = torch.matmul(shifts_int.to(dtype), cells)               # (G, S, 3)
+        # padded positions (G, nmax, 3)
+        ar = torch.arange(nmax, device=dev)
+        nat_g = torch.as_tensor(nat_a[g], device=dev)
+        off_g = torch.as_tensor(off_a[g], device=dev)
+        amask = ar.unsqueeze(0) < nat_g.unsqueeze(1)                 # (G, nmax)
+        gidx = (off_g.unsqueeze(1) + ar.unsqueeze(0)).clamp_(max=pos.shape[0] - 1)
+        gidx = torch.where(amask, gidx, torch.zeros_like(gidx))
+        pp = pos[gidx]                                               # (G, nmax, 3)
+        disp = (pp[:, None, :, None, :] + sc[:, None, None, :, :]
+                - pp[:, :, None, None, :])                           # (G, N, N, S, 3)
+        dist = torch.linalg.norm(disp, dim=-1)
+        valid = (dist < rc) & (dist > 1e-10)
+        valid &= amask[:, :, None, None] & amask[:, None, :, None]
+        self_pair = torch.eye(nmax, dtype=torch.bool, device=dev)[None, :, :, None] \
+            & zero_shift[None, None, None, :]
+        valid &= ~self_pair
+        nz = valid.nonzero()                                         # (P, 4): g, i, j, s
+        if nz.shape[0] == 0:
+            continue
+        gg, ii, jj, ss = nz.unbind(1)
+        pis.append(off_g[gg] + ii); pjs.append(off_g[gg] + jj)
+        rijs.append(disp[gg, ii, jj, ss]); fids.append(g_t[gg])
+    if not pis:
+        z = torch.zeros(0, dtype=torch.long, device=dev)
+        return z, z.clone(), torch.zeros(0, 3, dtype=dtype, device=dev), \
+            torch.zeros(0, dtype=dtype, device=dev)
+    pi = torch.cat(pis); pj = torch.cat(pjs); rij = torch.cat(rijs)
+    fid = torch.cat(fids)
+    # restore batch frame order (pairs were produced size-sorted)
+    _, perm = torch.sort(fid, stable=True)
+    pi, pj, rij = pi[perm], pj[perm], rij[perm]
+    return pi, pj, rij, torch.linalg.norm(rij, dim=-1)
+
+
 class StreamDataStore:
     """The training data store: host-resident, GPU memory scales with batch
     size only.
@@ -487,81 +565,10 @@ class StreamDataStore:
         return (pi[m_r], pj[m_r], rij[m_r]), (pi[m_a], pj[m_a], rij[m_a])
 
     def _search_device(self, pos, cell_b, nat, off):
-        """Batched brute-force neighbor search on the device (the numpy
-        builder's algorithm, vectorised over frames).
-
-        ``pos`` (Ntot, 3) wrapped positions of the batch, ``cell_b`` (B, 3, 3),
-        ``nat`` / ``off`` per-frame atom counts / offsets (host ints).
-        Frames are grouped by size (padding waste bounded by a memory
-        budget); the pair order returned is frame-major, then (i, j, image)
-        — identical to the cached path's order. Returns
-        ``(pair_i, pair_j, rij, d)`` for all pairs within ``max(rc)``.
-        """
-        dev = pos.device
-        rc = max(self._rc_r, self._rc_a)
-        B = len(nat)
-        inv = torch.linalg.inv(cell_b)                                # (B, 3, 3)
-        # image repeats per frame and direction (as image_repeats(): the
-        # perpendicular plane distance is 1/|inv[:, i]|)
-        nrep = torch.ceil(rc * torch.linalg.norm(inv, dim=1)).to(torch.long)   # (B, 3)
-        nrep_h = nrep.cpu().numpy()
-        nat_a = np.asarray(nat); off_a = np.asarray(off)
-        order = np.argsort(nat_a, kind="stable")
-        budget = 16_000_000 if dev.type != "cpu" else 2_000_000
-        pis, pjs, rijs, fids = [], [], [], []
-        k = 0
-        while k < B:
-            # group of consecutive (size-sorted) frames within the budget
-            g = [order[k]]; k += 1
-            while k < B:
-                cand = g + [order[k]]
-                nmax = int(nat_a[cand].max())
-                srep = (2 * nrep_h[cand].max(axis=0) + 1).prod()
-                if len(cand) * nmax * nmax * srep > budget:
-                    break
-                g = cand; k += 1
-            g = np.asarray(g)
-            nmax = int(nat_a[g].max())
-            rmax = nrep_h[g].max(axis=0)
-            ranges = [torch.arange(-int(r), int(r) + 1, device=dev) for r in rmax]
-            shifts_int = torch.stack(torch.meshgrid(*ranges, indexing="ij"),
-                                     dim=-1).reshape(-1, 3)             # (S, 3)
-            zero_shift = (shifts_int == 0).all(dim=1)
-            g_t = torch.as_tensor(g, device=dev)
-            cells = cell_b[g_t]                                          # (G, 3, 3)
-            sc = torch.matmul(shifts_int.to(self.dtype), cells)          # (G, S, 3)
-            # padded positions (G, nmax, 3)
-            ar = torch.arange(nmax, device=dev)
-            nat_g = torch.as_tensor(nat_a[g], device=dev)
-            off_g = torch.as_tensor(off_a[g], device=dev)
-            amask = ar.unsqueeze(0) < nat_g.unsqueeze(1)                 # (G, nmax)
-            gidx = (off_g.unsqueeze(1) + ar.unsqueeze(0)).clamp_(max=pos.shape[0] - 1)
-            gidx = torch.where(amask, gidx, torch.zeros_like(gidx))
-            pp = pos[gidx]                                               # (G, nmax, 3)
-            disp = (pp[:, None, :, None, :] + sc[:, None, None, :, :]
-                    - pp[:, :, None, None, :])                           # (G, N, N, S, 3)
-            dist = torch.linalg.norm(disp, dim=-1)
-            valid = (dist < rc) & (dist > 1e-10)
-            valid &= amask[:, :, None, None] & amask[:, None, :, None]
-            self_pair = torch.eye(nmax, dtype=torch.bool, device=dev)[None, :, :, None] \
-                & zero_shift[None, None, None, :]
-            valid &= ~self_pair
-            nz = valid.nonzero()                                         # (P, 4): g, i, j, s
-            if nz.shape[0] == 0:
-                continue
-            gg, ii, jj, ss = nz.unbind(1)
-            pis.append(off_g[gg] + ii); pjs.append(off_g[gg] + jj)
-            rijs.append(disp[gg, ii, jj, ss]); fids.append(g_t[gg])
-        if not pis:
-            z = torch.zeros(0, dtype=torch.long, device=dev)
-            return z, z.clone(), torch.zeros(0, 3, dtype=self.dtype, device=dev), \
-                torch.zeros(0, dtype=self.dtype, device=dev)
-        pi = torch.cat(pis); pj = torch.cat(pjs); rij = torch.cat(rijs)
-        fid = torch.cat(fids)
-        # restore batch frame order (pairs were produced size-sorted)
-        _, perm = torch.sort(fid, stable=True)
-        pi, pj, rij = pi[perm], pj[perm], rij[perm]
-        return pi, pj, rij, torch.linalg.norm(rij, dim=-1)
+        """Batched device neighbor search within ``max(rc)``, see
+        :func:`search_neighbors_batched`."""
+        return search_neighbors_batched(pos, cell_b, nat, off,
+                                        max(self._rc_r, self._rc_a), self.dtype)
 
     def scan_max_neighbors(self, batch_size: int = 256):
         """``on_the_fly`` only: run the device search over the whole shard

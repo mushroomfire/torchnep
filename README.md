@@ -33,6 +33,7 @@ TorchNEP is a from-scratch implementation of [NEP4](https://gpumd.org/theory/nep
 - **Fast on NVIDIA and AMD** — `torch.compile` with automatic backend selection, tuned on CUDA and ROCm
 - **Memory-friendly** — the dataset stays in host memory; GPU memory scales with the batch, not the dataset
 - **Fine-tuning, ZBL, plots** — start from any `nep.txt`, add short-range repulsion, plot every run
+- **Active learning** — choose the MD frames worth computing with DFT, with one model (MaxVol extrapolation grade)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/mushroomfire/torchnep/master/docs/assets/speed_scaling.png" alt="Training speed and scaling" width="90%">
@@ -56,7 +57,7 @@ from torchnep import train_nep
 train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
 ```
 
-The best model is written to `output/nep_best.txt`. The [documentation](https://mushroomfire.github.io/torchnep/) covers `nep.in`, the training data format, multi-GPU training, restart and fine-tuning, prediction, the ASE calculator and plotting.
+The best model is written to `output/nep_best.txt`. The [documentation](https://mushroomfire.github.io/torchnep/) covers `nep.in`, the training data format, multi-GPU training, restart and fine-tuning, prediction, the ASE calculator, plotting and active learning.
 
 ## Building the documentation
 

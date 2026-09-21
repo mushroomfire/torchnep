@@ -106,6 +106,7 @@ nav:
       - Prediction: guide/prediction.md
       - ASE calculator: guide/ase.md
       - Plotting: guide/plotting.md
+      - Extrapolation grade: guide/extrapolation.md
   - Reference:
       - Output files: reference/output-files.md
       - Python API: reference/api.md
