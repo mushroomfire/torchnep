@@ -42,7 +42,7 @@ from torchnep import train_nep, train_nep_sharded, predict_dataset, predict_data
 
 ::: torchnep.plot.element_errors
 
-## Extrapolation grade (experimental)
+## Extrapolation grade
 
 ::: torchnep.extrapolation.build_active_set
 

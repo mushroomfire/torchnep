@@ -1,11 +1,4 @@
-# Extrapolation grade (experimental)
-
-!!! warning "Experimental — only on the `feat/extrapolation-gamma` branch"
-    This feature is not part of a release yet. Install the branch to try it:
-
-    ```bash
-    pip install "git+https://github.com/mushroomfire/torchnep.git@feat/extrapolation-gamma"
-    ```
+# Extrapolation grade
 
 With **one** trained model, the extrapolation grade tells how far an atomic environment lies outside the model's training set — no committee of models is needed. Its use is active learning: out of many structures — MD frames from GPUMD, LAMMPS or anything that writes extended XYZ — choose the few worth computing with DFT and adding to the training set. The grade can also be computed by GPUMD during MD.
 
@@ -90,7 +83,7 @@ ActiveSet.load("active_set.pt", "nep.txt").save_gpumd("active_set.asi")
 and add to GPUMD's `run.in`, for example
 
 ```text
-compute_extrapolation asi_file active_set.asi gamma_low 2 gamma_high 50 check_interval 100 dump_interval 100
+compute_extrapolation nep_file nep.txt asi_file active_set.asi gamma_low 2 gamma_high 50 check_interval 100 dump_interval 100
 ```
 
 Every `check_interval` steps GPUMD grades all atoms, writes the frames with γ ≥ `gamma_low` to `extrapolation_dump.xyz`, and stops the run when γ exceeds `gamma_high`.
@@ -203,7 +196,7 @@ The upper figures of `compute_gamma` include the start-up of a fresh run. On one
 
 ## Limitations
 
-- **Experimental.** On one test (a Cr-Co-Ni model and a pool of structures from another dataset), choosing frames by γ reduced the error on held-out structures as much as choosing them by a committee of four models, and much more than choosing them at random. It has not been used in production active learning yet.
+- **Tested on one system so far:** on a Cr-Co-Ni model and a pool of structures from another dataset, choosing frames by γ reduced the error on held-out structures as much as choosing them by a committee of four models, and much more than choosing them at random. It has not been used in production active learning yet.
 - **Memory while building:** the Gram matrices take K² × 8 bytes per element on the GPU (70 MB for K = 2960). With the sharded build, each element's matrix is summed on one rank.
 - **γ_res** in float64 is computed as `|b|² − |b V|²`, which costs digits: it is accurate to about 1e-8 relative, plenty for a grade.
 - The active set depends on the model; rebuild it after retraining.

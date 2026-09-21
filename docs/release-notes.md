@@ -1,5 +1,15 @@
 # Release Notes
 
+## 1.0.6a2
+
+- **Extrapolation grade** (`torchnep.extrapolation`): choose new training
+  structures with one model instead of a committee. `build_active_set` builds
+  the MaxVol active set of the training set, `select_structures` picks the
+  frames worth computing with DFT (skipping near-duplicates), `compute_gamma`
+  grades any structures; multi-GPU variants, and export to GPUMD's
+  `compute_extrapolation`. See the
+  [guide](https://mushroomfire.github.io/torchnep/guide/extrapolation/).
+
 ## 1.0.6a1
 
 - **Documentation site**: the full documentation now lives at
