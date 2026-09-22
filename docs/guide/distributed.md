@@ -47,6 +47,14 @@ srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
 
 Any launcher that sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR` and `MASTER_PORT` works as well.
 
+## Collective timeout
+
+A rank that stops answering a collective — a network hiccup, a sick node — leaves the others waiting until the
+watchdog aborts the job, so the timeout decides how long a hung run keeps the whole allocation. It is 30 minutes,
+which also covers the longest legitimate wait: rank 0 alone writes the end-of-training prediction files while the
+other ranks already sit in the next collective (about 10 minutes for 13 million frames). `TORCHNEP_DIST_TIMEOUT_MIN`
+sets another value, in minutes; it applies to sharded training, prediction and extrapolation alike.
+
 ## Restarting
 
 A sharded run resumes from `checkpoint.pt` like a single-GPU run. Resubmitting the same job continues where it stopped, which also splits long trainings into several jobs that each fit a queue's time limit.
