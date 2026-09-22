@@ -1752,6 +1752,13 @@ def _maybe_enable_tf32(dev, dtype, log):
             log("  TF32 matmul: enabled (TORCHNEP_TF32=1)")
 
 
+def _metric_dtype(dev):
+    """dtype of the per-epoch metric accumulators kept on the device: float64,
+    except on MPS, which has no float64. float32 still counts exactly up to
+    2**24 force components per epoch, far beyond what trains on a laptop."""
+    return torch.float32 if dev.type == "mps" else torch.float64
+
+
 def _compile_check(dev):
     """Decide whether torch.compile can be used; never raises.
 
@@ -2480,7 +2487,7 @@ def train_nep(
             # pipeline (the CPU must run a full step ahead of the GPU for
             # the streamed collate + kernel launches to hide).
             # Layout: [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
-            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            acc = torch.zeros(8, dtype=_metric_dtype(dev), device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -2669,19 +2676,19 @@ def train_nep(
                 # Device-side metric accumulation — one fused add per step,
                 # fetched once per epoch. Bad steps contribute zero via ok_f
                 # (consistently for sums AND counts).
-                zero64 = acc.new_zeros(())
+                zero_acc = acc.new_zeros(())
                 acc += ok_f * torch.stack([
-                    m_le.double() if m_le is not None else zero64,
-                    m_lf.double() if m_lf is not None else zero64,
-                    m_lv.double() if m_lv is not None else zero64,
-                    m_ls.double() if m_ls is not None else zero64,
-                    (batch["energy_mask"].sum().double()
-                     if m_le is not None else zero64),
-                    (batch["force_mask"].sum().double()
-                     if m_lf is not None else zero64),
-                    (batch["virial_mask"].sum().double()
-                     if m_lv is not None else zero64),
-                    m_resid.double() if m_resid is not None else zero64,
+                    m_le.to(acc.dtype) if m_le is not None else zero_acc,
+                    m_lf.to(acc.dtype) if m_lf is not None else zero_acc,
+                    m_lv.to(acc.dtype) if m_lv is not None else zero_acc,
+                    m_ls.to(acc.dtype) if m_ls is not None else zero_acc,
+                    (batch["energy_mask"].sum().to(acc.dtype)
+                     if m_le is not None else zero_acc),
+                    (batch["force_mask"].sum().to(acc.dtype)
+                     if m_lf is not None else zero_acc),
+                    (batch["virial_mask"].sum().to(acc.dtype)
+                     if m_lv is not None else zero_acc),
+                    m_resid.to(acc.dtype) if m_resid is not None else zero_acc,
                 ])
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))

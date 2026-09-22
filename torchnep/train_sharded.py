@@ -49,7 +49,7 @@ from . import __version__
 from .predict import predict_from_store_sharded, _dist_timeout
 from .model import slim_model
 from .train import (
-    _BANNER, _AUTHOR,
+    _BANNER, _AUTHOR, _metric_dtype,
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
@@ -1172,7 +1172,7 @@ def train_nep_sharded(
             # Device-side accumulators, fetched (and all-reduced) once per
             # epoch — see train_nep. Layout:
             # [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
-            acc = torch.zeros(8, dtype=torch.float64, device=dev)
+            acc = torch.zeros(8, dtype=_metric_dtype(dev), device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -1384,19 +1384,19 @@ def train_nep_sharded(
                         and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
-                zero64 = acc.new_zeros(())
+                zero_acc = acc.new_zeros(())
                 acc += ok_f * torch.stack([
-                    m_le.double() if m_le is not None else zero64,
-                    m_lf.double() if m_lf is not None else zero64,
-                    m_lv.double() if m_lv is not None else zero64,
-                    m_ls.double() if m_ls is not None else zero64,
-                    (batch["energy_mask"].sum().double()
-                     if m_le is not None else zero64),
-                    (batch["force_mask"].sum().double()
-                     if m_lf is not None else zero64),
-                    (batch["virial_mask"].sum().double()
-                     if m_lv is not None else zero64),
-                    m_resid.double() if m_resid is not None else zero64,
+                    m_le.to(acc.dtype) if m_le is not None else zero_acc,
+                    m_lf.to(acc.dtype) if m_lf is not None else zero_acc,
+                    m_lv.to(acc.dtype) if m_lv is not None else zero_acc,
+                    m_ls.to(acc.dtype) if m_ls is not None else zero_acc,
+                    (batch["energy_mask"].sum().to(acc.dtype)
+                     if m_le is not None else zero_acc),
+                    (batch["force_mask"].sum().to(acc.dtype)
+                     if m_lf is not None else zero_acc),
+                    (batch["virial_mask"].sum().to(acc.dtype)
+                     if m_lv is not None else zero_acc),
+                    m_resid.to(acc.dtype) if m_resid is not None else zero_acc,
                 ])
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
