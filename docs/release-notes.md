@@ -1,32 +1,12 @@
 # Release Notes
 
-## 1.0.6a2
+## 1.0.6
 
-- **Extrapolation grade** (`torchnep.extrapolation`): choose new training
-  structures with one model instead of a committee. `build_active_set` builds
-  the MaxVol active set of the training set, `select_structures` picks the
-  frames worth computing with DFT (skipping near-duplicates), `compute_gamma`
-  grades any structures; multi-GPU variants, and export to GPUMD's
-  `compute_extrapolation`. See the
-  [guide](https://mushroomfire.github.io/torchnep/guide/extrapolation/).
-- **Lint-clean code**: `ruff check .` reports no warnings (rules in
-  `pyproject.toml`), and pull requests must keep it so (`CONTRIBUTING.md`);
-  unused imports and variables removed. The README explains how to build the
-  documentation locally.
-
-## 1.0.6a1
-
-- **Documentation site**: the full documentation now lives at
-  <https://mushroomfire.github.io/torchnep/> (sources in `docs/`, built with
-  MkDocs Material); the README is a short overview and these release notes
-  moved to `docs/release-notes.md`.
-- **Error figure redesigned** (`NEPPlotter.errors`): one histogram of
-  NEP − DFT per quantity with training and validation overlaid and annotated
-  with RMSE / MAE / max, plus the force error against the force magnitude, in
-  the style of the parity panels. New `quantities`, `force_magnitude` and
-  `bins` arguments; the per-element and per-`config_type` bars are gone
-  (`periodic_table` draws the per-element errors) and with them the `split`
-  argument.
+- **Extrapolation grade** (`torchnep.extrapolation`): pick new training structures with one model instead of a committee, with multi-GPU variants and export to GPUMD's `compute_extrapolation`. See the [guide](https://mushroomfire.github.io/torchnep/guide/extrapolation/).
+- **Documentation site** at <https://mushroomfire.github.io/torchnep/>.
+- **Error figure redesigned** (`NEPPlotter.errors`): NEP − DFT histograms with training and validation overlaid; the `split` argument is removed.
+- **Multi-GPU timeout**: 30 min by default for training, prediction and extrapolation (`TORCHNEP_DIST_TIMEOUT_MIN`).
+- **Lint-clean code**: `ruff check .` reports no warnings.
 
 ## 1.0.5
 
