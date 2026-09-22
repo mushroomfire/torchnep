@@ -529,3 +529,26 @@ def test_final_predict_prints_metrics(tmp_path):
         assert set(table) == {"E", "F", "V"}, (title, table)
         for k in table:
             assert abs(table[k] - ref[k]) <= 1e-6 + 1e-5 * ref[k], (title, k, table[k], ref[k])
+
+
+def test_metric_accumulators_follow_the_device():
+    """The per-epoch metric sums live on the device: float64 wherever it exists,
+    float32 on MPS, which has no float64 (training there used to crash on it)."""
+    from torchnep.train import _metric_dtype
+    assert _metric_dtype(torch.device("cpu")) == torch.float64
+    assert _metric_dtype(torch.device("mps")) == torch.float32
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple MPS")
+def test_trains_on_mps(tmp_path):
+    """A short float32 run on MPS end to end: epochs, final prediction and its
+    metrics table (the table must agree with the prediction files it summarises)."""
+    nepin, xyz = _write_run_files(tmp_path, n_frames=20, epochs=2)
+    out = tmp_path / "mps"
+    _train(nepin, xyz, out, device="mps", precision="float32")
+    log = (out / "output.log").read_text()
+    assert "Backend  : MPS" in log
+    assert _loss_out_epochs(out) == 2
+    table, ref = _table_rmse(log, "Training set"), _file_rmse(out, "train")
+    for k in table:
+        assert np.isfinite(table[k]) and abs(table[k] - ref[k]) <= 1e-4 + 1e-3 * ref[k], (k, table[k], ref[k])
