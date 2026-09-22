@@ -46,7 +46,7 @@ from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices)
 from . import ops
 from . import __version__
-from .predict import predict_from_store_sharded
+from .predict import predict_from_store_sharded, _dist_timeout
 from .model import slim_model
 from .train import (
     _BANNER, _AUTHOR,
@@ -323,12 +323,9 @@ def train_nep_sharded(
         # heterogeneous rank->GPU mappings). gloo ignores device_id.
         # Collective timeout: rank 0 alone writes the end-of-training
         # prediction files (minutes for a multi-million-frame set) while the
-        # other ranks already wait in the next collective; the default
-        # 10 min would abort them. Override with TORCHNEP_DIST_TIMEOUT_MIN.
-        from datetime import timedelta
-        _to = timedelta(minutes=float(os.environ.get(
-            "TORCHNEP_DIST_TIMEOUT_MIN", 180)))
-        dist.init_process_group(backend=ddp_backend, timeout=_to,
+        # other ranks already wait in the next collective; torch's default
+        # 10 min would abort them. See _dist_timeout().
+        dist.init_process_group(backend=ddp_backend, timeout=_dist_timeout(),
                                 device_id=dev if cuda_available else None)
         # Tear the group down once, at process exit — NOT at the end of this
         # function. That lets a single script call train_nep_sharded() more than

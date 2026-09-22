@@ -34,6 +34,18 @@ from .nep import NEPCalculator
 from . import ops
 
 
+def _dist_timeout():
+    """Collective timeout shared by every sharded path (training, prediction,
+    extrapolation). It has to cover the longest legitimate wait — rank 0 alone
+    writing the end-of-training prediction files, or the MaxVol merges of the
+    active-set owners — while the other ranks already sit in the next
+    collective. It also decides how long a hung collective burns the whole
+    allocation before the watchdog aborts, so the default is 30 minutes rather
+    than hours. Override with TORCHNEP_DIST_TIMEOUT_MIN."""
+    from datetime import timedelta
+    return timedelta(minutes=float(os.environ.get("TORCHNEP_DIST_TIMEOUT_MIN", 30)))
+
+
 # GPUMD writes this sentinel into the reference column of virial_train.out /
 # stress_train.out for structures that carry no reference virial (see GPUMD
 # src/main_nep/structure.cu: ``structure.virial[m] = -1e6``). For stress it
@@ -623,7 +635,7 @@ def predict_dataset_sharded(
         local_world_env = int(os.environ.get("LOCAL_WORLD_SIZE",
                               os.environ.get("SLURM_NTASKS_PER_NODE", world_size)))
         pg_backend = "nccl" if cuda_available and local_world_env <= n_gpus else "gloo"
-        dist.init_process_group(backend=pg_backend,
+        dist.init_process_group(backend=pg_backend, timeout=_dist_timeout(),
                                 device_id=torch.device(device) if cuda_available else None)
         _register_pg_atexit()
     rank, world_size = dist.get_rank(), dist.get_world_size()

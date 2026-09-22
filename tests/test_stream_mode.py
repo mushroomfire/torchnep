@@ -253,3 +253,17 @@ def test_sharded_final_predict_prints_metrics(tmp_path):
         assert set(table) == {"E", "F", "V"}, (title, table)
         for k2 in table:
             assert abs(table[k2] - ref[k2]) <= 1e-6 + 1e-5 * ref[k2], (title, k2, table[k2], ref[k2])
+
+
+def test_dist_timeout_default_and_override(monkeypatch):
+    """One collective timeout for every sharded path: 30 min by default (long
+    enough for rank 0's end-of-training prediction, short enough that a hung
+    collective does not burn the allocation for hours), overridable."""
+    from torchnep.predict import _dist_timeout
+    from torchnep.train_sharded import _dist_timeout as from_train
+    from torchnep.extrapolation import _dist_timeout as from_extra
+    assert from_train is _dist_timeout and from_extra is _dist_timeout
+    monkeypatch.delenv("TORCHNEP_DIST_TIMEOUT_MIN", raising=False)
+    assert _dist_timeout().total_seconds() == 1800
+    monkeypatch.setenv("TORCHNEP_DIST_TIMEOUT_MIN", "20")
+    assert _dist_timeout().total_seconds() == 1200

@@ -70,7 +70,7 @@ import torch
 
 from . import ops
 from .nep import NEPCalculator
-from .predict import _Progress, _chunk_bounds, _pick_device
+from .predict import _Progress, _chunk_bounds, _dist_timeout, _pick_device
 
 _FORMAT = "torchnep-active-set"
 _VERSION = 1
@@ -281,9 +281,7 @@ def _comm_setup(device):
         backend = "nccl" if cuda and local_world <= n_gpus else "gloo"
         # the owners' MaxVol merges keep the other ranks waiting in a
         # collective; same timeout as the sharded trainer
-        from datetime import timedelta
-        timeout = timedelta(minutes=float(os.environ.get("TORCHNEP_DIST_TIMEOUT_MIN", 180)))
-        dist.init_process_group(backend=backend, timeout=timeout,
+        dist.init_process_group(backend=backend, timeout=_dist_timeout(),
                                 device_id=device if cuda else None)
         _register_pg_atexit()
     comm_dev = device if dist.get_backend() == "nccl" else torch.device("cpu")
