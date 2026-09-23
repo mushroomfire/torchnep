@@ -60,6 +60,16 @@ def test_failure_switches_triton_ops_off_and_warns_once(fresh, monkeypatch):
     assert len(lines) == 1 and len(calls) == 1          # once per process
 
 
+def test_older_pytorch_only_mentions_compile(fresh, monkeypatch):
+    """PyTorch < 2.12 has no torch._native: no built-in op goes through Triton,
+    so there is nothing to switch off and nothing about it to say."""
+    monkeypatch.setattr(rt, "triton_runtime_ok", lambda: (False, NO_COMPILER))
+    monkeypatch.setitem(sys.modules, "torch._native.registry", None)     # import -> ImportError
+    lines = []
+    assert rt.ensure_triton_runtime(torch.device("cuda"), log=lines.append) is False
+    assert len(lines) == 1 and "built-in" not in lines[0] and "torch.compile stays off" in lines[0]
+
+
 def test_compile_check_refuses_cuda_when_triton_cannot_run(fresh, monkeypatch):
     import importlib.util
     real = importlib.util.find_spec

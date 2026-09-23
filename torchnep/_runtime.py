@@ -84,14 +84,20 @@ def ensure_triton_runtime(dev, log=None):
     if first:
         try:
             from torch._native.registry import deregister_op_overrides
-            deregister_op_overrides(disable_dsl_names="triton")
-            fallback = ("PyTorch's Triton-backed built-in ops are switched back to the regular CUDA kernels "
-                        "for this run")
-        except Exception:
-            fallback = "if a built-in op still fails, set TORCH_DISABLE_NATIVE_JIT=1 before starting Python"
+        except ImportError:              # PyTorch < 2.12: no built-in op goes through Triton
+            fallback = None
+        else:
+            try:
+                deregister_op_overrides(disable_dsl_names="triton")
+                fallback = ("PyTorch's Triton-backed built-in ops are switched back to the regular CUDA "
+                            "kernels for this run")
+            except Exception:            # private API: if it moved, say how to do it by hand
+                fallback = ("if a built-in op still fails, set TORCH_DISABLE_NATIVE_JIT=1 before starting "
+                            "Python")
+        meanwhile = f"{fallback}, and torch.compile stays off" if fallback else "torch.compile stays off"
         msg = (f"Triton cannot launch CUDA kernels here ({reason}). It builds a small C launcher on first "
                f"use, cached in ~/.triton/cache afterwards: load a compiler (e.g. `module load gcc`) or set "
-               f"CC and CXX. Meanwhile {fallback}, and torch.compile stays off.")
+               f"CC and CXX. Meanwhile {meanwhile}.")
         if log is not None:
             log(f"  WARNING: {msg}")
         else:
