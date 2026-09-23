@@ -1437,9 +1437,7 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     The optimizer state carries the lr of the checkpoint moment — nep.in's
     lr is never re-applied on resume. The scheduler state is restored into
     the scheduler that was active when the checkpoint was written
-    (``in_stage2`` tag; pre-tag checkpoints fall back to the stage-1
-    scheduler, matching the old behaviour). SWA state is restored when both
-    sides have it.
+    (``in_stage2`` tag). SWA state is restored when both sides have it.
 
     Returns a dict with epoch / best_loss / best_true_loss / loss_weights /
     in_stage2.
@@ -1447,15 +1445,9 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
-    model_state = ckpt["model_state"]
-    # Checkpoints written by older DDP runs saved the shim's state_dict,
-    # whose keys carry a uniform "model." prefix — strip it so they load
-    # into a plain NEPModel (new checkpoints always store plain keys).
-    if model_state and all(k.startswith("model.") for k in model_state):
-        model_state = {k[len("model."):]: v for k, v in model_state.items()}
-    m.load_state_dict(model_state)
+    m.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    in_stage2 = ckpt.get("in_stage2", False)
+    in_stage2 = ckpt["in_stage2"]
     target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
               else lr_scheduler)
     if target is not None and "scheduler_state" in ckpt:
@@ -1477,10 +1469,10 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "best_true_loss": ckpt.get("best_true_loss", float("inf")),
         "loss_weights": ckpt.get("loss_weights"),
         "in_stage2": in_stage2,
-        "run_seed": ckpt.get("run_seed"),
+        "run_seed": ckpt["run_seed"],
         "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
         "valid_info": ckpt.get("valid_info"),
-        "start_stage2": ckpt.get("start_stage2"),
+        "start_stage2": ckpt["start_stage2"],
     }
 
 
