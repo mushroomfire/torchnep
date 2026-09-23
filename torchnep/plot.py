@@ -490,15 +490,6 @@ class NEPPlotter:
         self.label_weight = label_weight
         self._rng = np.random.default_rng(0)
 
-    # kept for the simpler figures below
-    @property
-    def c_train(self):
-        return self.colors["train"]
-
-    @property
-    def c_test(self):
-        return self.colors["valid"]
-
     def _label_panels(self, axes, dx=-22, dy=1):
         """Panel labels at the top-left corner outside every axes, offset in
         points so they line up whatever the panel's axis type."""
@@ -517,47 +508,6 @@ class NEPPlotter:
                 fig.savefig(out, bbox_inches="tight")
             plt.close(fig)
         return fig
-
-    def _small(self, n=1):
-        return self.rc["font.size"] - n
-
-    def _parity_panel(self, ax, ref, pred, key, kind="scatter", color=None,
-                      label=None, note=None):
-        """One parity panel over the FULL data range with the diagonal and
-        RMSE / MAE / N annotated. ``ref``/``pred`` are flattened."""
-        ref = np.asarray(ref, float).ravel()
-        pred = np.asarray(pred, float).ravel()
-        title, unit, eunit, scale = _QTY[key]
-        color = color or self.c_train
-        ax.set_title(title + (f" ({label})" if label else "") + (f", {note}" if note else ""))
-        if len(ref) == 0:
-            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
-            return
-        lo = float(min(ref.min(), pred.min()))
-        hi = float(max(ref.max(), pred.max()))
-        pad = 0.03 * (hi - lo) + 1e-9
-        lo, hi = lo - pad, hi + pad
-        if kind == "density":
-            ax.hexbin(ref, pred, gridsize=120, extent=(lo, hi, lo, hi), mincnt=1,
-                      bins="log", cmap=self.cmap, rasterized=True)
-        else:
-            if len(ref) > self.max_points:
-                sel = self._rng.choice(len(ref), self.max_points, replace=False)
-                r, p = ref[sel], pred[sel]
-            else:
-                r, p = ref, pred
-            ax.scatter(r, p, s=4, alpha=0.5, color=color, edgecolors="none",
-                       rasterized=True)
-        ax.plot([lo, hi], [lo, hi], "--", color="0.3", lw=0.8, zorder=0)
-        _equal_ticks(ax, lo, hi)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel(f"DFT {title.lower()} ({unit})")
-        ax.set_ylabel(f"NEP {title.lower()} ({unit})")
-        ax.text(0.04, 0.96,
-                f"RMSE {_rmse(ref, pred) * scale:.1f} {eunit}\n"
-                f"MAE {_mae(ref, pred) * scale:.1f} {eunit}\nN = {len(ref):,}",
-                transform=ax.transAxes, ha="left", va="top", fontsize=self._small(),
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.75))
 
     def _hist_panel(self, ax, sets, key, bins=120):
         """Histograms of ``pred - ref`` of every set in the error unit, log
@@ -1006,9 +956,5 @@ class NEPPlotter:
             if title:
                 fig.suptitle(title)
         return self._finish(fig, out)
-
-def _shift_note(q, mode):
-    return None if (q != "E" or mode is None) else f"shifted ({mode})"
-
 
 shift_energy_fn = shift_energy   # keyword ``shift_energy`` shadows the helper inside methods

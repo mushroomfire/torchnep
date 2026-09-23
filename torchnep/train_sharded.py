@@ -1002,9 +1002,6 @@ def train_nep_sharded(
         optimizer, lr_scheduler_mode, scheduler_factor,
         scheduler_patience, stop_lr)
 
-    def _loss_fn(pred, ref):
-        return torch.mean((pred - ref) ** 2)
-
     swa_model = None
     stage2_scheduler = None
     if stage2:

@@ -339,7 +339,6 @@ class StreamDataStore:
         self.device = device
         self.dtype = dtype
         self.n = len(structures)
-        self.has_cached_basis = True
         self._pin = device.type == "cuda"
         self.neighbor_mode = neighbor_mode
 
@@ -1164,41 +1163,6 @@ def choose_neighbor_mode(frames, config, requested="auto", itemsize=4,
 
 def _fmt_gb(b):
     return f"{b / 2**30:.1f} GiB"
-
-
-def host_rss():
-    """(current, peak) resident set size of this process in bytes (Linux
-    /proc; peak from getrusage elsewhere). Zeros when unavailable."""
-    cur = peak = 0
-    try:
-        for line in open("/proc/self/status"):
-            if line.startswith("VmRSS:"):
-                cur = int(line.split()[1]) * 1024
-            elif line.startswith("VmHWM:"):
-                peak = int(line.split()[1]) * 1024
-    except OSError:
-        try:
-            import resource
-            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            peak = r * (1 if platform.system() == "Darwin" else 1024)
-            cur = peak
-        except Exception:
-            pass
-    return cur, peak
-
-
-def host_mem_line(tag, dist_mod=None, device=None):
-    """Log line with this process's host RSS (now / peak); with a torch
-    distributed process group the min / max over ranks are folded in."""
-    cur, peak = host_rss()
-    s = f"  host memory [{tag}]: RSS {_fmt_gb(cur)} (peak {_fmt_gb(peak)})"
-    if dist_mod is not None and dist_mod.is_initialized():
-        t = torch.tensor([cur, -cur, peak], dtype=torch.float64,
-                         device=device if device is not None else "cpu")
-        dist_mod.all_reduce(t, op=dist_mod.ReduceOp.MAX)
-        s += (f"; over ranks RSS min {_fmt_gb(-t[1].item())} max "
-              f"{_fmt_gb(t[0].item())}, peak max {_fmt_gb(t[2].item())}")
-    return s
 
 
 def compute_max_neighbors(structures):
@@ -2327,9 +2291,6 @@ def train_nep(
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
         scheduler_patience, stop_lr)
-
-    def _loss_fn(pred, ref):
-        return torch.mean((pred - ref) ** 2)
 
     swa_model = None
     stage2_scheduler = None
