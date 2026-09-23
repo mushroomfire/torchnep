@@ -33,8 +33,15 @@ torch = ["torch>=2.0", "numpy>=1.20"]
 ase = ["ase>=3.22"]
 plot = ["matplotlib>=3.5", "polars>=0.20"]
 all = ["ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
-dev = ["pytest", "pytest-xdist", "ruff", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
+dev = ["pytest", "pytest-xdist", "pytest-cov", "coverage>=7.10", "ruff", "ase>=3.22", "matplotlib>=3.5", "polars>=0.20"]
 docs = ["mkdocs>=1.6,<2", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.26", "ruff"]
+
+[tool.coverage.run]
+source = ["torchnep"]
+# The multi-GPU tests (TORCHNEP_TEST_DDP=1) run the sharded code in torchrun child
+# processes: measure those too (coverage >= 7.10), each writing its own data file.
+patch = ["subprocess"]
+parallel = true
 
 [tool.pytest.ini_options]
 
