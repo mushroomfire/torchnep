@@ -118,16 +118,17 @@ def test_streamed_split_and_slim_types_match_in_memory(tmp_path):
     np.testing.assert_allclose(_loss(tmp_path / "streamed"), _loss(tmp_path / "memory"), rtol=1e-12, atol=0)
 
 
-def test_resume_continues_exactly(tmp_path):
+@pytest.mark.parametrize("with_valid", [True, False], ids=["valid_file", "no_valid"])
+def test_resume_continues_exactly(tmp_path, with_valid):
     """Long trainings run in segments: a run stopped after epoch 2 and resumed
     with restart=True must end exactly like one that ran 4 epochs straight
-    (model, optimizer, scheduler and shard order all restored). With a
-    validation set, as in production runs: without one, the end-of-run
-    true-loss evaluation re-solves b1 (a documented side effect), so extending
-    a finished run is exact only up to that one offset update."""
+    (model, optimizer, scheduler and shard order all restored). Without a
+    validation set the final epoch of the first segment is evaluated with
+    its exact b1; that must not leak into the training state."""
     xyz = _frames(tmp_path / "train.xyz", 0, 16)
-    valid = _frames(tmp_path / "valid.xyz", 16, 8)
-    kw = dict(run_seed=7, checkpoint_interval=1, valid_file=valid)
+    kw = dict(run_seed=7, checkpoint_interval=1)
+    if with_valid:
+        kw["valid_file"] = _frames(tmp_path / "valid.xyz", 16, 8)
     straight = tmp_path / "straight"
     _run(tmp_path, _nep_in(tmp_path / "nep4.in", TYPES3, "stage2 0\nepoch 4\n"), xyz, straight,
          restart=False, **kw)

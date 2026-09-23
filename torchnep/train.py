@@ -1603,12 +1603,17 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     decide whether a candidate epoch really is the best model (see the
     best-save block in the epoch loop).
 
-    Side effect: sets the exact optimal energy offset ``b1`` for these frozen
-    weights (δ = sum_e_resid / n_e) so the evaluated loss and the saved model
-    agree. This is what keeps nep_best ≤ nep_final: every candidate (the final
-    epoch always among them) is judged AND saved with its own exact b1.
+    The loss is that of the exact optimal energy offset for these frozen
+    weights, ``b1 + delta`` (delta = sum_e_resid / n_e). ``b1`` itself is left
+    alone: the caller saves the candidate under ``_b1_shifted(raw_model,
+    delta)``, so every candidate (the final epoch always among them) is judged
+    AND saved with its own exact b1 — which keeps nep_best <= nep_final —
+    while training continues from the same b1 whether or not an epoch was
+    evaluated (a run extended from its checkpoint then retraces the longer
+    run exactly).
 
-    Returns (true_loss, rmse_e, rmse_f, rmse_v) — energy terms offset-corrected.
+    Returns (true_loss, rmse_e, rmse_f, rmse_v, delta) — energy terms
+    offset-corrected.
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
@@ -1617,18 +1622,30 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
             data_store, batch_size, raw_model,
             compute_props, compute_props_cached,
             use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
-    # Exact optimal b1 for these frozen weights, solved from this same pass.
+    # Exact optimal b1 shift for these frozen weights, solved from this same pass.
     delta = sum_e_resid / n_e if n_e > 0 else 0.0
-    if n_e > 0:
-        with torch.no_grad():
-            raw_model.b1.add_(delta)
     # Offset-corrected energy MSE = Var(residual) = E[r²] − δ². Clamp tiny
     # negatives from float round-off.
     mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v), delta
+
+
+@contextlib.contextmanager
+def _b1_shifted(raw_model, delta):
+    """``b1 + delta`` inside the block (to save a model with its exact energy
+    offset), the untouched ``b1`` afterwards — restored by value, since
+    ``(b1 + delta) - delta`` need not round back to ``b1``."""
+    saved = raw_model.b1.detach().clone()
+    with torch.no_grad():
+        raw_model.b1.add_(delta)
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            raw_model.b1.copy_(saved)
 
 
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
@@ -2428,9 +2445,13 @@ def train_nep(
                    and getattr(optimizer, "_step_supports_amp_scaling",
                                False))
 
+    # Exact b1 shift of the last epoch's frozen-weight evaluation (no
+    # validation set only), for nep_final; None when that epoch was not evaluated.
+    final_b1_delta = None
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
+            final_b1_delta = None
             model.train()
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
@@ -2815,14 +2836,15 @@ def train_nep(
                 if new_min:
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                t_loss, _te, _tf, _tv = _evaluate_true_loss(
+                t_loss, _te, _tf, _tv, final_b1_delta = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
-                    _save_best()
+                    with _b1_shifted(raw_model, final_b1_delta):
+                        _save_best()
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs or stop_now:
                 _save_checkpoint(
@@ -2879,14 +2901,20 @@ def train_nep(
         if loss_log is not None:
             loss_log.close()
 
-    # Final-epoch model (what the current weights actually are). b1 is already
-    # exact for these weights: the final epoch (epoch == num_epochs) always
-    # runs the best-model eval, which solves and sets the optimal b1. Do NOT
-    # recompute it here — that would give nep_final a different (lower-loss) b1
-    # than the value the best-model comparison used, which could make nep_final
-    # beat the saved nep_best.
-    raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
-                           max_NN_rad, max_NN_ang)
+    # Final-epoch model (what the current weights actually are). Without a
+    # validation set it is saved with the exact b1 of the final epoch's
+    # best-model eval — the value that comparison used, so nep_final cannot
+    # beat nep_best. A run that ended without that eval (resumed with no
+    # epochs left, or stopped early before the evaluated last third) solves
+    # it here from the same pass. With a validation set, b1 is the
+    # train-fitted one, as for nep_best.
+    if valid_store is None and final_b1_delta is None:
+        final_b1_delta = _evaluate_true_loss(
+            data_store, batch_size, raw_model, compute_props, compute_props_cached,
+            use_autograd_forces, train_backend, 1.0, 1.0, 1.0, dtype, dev)[-1]
+    with _b1_shifted(raw_model, final_b1_delta or 0.0):
+        raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
+                               max_NN_rad, max_NN_ang)
     # SWA-averaged model (only when user opted in and stage 2 ran).
     if swa_model is not None and int(swa_model.n_averaged) == 0:
         _log("SWA window never reached (run ended before swa_start) — "

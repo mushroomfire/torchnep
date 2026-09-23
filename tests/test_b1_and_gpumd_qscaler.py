@@ -241,7 +241,7 @@ def test_nep_best_not_worse_than_final(tmp_path):
         from torchnep.train import _evaluate_true_loss
         m = NEPModel(cfg).to(torch.float64)
         m.load_weights_from_nep_txt(path)
-        loss, _, _, _ = _evaluate_true_loss(
+        loss, *_ = _evaluate_true_loss(
             ds, 1000, m, m.compute_properties, m.compute_properties_cached,
             False, "loop", *pref, torch.float64, torch.device("cpu"))
         return float(loss)

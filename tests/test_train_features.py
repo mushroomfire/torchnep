@@ -100,6 +100,27 @@ def test_redo_stage2_from_its_checkpoint_reproduces_the_run(tmp_path):
     np.testing.assert_allclose(b, stage2, rtol=1e-12, atol=0)
 
 
+def test_extending_a_run_without_validation_is_exact(tmp_path):
+    """Without a validation set, the last third of a run evaluates candidate
+    epochs on frozen weights with their exact energy offset b1 — the final
+    epoch always. That evaluation must not change the training state: a
+    3-epoch run extended to 6 from its checkpoint retraces the 6-epoch run
+    (loss.out and nep_final.txt identical), and resuming a finished run
+    leaves nep_final.txt as it was."""
+    _, xyz = _write_run_files(tmp_path, n_frames=16)
+    for n in (3, 6):
+        (tmp_path / f"nep{n}.in").write_text(NEP_IN + f"epoch {n}\nbatch 8\nstage2 0\n")
+    straight, split = tmp_path / "straight", tmp_path / "split"
+    _train(str(tmp_path / "nep6.in"), xyz, straight, run_seed=0, checkpoint_interval=1)
+    _train(str(tmp_path / "nep3.in"), xyz, split, run_seed=0, checkpoint_interval=1)
+    _train(str(tmp_path / "nep6.in"), xyz, split, run_seed=0, checkpoint_interval=1, restart=True)
+    np.testing.assert_array_equal(np.loadtxt(split / "loss.out"), np.loadtxt(straight / "loss.out"))
+    final = (straight / "nep_final.txt").read_text()
+    assert (split / "nep_final.txt").read_text() == final
+    _train(str(tmp_path / "nep6.in"), xyz, straight, run_seed=0, restart=True)   # no epochs left
+    assert (straight / "nep_final.txt").read_text() == final
+
+
 def test_resume_reports_changed_validation_and_loss_weights(tmp_path):
     """A restart whose validation split or loss weights differ from the
     checkpoint's warns and resets the best losses instead of silently mixing."""

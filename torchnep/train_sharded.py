@@ -56,7 +56,7 @@ from .train import (
     preprocess_structures, compute_max_neighbors,
     choose_neighbor_mode, NEIGHBOR_MODES, _fmt_gb,
     _save_checkpoint, _load_checkpoint,
-    _trim_loss_log, _accumulate_true_loss_sums,
+    _trim_loss_log, _accumulate_true_loss_sums, _b1_shifted,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
     _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
@@ -1154,9 +1154,13 @@ def train_nep_sharded(
                    and getattr(optimizer, "_step_supports_amp_scaling",
                                False))
 
+    # Exact b1 shift of the last epoch's frozen-weight evaluation (no
+    # validation set only), for nep_final; None when that epoch was not evaluated.
+    final_b1_delta = None
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
+            final_b1_delta = None
             model.train()
 
             # Per-epoch local frame shuffle. Each rank independently
@@ -1570,12 +1574,12 @@ def train_nep_sharded(
                 dist.all_reduce(sums_t)
                 (s_le, s_lf, s_lv, _s_ls,
                  n_e, n_f, n_v, s_e_resid) = sums_t.tolist()
-                # Exact optimal b1 for these frozen weights, from the global
-                # (all-reduced) residual — identical on every rank.
+                # Exact optimal b1 shift for these frozen weights, from the
+                # global (all-reduced) residual — identical on every rank.
+                # Applied only to the saved model, never to the training
+                # state (see _evaluate_true_loss in train.py).
                 delta = s_e_resid / n_e if n_e > 0 else 0.0
-                if n_e > 0:
-                    with torch.no_grad():
-                        raw_model.b1.add_(delta)
+                final_b1_delta = delta
                 mse_e = max(0.0, s_le / max(n_e, 1.0) - delta * delta)
                 t_loss = (cur_pref_e * mse_e
                           + cur_pref_f * s_lf / max(n_f, 1.0)
@@ -1583,7 +1587,8 @@ def train_nep_sharded(
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     if is_main:
-                        _save_best()
+                        with _b1_shifted(raw_model, delta):
+                            _save_best()
 
             if is_main and (epoch % checkpoint_interval == 0
                             or epoch == num_epochs or stop_now):
@@ -1632,13 +1637,24 @@ def train_nep_sharded(
         if is_main and loss_log is not None:
             loss_log.close()
 
-    # b1 is already exact for the final weights: the final epoch always runs
-    # the best-model eval, which solves and sets the optimal b1 (all ranks).
-    # Recomputing here would desync nep_final's offset from the value the
-    # best comparison used and could make nep_final beat nep_best.
+    # nep_final: without a validation set, saved with the exact b1 of the
+    # final epoch's best-model eval (the value that comparison used, so
+    # nep_final cannot beat nep_best); a run that ended without that eval
+    # (resumed with no epochs left, or stopped early before the evaluated
+    # last third) solves it here from the same all-reduced pass. See train_nep.
+    if valid_store is None and final_b1_delta is None:
+        fs = torch.tensor(_accumulate_true_loss_sums(
+            data_store, batch_size, raw_model,
+            raw_model.compute_properties, _shim._compute_cached,
+            use_autograd_forces, train_backend,
+            global_has_forces, global_has_virial, dtype, dev),
+            device=dev, dtype=torch.float64)
+        dist.all_reduce(fs)
+        final_b1_delta = (fs[7] / fs[4]).item() if fs[4] > 0 else 0.0
     if is_main:
-        raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
-                               max_NN_rad, max_NN_ang)
+        with _b1_shifted(raw_model, final_b1_delta or 0.0):
+            raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
+                                   max_NN_rad, max_NN_ang)
     if swa_model is not None and int(swa_model.n_averaged) == 0:
         _log("SWA window never reached (run ended before swa_start) — "
              "nep_average.txt not written")

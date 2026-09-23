@@ -2,7 +2,7 @@
 
 ## Resume a run
 
-A run resumes automatically: with `restart=True` (the default), `train_nep` continues from `output_dir/checkpoint.pt` if it exists. Resuming is an exact continuation — learning rate, optimizer, scheduler and best-model state all come from the checkpoint.
+A run resumes automatically: with `restart=True` (the default), `train_nep` continues from `output_dir/checkpoint.pt` if it exists. Resuming is an exact continuation — learning rate, optimizer, scheduler and best-model state all come from the checkpoint. This includes extending a finished run: raise `epoch` in nep.in and resubmit, and the result equals a run that had the larger `epoch` from the start.
 
 ```python
 # continue output/checkpoint.pt
