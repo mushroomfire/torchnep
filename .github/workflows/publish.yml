@@ -80,6 +80,12 @@ jobs:
           if [ ! -s notes.md ]; then
             echo "No '## $ver' section in docs/release-notes.md" > notes.md
           fi
+          # links written relative to docs/ (e.g. guide/x.md#anchor) work on
+          # the docs site only; point them at the site for the release page
+          site=$(awk '/^site_url:/ {print $2}' mkdocs.yml); site="${site%/}/"
+          sed -E -i \
+            -e "s|\]\((([^):#]*/)?)index\.md(#[^)]*)?\)|](${site}\1\3)|g" \
+            -e "s|\]\(([^):#]+)\.md(#[^)]*)?\)|](${site}\1/\2)|g" notes.md
           cat notes.md
 
       - name: Create GitHub Release
