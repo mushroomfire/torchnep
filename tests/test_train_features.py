@@ -113,14 +113,74 @@ def test_resume_reports_changed_validation_and_loss_weights(tmp_path):
     assert "Loss weights changed since checkpoint was saved" in log
 
 
+def test_early_stop_in_stage1_moves_the_stage2_start(tmp_path):
+    """Frozen weights (lr 0) plateau at once: stage 1 hands over to stage 2
+    early, stage 2 then stops early. The loss plot must mark stage 2 where it
+    really began (the first "[S2] Epoch" line), not at the scheduled epoch."""
+    from torchnep.plot import stage2_epoch
+    _, xyz = _write_run_files(tmp_path, n_frames=16)
+    (tmp_path / "nep.in").write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nstage2_lr 0\nearly_stop 2\nstage2 1\n")
+    out = tmp_path / "out"
+    _train(str(tmp_path / "nep.in"), xyz, out, run_seed=0, valid_ratio=0.25)
+    log = (out / "output.log").read_text()
+    assert "Early stop (stage 1)" in log and "Early stop:" in log
+    first_s2 = int(log.split("[S2] Epoch")[1].split()[0])
+    assert first_s2 < 20 and stage2_epoch(out) == first_s2
+    assert len(np.loadtxt(out / "loss.out", ndmin=2)) < 40
+
+
+def test_step_scheduler_halves_lr_and_stops_at_stop_lr(tmp_path):
+    """lr_scheduler step: lr x scheduler_factor every scheduler_patience
+    epochs, never below stop_lr (0.01 -> 0.005 -> 0.0025, clamped to 0.003).
+    The log prints the lr after each epoch's scheduler step."""
+    _, xyz = _write_run_files(tmp_path, n_frames=16)
+    (tmp_path / "nep.in").write_text(NEP_IN + "epoch 7\nbatch 8\nstage2 0\nlr 0.01\nlr_scheduler step\n"
+                                     "scheduler_patience 2\nscheduler_factor 0.5\nstop_lr 0.003\n")
+    out = tmp_path / "out"
+    _train(str(tmp_path / "nep.in"), xyz, out, run_seed=0, print_interval=1)
+    lrs = [float(ln.split("| lr ")[1].split()[0])
+           for ln in (out / "output.log").read_text().splitlines() if ln.startswith("Epoch")]
+    np.testing.assert_allclose(lrs, [1e-2, 5e-3, 5e-3, 3e-3, 3e-3, 3e-3, 3e-3])
+
+
+def test_resume_after_a_kill_between_checkpoints(tmp_path):
+    """A run killed after logging epoch 3 but with its last checkpoint at
+    epoch 2 retrains epoch 3 on resume: loss.out must not list epoch 3 twice,
+    and the result equals an uninterrupted run."""
+    _, xyz = _write_run_files(tmp_path, n_frames=16)
+    for n in (2, 4):
+        (tmp_path / f"nep{n}.in").write_text(NEP_IN + f"epoch {n}\nbatch 8\nstage2 0\n")
+    kw = dict(run_seed=0, valid_ratio=0.25, checkpoint_interval=1)
+    straight, killed = tmp_path / "straight", tmp_path / "killed"
+    _train(str(tmp_path / "nep4.in"), xyz, straight, **kw)
+    _train(str(tmp_path / "nep2.in"), xyz, killed, **kw)
+    with open(killed / "loss.out", "a") as fh:                 # epoch 3 logged, then killed
+        fh.write("3 " + " ".join(["9.9"] * 9) + "\n")
+    _train(str(tmp_path / "nep4.in"), xyz, killed, restart=True, **kw)
+    np.testing.assert_allclose(np.loadtxt(killed / "loss.out", ndmin=2),
+                               np.loadtxt(straight / "loss.out", ndmin=2), rtol=1e-12, atol=0)
+
+
 def test_random_validation_split_and_unknown_strategy(tmp_path):
+    """The random split held out by train_nep is the one export_valid_split
+    writes to test.xyz (same frames, same order), so a GPUMD run on the
+    exported files validates on the same structures."""
+    from torchnep import export_valid_split
     nepin, xyz = _write_run_files(tmp_path, n_frames=16, epochs=1)
     out = tmp_path / "out"
     _train(nepin, xyz, out, run_seed=0, valid_ratio=0.25, valid_strategy="random", prediction_interval=1)
     assert "valid_ratio=0.25: held out 4 frames" in (out / "output.log").read_text()
-    assert len(np.loadtxt(out / "energy_test.out", ndmin=2)) == 4
+    e_test = np.loadtxt(out / "energy_test.out", ndmin=2)[:, 1]
+    _, test_xyz, n_tr, n_va = export_valid_split(xyz, 0.25, 0, output_dir=str(tmp_path / "split"),
+                                                 strategy="random")
+    assert (n_tr, n_va) == (12, 4)
+    np.testing.assert_allclose(e_test, [f["energy"] / f["natoms"] for f in read_xyz(test_xyz)], atol=1e-10)
     with pytest.raises(ValueError, match="valid_strategy"):
         _train(nepin, xyz, tmp_path / "bad", run_seed=0, valid_ratio=0.25, valid_strategy="nearest")
+    with pytest.raises(ValueError, match="unknown split strategy"):
+        export_valid_split(xyz, 0.25, 0, output_dir=str(tmp_path / "bad"), strategy="nearest")
+    with pytest.raises(ValueError, match="overwrite the input"):
+        export_valid_split(xyz, 0.25, 0, output_dir=str(tmp_path), strategy="random")
 
 
 def test_parallel_preprocessing_equals_serial(tmp_path):

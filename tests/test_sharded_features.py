@@ -103,6 +103,21 @@ def test_streamed_loading_matches_in_memory(tmp_path):
     assert len(np.loadtxt(tmp_path / "streamed" / "energy_test.out", ndmin=2)) == 8
 
 
+def test_streamed_split_and_slim_types_match_in_memory(tmp_path):
+    """The streamed loader draws its validation split and the species union
+    for slim_types from per-rank shards: a 4-type nep.in on Cr/Co/Ni data with
+    valid_ratio (random strategy) must train exactly like the in-memory path."""
+    xyz = _frames(tmp_path / "train.xyz", 0, 24)
+    nepin = _nep_in(tmp_path / "nep.in", "type 4 Cr Co Ni Fe\n", "epoch 2\n")
+    kw = dict(restart=False, run_seed=5, valid_ratio=0.25, valid_strategy="random", slim_types=True)
+    log_s = _run(tmp_path, nepin, xyz, tmp_path / "streamed", env={"TORCHNEP_STREAM_THRESHOLD": "0"}, **kw)
+    log_m = _run(tmp_path, nepin, xyz, tmp_path / "memory", **kw)
+    assert "streamed shard loading" in log_s
+    for log in (log_s, log_m):
+        assert "held out 6 frames" in log and "(removing: ['Fe'])" in log
+    np.testing.assert_allclose(_loss(tmp_path / "streamed"), _loss(tmp_path / "memory"), rtol=1e-12, atol=0)
+
+
 def test_resume_continues_exactly(tmp_path):
     """Long trainings run in segments: a run stopped after epoch 2 and resumed
     with restart=True must end exactly like one that ran 4 epochs straight
