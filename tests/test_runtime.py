@@ -102,10 +102,14 @@ print("RESULT", ok, err, sum("C compiler" in str(x.message) for x in w))
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 def test_eager_cuda_runs_without_a_compiler(tmp_path):
-    """No compiler and an empty Triton cache: eager work must still run, with one warning."""
+    """No compiler and an empty Triton cache: eager work must still run, with one warning.
+
+    PATH is cut down to the interpreter's directory, which hides even a system gcc in
+    /usr/bin: Triton looks its C compiler up on PATH but finds libcuda through the
+    absolute /sbin/ldconfig, so nothing else needs PATH."""
     env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "triton"),
                TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"),
-               PATH=os.path.dirname(sys.executable) + ":/usr/bin:/bin")
+               PATH=os.path.dirname(sys.executable))
     env.pop("CC", None); env.pop("CXX", None)
     if any(shutil.which(c, path=env["PATH"]) for c in ("cc", "gcc", "clang")):
         pytest.skip("a C compiler is still on the stripped PATH; nothing to test here")
