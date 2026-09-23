@@ -52,3 +52,36 @@ jobs:
 
       - name: Run tests
         run: pytest -q -n auto      # one worker per core (pytest-xdist)
+
+  coverage:
+    # One CPU run with the opt-in multi-process tests switched on (TORCHNEP_TEST_DDP=1), uploaded to Codecov for the
+    # README badge. GPU-only code cannot run on these runners; the README states the GPU-inclusive figure measured
+    # separately. An editable install keeps the reported paths equal to the repository's.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install CPU PyTorch and TorchNEP (editable, with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .[ase,dev]
+
+      - name: Run tests with coverage
+        env:
+          TORCHNEP_TEST_DDP: "1"
+        run: pytest -q -n auto --cov=torchnep --cov-report=xml --cov-report=term
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
