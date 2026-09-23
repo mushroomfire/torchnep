@@ -69,6 +69,34 @@ def test_readers_and_shift(tmp_path):
     assert stage2_epoch(tmp_path) == 15          # nep.in: stage2 1, epoch 30
 
 
+def test_gpumd_fixed_width_outputs_and_exact_element_shift(tmp_path, monkeypatch):
+    """GPUMD pads its *_train.out columns with runs of spaces: they must read
+    like TorchNEP's single-space files, with and without polars. An energy
+    offset that is a sum of per-element constants is removed exactly by
+    shift_energy="element"."""
+    _write_run(tmp_path)
+    ref = read_outputs(tmp_path, "train")
+    gpumd = tmp_path / "gpumd"
+    gpumd.mkdir()
+    for name in ("energy", "force", "virial", "stress"):
+        t = np.loadtxt(tmp_path / f"{name}_train.out")
+        np.savetxt(gpumd / f"{name}_train.out", t, fmt="%15.8f")
+    for polars in (True, False):
+        if not polars:
+            import sys
+            monkeypatch.setitem(sys.modules, "polars", None)
+        d = read_outputs(gpumd, "train")
+        for q in ("E", "F", "V", "S"):
+            np.testing.assert_allclose(d[q]["ref"], ref[q]["ref"], atol=1e-8)
+    natoms, species, ct = frame_meta(tmp_path / "data.xyz")
+    offset = {"Cr": 0.37, "Ni": -1.21}                         # eV per atom of each element
+    d = {"E": {"ref": ref["E"]["ref"],
+               "pred": ref["E"]["ref"] + np.array([sum(offset[e] for e in s) for s in species]) / natoms}}
+    np.testing.assert_allclose(shift_energy(d, "element", (natoms, species, ct)), d["E"]["ref"], atol=1e-12)
+    with pytest.raises(ValueError, match="None, 'mean' or 'element'"):
+        shift_energy(d, "median")
+
+
 def test_all_figures(tmp_path):
     _write_run(tmp_path)
     p = NEPPlotter(font=None, dpi=60)          # no font lookup: CI runners have no Arial

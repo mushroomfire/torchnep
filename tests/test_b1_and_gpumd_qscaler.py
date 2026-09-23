@@ -156,11 +156,11 @@ def test_weight_decay_shrinks_weights(tmp_path):
     """With the same seed/init/data order, a positive weight_decay (AdamW
     decoupled decay) drives the NN weights to a smaller RMS than an
     unregularized run — the only difference is the decay term, which points
-    every weight toward 0. (lambda_1/lambda_2 were removed; nep.in files
-    that still carry them get a warning and the keys are ignored.)"""
+    every weight toward 0. The baseline sets weight_decay 0 explicitly (the
+    default is 1e-4)."""
     _, xyz = _write_run_files(tmp_path)
     base = tmp_path / "nep0.in"
-    base.write_text(NEP_IN + "epoch 8\nbatch 8\nlambda_2 0\n")
+    base.write_text(NEP_IN + "epoch 8\nbatch 8\nweight_decay 0\n")
     reg = tmp_path / "nepR.in"
     reg.write_text(NEP_IN + "epoch 8\nbatch 8\nweight_decay 0.3\n")
 
@@ -241,7 +241,7 @@ def test_nep_best_not_worse_than_final(tmp_path):
         from torchnep.train import _evaluate_true_loss
         m = NEPModel(cfg).to(torch.float64)
         m.load_weights_from_nep_txt(path)
-        loss, _, _, _ = _evaluate_true_loss(
+        loss, *_ = _evaluate_true_loss(
             ds, 1000, m, m.compute_properties, m.compute_properties_cached,
             False, "loop", *pref, torch.float64, torch.device("cpu"))
         return float(loss)

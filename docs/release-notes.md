@@ -4,6 +4,15 @@
 
 - **GPU machines without a C compiler**: PyTorch 2.12+ runs some built-in CUDA operations through Triton even without `torch.compile`, and Triton needs a C compiler the first time it runs on a machine. TorchNEP now checks this at start-up: it warns, runs those operations with the regular CUDA kernels and keeps `torch.compile` off, instead of failing in the middle of training. See [Installation](getting-started/installation.md#a-c-compiler-on-the-gpu-machine).
 - **Training on Apple GPUs (MPS) works again**; it had failed at the first epoch since 1.0.2.
+- **Unknown nep.in keywords are an error**: a typo or a GPUMD-only option stops the run with the keyword and its line, instead of being ignored.
+- **Exact restart without a validation set**: extending a finished run by raising `epoch` now gives exactly the longer run (the best-model check no longer changes the training state).
+- **Fixes**:
+    - `slim_types=True` failed for models with per-species cutoffs or a `zbl.in` table; the kept elements now keep their cutoffs and ZBL parameters.
+    - Training in `float64` on a CUDA GPU failed at the first step.
+    - Steps skipped for a non-finite gradient are now reported on every device, not only on CUDA.
+    - The loss plot marks stage 2 where it really started when stage 1 stopped early.
+    - Blank lines between frames of an xyz file are accepted everywhere, not only by the streamed reader.
+- **Test coverage** reported on [Codecov](https://codecov.io/gh/mushroomfire/torchnep); new tests for fine-tuning, slimming, restart, the multi-GPU trainer and GPU training with `torch.compile`, and unused code removed.
 
 ## 1.0.6
 

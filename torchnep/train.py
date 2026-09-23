@@ -40,7 +40,7 @@ from datetime import datetime
 from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
-from .model import NEPModel, slim_model, gpumd_init_parameters
+from .model import NEPModel, slim_model, slim_config, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices, build_neighbor_list_np,
                    build_neighbor_list_np_ex, wrap_positions,
@@ -339,7 +339,6 @@ class StreamDataStore:
         self.device = device
         self.dtype = dtype
         self.n = len(structures)
-        self.has_cached_basis = True
         self._pin = device.type == "cuda"
         self.neighbor_mode = neighbor_mode
 
@@ -1166,41 +1165,6 @@ def _fmt_gb(b):
     return f"{b / 2**30:.1f} GiB"
 
 
-def host_rss():
-    """(current, peak) resident set size of this process in bytes (Linux
-    /proc; peak from getrusage elsewhere). Zeros when unavailable."""
-    cur = peak = 0
-    try:
-        for line in open("/proc/self/status"):
-            if line.startswith("VmRSS:"):
-                cur = int(line.split()[1]) * 1024
-            elif line.startswith("VmHWM:"):
-                peak = int(line.split()[1]) * 1024
-    except OSError:
-        try:
-            import resource
-            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            peak = r * (1 if platform.system() == "Darwin" else 1024)
-            cur = peak
-        except Exception:
-            pass
-    return cur, peak
-
-
-def host_mem_line(tag, dist_mod=None, device=None):
-    """Log line with this process's host RSS (now / peak); with a torch
-    distributed process group the min / max over ranks are folded in."""
-    cur, peak = host_rss()
-    s = f"  host memory [{tag}]: RSS {_fmt_gb(cur)} (peak {_fmt_gb(peak)})"
-    if dist_mod is not None and dist_mod.is_initialized():
-        t = torch.tensor([cur, -cur, peak], dtype=torch.float64,
-                         device=device if device is not None else "cpu")
-        dist_mod.all_reduce(t, op=dist_mod.ReduceOp.MAX)
-        s += (f"; over ranks RSS min {_fmt_gb(-t[1].item())} max "
-              f"{_fmt_gb(t[0].item())}, peak max {_fmt_gb(t[2].item())}")
-    return s
-
-
 def compute_max_neighbors(structures):
     """Return (max_NN_radial, max_NN_angular) over all structures.
 
@@ -1473,9 +1437,7 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     The optimizer state carries the lr of the checkpoint moment — nep.in's
     lr is never re-applied on resume. The scheduler state is restored into
     the scheduler that was active when the checkpoint was written
-    (``in_stage2`` tag; pre-tag checkpoints fall back to the stage-1
-    scheduler, matching the old behaviour). SWA state is restored when both
-    sides have it.
+    (``in_stage2`` tag). SWA state is restored when both sides have it.
 
     Returns a dict with epoch / best_loss / best_true_loss / loss_weights /
     in_stage2.
@@ -1483,15 +1445,9 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
-    model_state = ckpt["model_state"]
-    # Checkpoints written by older DDP runs saved the shim's state_dict,
-    # whose keys carry a uniform "model." prefix — strip it so they load
-    # into a plain NEPModel (new checkpoints always store plain keys).
-    if model_state and all(k.startswith("model.") for k in model_state):
-        model_state = {k[len("model."):]: v for k, v in model_state.items()}
-    m.load_state_dict(model_state)
+    m.load_state_dict(ckpt["model_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    in_stage2 = ckpt.get("in_stage2", False)
+    in_stage2 = ckpt["in_stage2"]
     target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
               else lr_scheduler)
     if target is not None and "scheduler_state" in ckpt:
@@ -1513,10 +1469,10 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "best_true_loss": ckpt.get("best_true_loss", float("inf")),
         "loss_weights": ckpt.get("loss_weights"),
         "in_stage2": in_stage2,
-        "run_seed": ckpt.get("run_seed"),
+        "run_seed": ckpt["run_seed"],
         "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
         "valid_info": ckpt.get("valid_info"),
-        "start_stage2": ckpt.get("start_stage2"),
+        "start_stage2": ckpt["start_stage2"],
     }
 
 
@@ -1647,12 +1603,17 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     decide whether a candidate epoch really is the best model (see the
     best-save block in the epoch loop).
 
-    Side effect: sets the exact optimal energy offset ``b1`` for these frozen
-    weights (δ = sum_e_resid / n_e) so the evaluated loss and the saved model
-    agree. This is what keeps nep_best ≤ nep_final: every candidate (the final
-    epoch always among them) is judged AND saved with its own exact b1.
+    The loss is that of the exact optimal energy offset for these frozen
+    weights, ``b1 + delta`` (delta = sum_e_resid / n_e). ``b1`` itself is left
+    alone: the caller saves the candidate under ``_b1_shifted(raw_model,
+    delta)``, so every candidate (the final epoch always among them) is judged
+    AND saved with its own exact b1 — which keeps nep_best <= nep_final —
+    while training continues from the same b1 whether or not an epoch was
+    evaluated (a run extended from its checkpoint then retraces the longer
+    run exactly).
 
-    Returns (true_loss, rmse_e, rmse_f, rmse_v) — energy terms offset-corrected.
+    Returns (true_loss, rmse_e, rmse_f, rmse_v, delta) — energy terms
+    offset-corrected.
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
@@ -1661,18 +1622,30 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
             data_store, batch_size, raw_model,
             compute_props, compute_props_cached,
             use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
-    # Exact optimal b1 for these frozen weights, solved from this same pass.
+    # Exact optimal b1 shift for these frozen weights, solved from this same pass.
     delta = sum_e_resid / n_e if n_e > 0 else 0.0
-    if n_e > 0:
-        with torch.no_grad():
-            raw_model.b1.add_(delta)
     # Offset-corrected energy MSE = Var(residual) = E[r²] − δ². Clamp tiny
     # negatives from float round-off.
     mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v), delta
+
+
+@contextlib.contextmanager
+def _b1_shifted(raw_model, delta):
+    """``b1 + delta`` inside the block (to save a model with its exact energy
+    offset), the untouched ``b1`` afterwards — restored by value, since
+    ``(b1 + delta) - delta`` need not round back to ``b1``."""
+    saved = raw_model.b1.detach().clone()
+    with torch.no_grad():
+        raw_model.b1.add_(delta)
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            raw_model.b1.copy_(saved)
 
 
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
@@ -2077,9 +2050,7 @@ def train_nep(
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
             _slim_keep = keep
-            config = dict(orig_config)
-            config["type_names"] = keep
-            config["num_types"] = len(keep)
+            config = slim_config(orig_config, keep)
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -2328,9 +2299,6 @@ def train_nep(
         optimizer, lr_scheduler_mode, scheduler_factor,
         scheduler_patience, stop_lr)
 
-    def _loss_fn(pred, ref):
-        return torch.mean((pred - ref) ** 2)
-
     swa_model = None
     stage2_scheduler = None
     if stage2:
@@ -2475,9 +2443,13 @@ def train_nep(
                    and getattr(optimizer, "_step_supports_amp_scaling",
                                False))
 
+    # Exact b1 shift of the last epoch's frozen-weight evaluation (no
+    # validation set only), for nep_final; None when that epoch was not evaluated.
+    final_b1_delta = None
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
+            final_b1_delta = None
             model.train()
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
@@ -2663,7 +2635,9 @@ def train_nep(
                     # still averages the (unchanged) weights, and that
                     # step's metrics are excluded via the same flag.
                     bad = (~torch.isfinite(gn_t)).to(dtype)
-                    optimizer.found_inf = bad
+                    # fused Adam takes a float32 flag whatever the parameter
+                    # dtype (a float64 one fails in every float64 run)
+                    optimizer.found_inf = bad.to(torch.float32)
                     optimizer.step()
                     n_bad_t += bad
                     ok_f = (1.0 - bad).to(torch.float64)
@@ -2671,6 +2645,7 @@ def train_nep(
                     gn = float(gn_t)
                     if not np.isfinite(gn):
                         optimizer.zero_grad(set_to_none=True)
+                        n_bad_t += 1
                         continue
                     optimizer.step()
                     ok_f = 1.0
@@ -2862,14 +2837,15 @@ def train_nep(
                 if new_min:
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                t_loss, _te, _tf, _tv = _evaluate_true_loss(
+                t_loss, _te, _tf, _tv, final_b1_delta = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
-                    _save_best()
+                    with _b1_shifted(raw_model, final_b1_delta):
+                        _save_best()
 
             if epoch % checkpoint_interval == 0 or epoch == num_epochs or stop_now:
                 _save_checkpoint(
@@ -2926,14 +2902,20 @@ def train_nep(
         if loss_log is not None:
             loss_log.close()
 
-    # Final-epoch model (what the current weights actually are). b1 is already
-    # exact for these weights: the final epoch (epoch == num_epochs) always
-    # runs the best-model eval, which solves and sets the optimal b1. Do NOT
-    # recompute it here — that would give nep_final a different (lower-loss) b1
-    # than the value the best-model comparison used, which could make nep_final
-    # beat the saved nep_best.
-    raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
-                           max_NN_rad, max_NN_ang)
+    # Final-epoch model (what the current weights actually are). Without a
+    # validation set it is saved with the exact b1 of the final epoch's
+    # best-model eval — the value that comparison used, so nep_final cannot
+    # beat nep_best. A run that ended without that eval (resumed with no
+    # epochs left, or stopped early before the evaluated last third) solves
+    # it here from the same pass. With a validation set, b1 is the
+    # train-fitted one, as for nep_best.
+    if valid_store is None and final_b1_delta is None:
+        final_b1_delta = _evaluate_true_loss(
+            data_store, batch_size, raw_model, compute_props, compute_props_cached,
+            use_autograd_forces, train_backend, 1.0, 1.0, 1.0, dtype, dev)[-1]
+    with _b1_shifted(raw_model, final_b1_delta or 0.0):
+        raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
+                               max_NN_rad, max_NN_ang)
     # SWA-averaged model (only when user opted in and stage 2 ran).
     if swa_model is not None and int(swa_model.n_averaged) == 0:
         _log("SWA window never reached (run ended before swa_start) — "

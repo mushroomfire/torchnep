@@ -779,6 +779,28 @@ def gpumd_init_parameters(model: NEPModel) -> None:
         torch.nn.init.uniform_(net.w1, -1.0, 1.0)
 
 
+def slim_config(config: dict, keep_type_names: List[str]) -> dict:
+    """A ``parse_nep_in`` config restricted to ``keep_type_names`` (in that
+    order): the type list and everything indexed by type follows — the
+    per-species cutoffs and the rows of a flexible ZBL (zbl.in) pair table.
+    The architecture of the model :func:`slim_model` returns."""
+    unknown = [t for t in keep_type_names if t not in config["type_names"]]
+    if unknown:
+        raise ValueError(f"Types not in source config: {unknown}")
+    keep_idx = [config["type_names"].index(t) for t in keep_type_names]
+    out = dict(config)
+    out["type_names"] = list(keep_type_names)
+    out["num_types"] = len(keep_idx)
+    for key in ("cutoff_radial_per_type", "cutoff_angular_per_type"):
+        if config.get(key) is not None:
+            out[key] = [config[key][i] for i in keep_idx]
+    if config.get("zbl_flexible") is not None:
+        rows, T = config["zbl_flexible"], config["num_types"]
+        out["zbl_flexible"] = [list(rows[zbl_pair_index(keep_idx[a], keep_idx[b], T)])
+                               for a in range(len(keep_idx)) for b in range(a, len(keep_idx))]
+    return out
+
+
 def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
     """Return a new NEPModel containing only the specified element types.
 

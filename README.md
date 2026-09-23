@@ -64,11 +64,10 @@ The best model is written to `output/nep_best.txt`. The [documentation](https://
 
 ```bash
 pip install -e ".[dev]"
-pytest                        # GPU-only tests run when a GPU is present
-TORCHNEP_TEST_DDP=1 pytest    # also the multi-process (DDP) tests
+TORCHNEP_TEST_DDP=1 pytest -n auto    # CPU; GPU-only tests are skipped
 ```
 
-The coverage badge is the CPU run in CI, multi-process tests included. On GPUs — 2 × NVIDIA GH200 with the multi-GPU tests on — 267 tests pass and cover **86 %** of the code; the one skipped test needs an Apple GPU (1.0.7a1, September 2026).
+The coverage badge is this CPU run in CI. On 2 × NVIDIA GH200 the full suite (326 tests, including GPU training with `torch.compile` and multi-GPU training) covers **94 %** of the code (September 2026). How to run it on your own GPU machine: [Running the test suite](https://mushroomfire.github.io/torchnep/getting-started/installation/#running-the-test-suite).
 
 ## Building the documentation
 
