@@ -60,3 +60,32 @@ module load gcc          # or: export CC=/path/to/gcc CXX=/path/to/g++
 ```
 
 Without one, TorchNEP warns at start-up, runs those operations with the regular CUDA kernels and keeps `torch.compile` off. Training and prediction still work, only without the compiled speed-up.
+
+## Running the test suite
+
+The tests need a source checkout and the development extras:
+
+```bash
+git clone https://github.com/mushroomfire/torchnep.git
+cd torchnep
+pip install -e ".[dev]"
+```
+
+**On any machine (CPU).** This is what CI runs. Tests that need a GPU are skipped.
+
+```bash
+TORCHNEP_TEST_DDP=1 pytest -n auto      # about a minute on an 8-core laptop
+```
+
+`TORCHNEP_TEST_DDP=1` adds the multi-process tests, which start two processes with `torchrun`. `-n auto` spreads the tests over all CPU cores.
+
+**On a GPU machine: the full suite.** Some paths only run on a GPU: training with `torch.compile` (the default on GPUs) against eager mode, the CUDA-only safeguards and multi-GPU training. Run everything on a node with two GPUs and a C compiler:
+
+```bash
+module load gcc                          # if the node has no C compiler (see above)
+TORCHNEP_TEST_DDP=1 pytest -rs           # one process: the GPU tests share the devices
+```
+
+On 2 × NVIDIA GH200 this takes about 25 minutes (measured with coverage on) and runs every test but one (it needs an Apple GPU). With a single GPU the two-GPU tests are skipped; `-rs` lists every skipped test and why.
+
+**Coverage.** Add `--cov=torchnep --cov-report=term-missing` to either command to see which lines the run did not reach.
