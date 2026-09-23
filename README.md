@@ -13,6 +13,7 @@
   <a href="https://pypi.org/project/torchnep/"><img src="https://img.shields.io/pypi/v/torchnep?logo=pypi&logoColor=white" alt="PyPI"></a>
   <a href="https://pypi.org/project/torchnep/"><img src="https://img.shields.io/pypi/pyversions/torchnep?logo=python&logoColor=white" alt="Python"></a>
   <a href="https://github.com/mushroomfire/torchnep/actions/workflows/test.yml"><img src="https://github.com/mushroomfire/torchnep/actions/workflows/test.yml/badge.svg" alt="Tests"></a>
+  <a href="https://codecov.io/gh/mushroomfire/torchnep"><img src="https://codecov.io/gh/mushroomfire/torchnep/graph/badge.svg" alt="Coverage"></a>
   <a href="https://mushroomfire.github.io/torchnep/"><img src="https://img.shields.io/badge/docs-online-18202C" alt="Documentation"></a>
   <a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/license-GPLv3-blue" alt="License: GPL v3"></a>
   <a href="https://pypi.org/project/torchnep/"><img src="https://img.shields.io/pypi/dm/torchnep" alt="Downloads"></a>
@@ -58,6 +59,16 @@ train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
 ```
 
 The best model is written to `output/nep_best.txt`. The [documentation](https://mushroomfire.github.io/torchnep/) covers `nep.in`, the training data format, multi-GPU training, restart and fine-tuning, prediction, the ASE calculator, plotting and active learning.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest                        # GPU-only tests run when a GPU is present
+TORCHNEP_TEST_DDP=1 pytest    # also the multi-process (DDP) tests
+```
+
+The coverage badge is the CPU run in CI, multi-process tests included. On GPUs — 2 × NVIDIA GH200 with the multi-GPU tests on — 267 tests pass and cover **86 %** of the code; the one skipped test needs an Apple GPU (1.0.7a1, September 2026).
 
 ## Building the documentation
 
