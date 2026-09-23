@@ -113,11 +113,15 @@ def _parse_frame_block(block, energy_key="energy"):
 
 
 def _split_frames(lines):
-    """Split an XYZ text into per-frame line blocks."""
+    """Split an XYZ text into per-frame line blocks (stray blank lines between
+    frames are skipped, as in :func:`index_xyz`)."""
     blocks = []
     i = 0
     n = len(lines)
     while i < n:
+        if not lines[i].strip():
+            i += 1
+            continue
         natoms = int(lines[i].strip())
         end = i + 2 + natoms
         blocks.append(lines[i:end])

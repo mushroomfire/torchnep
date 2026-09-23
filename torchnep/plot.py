@@ -135,15 +135,20 @@ def exclude_frames(d, exclude, natoms):
 
 def stage2_epoch(path="."):
     """Epoch at which stage 2 started, from ``output.log`` ("Stage 2 from
-    epoch N") or ``nep.in`` (``start_stage2``, else half of ``epoch`` when
-    ``stage2 1``) in ``path``; None when not found / no stage 2."""
+    epoch N", or "starting stage 2 at epoch N" when stage 1 stopped early;
+    the last one wins) or ``nep.in`` (``start_stage2``, else half of
+    ``epoch`` when ``stage2 1``) in ``path``; None when not found / no
+    stage 2."""
     log = os.path.join(path, "output.log")
     if os.path.exists(log):
+        found = None
         with open(log, errors="replace") as fh:
             for line in fh:
-                m = re.search(r"Stage 2 from epoch (\d+)", line)
+                m = re.search(r"(?:Stage 2 from|starting stage 2 at) epoch (\d+)", line)
                 if m:
-                    return int(m.group(1))
+                    found = int(m.group(1))
+        if found is not None:
+            return found
     nep_in = os.path.join(path, "nep.in")
     if os.path.exists(nep_in):
         kv = {}
@@ -168,6 +173,8 @@ def frame_meta(xyz):
             line = fh.readline()
             if not line:
                 break
+            if not line.strip():                  # stray blank line between frames
+                continue
             n = int(line)
             hdr = fh.readline()
             m = re.search(r"config_type=(\S+)", hdr)
