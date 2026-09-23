@@ -49,4 +49,14 @@ python -c "import torch, torchnep; print(torchnep.__version__, torch.cuda.is_ava
 `torch.cuda.is_available()` is also `True` on AMD GPUs with a ROCm build of PyTorch.
 
 !!! tip "torch.compile"
-    On a GPU, training compiles its kernels with `torch.compile`, which needs Triton (shipped with the CUDA and ROCm builds of PyTorch). Without it TorchNEP falls back to eager mode and says so in the log.
+    On a GPU, training compiles its kernels with `torch.compile`, which needs Triton (shipped with the CUDA and ROCm builds of PyTorch) and a C compiler (below). Without them TorchNEP falls back to eager mode and says so in the log.
+
+## A C compiler on the GPU machine
+
+Triton builds a small C launcher the first time it runs on a machine and keeps it in `~/.triton/cache`. Since PyTorch 2.12, some built-in CUDA operations run through Triton even without `torch.compile`, so the GPU machine needs a C compiler at least once. Cluster compute nodes often have none. Load one in the job script before Python starts:
+
+```bash
+module load gcc          # or: export CC=/path/to/gcc CXX=/path/to/g++
+```
+
+Without one, TorchNEP warns at start-up, runs those operations with the regular CUDA kernels and keeps `torch.compile` off. Training and prediction still work, only without the compiled speed-up.
