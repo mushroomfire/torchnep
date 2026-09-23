@@ -68,7 +68,7 @@ pytest                        # GPU-only tests run when a GPU is present
 TORCHNEP_TEST_DDP=1 pytest    # also the multi-process (DDP) tests
 ```
 
-The coverage badge is the CPU run in CI, multi-process tests included. On GPUs — 2 × NVIDIA GH200 with the multi-GPU tests on — 267 tests pass and cover **86 %** of the code; the one skipped test needs an Apple GPU (1.0.7a1, September 2026).
+The coverage badge is the CPU run in CI, multi-process tests included. On GPUs — 2 × NVIDIA GH200 with the multi-GPU tests on — 298 tests pass and cover **92 %** of the code; the one skipped test needs an Apple GPU (1.0.7a1, September 2026).
 
 ## Building the documentation
 
