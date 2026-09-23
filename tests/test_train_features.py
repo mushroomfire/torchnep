@@ -182,6 +182,42 @@ def test_resume_after_a_kill_between_checkpoints(tmp_path):
                                np.loadtxt(straight / "loss.out", ndmin=2), rtol=1e-12, atol=0)
 
 
+def _nan_force_in_every_frame(xyz):
+    """Set f_z of the first atom of every frame to nan (every batch then has a
+    non-finite loss and gradient)."""
+    lines, i = open(xyz).read().splitlines(), 0
+    while i < len(lines):
+        n = int(lines[i])
+        parts = lines[i + 2].split()
+        parts[-1] = "nan"
+        lines[i + 2] = " ".join(parts)
+        i += n + 2
+    open(xyz, "w").write("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_non_finite_gradient_steps_are_skipped(tmp_path, device):
+    """A step whose gradient is not finite must leave the model untouched and
+    be reported. With a nan label in every frame every step is bad, so the
+    run must end with the initial weights: its forces (independent of the
+    energy offset) equal those of a run on clean data with lr 0. CPU checks
+    the synchronous guard, CUDA the host-sync-free one (fused Adam)."""
+    _, xyz = _write_run_files(tmp_path, n_frames=16)
+    clean = tmp_path / "clean.xyz"
+    clean.write_text(open(xyz).read())
+    _nan_force_in_every_frame(xyz)
+    (tmp_path / "bad.in").write_text(NEP_IN + "epoch 2\nbatch 8\nstage2 0\n")
+    (tmp_path / "frozen.in").write_text(NEP_IN + "epoch 2\nbatch 8\nstage2 0\nlr 0\n")
+    kw = dict(run_seed=0, device=device, print_interval=1)
+    _train(str(tmp_path / "bad.in"), xyz, tmp_path / "bad", **kw)
+    _train(str(tmp_path / "frozen.in"), str(clean), tmp_path / "frozen", **kw)
+    log = (tmp_path / "bad" / "output.log").read_text()
+    assert log.count("2 step(s) skipped this epoch (non-finite gradient norm)") == 2
+    frame = read_xyz(str(clean))[0]
+    torch.testing.assert_close(_forces(tmp_path / "bad" / "nep_final.txt", frame),
+                               _forces(tmp_path / "frozen" / "nep_final.txt", frame), rtol=1e-10, atol=1e-10)
+
+
 def test_random_validation_split_and_unknown_strategy(tmp_path):
     """The random split held out by train_nep is the one export_valid_split
     writes to test.xyz (same frames, same order), so a GPUMD run on the

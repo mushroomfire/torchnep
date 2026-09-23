@@ -48,7 +48,7 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded, _dist_timeout
 from ._runtime import ensure_triton_runtime
-from .model import slim_model
+from .model import slim_model, slim_config
 from .train import (
     _BANNER, _AUTHOR, _metric_dtype,
     _backend_info, StreamDataStore, iter_collated,
@@ -558,9 +558,7 @@ def train_nep_sharded(
                        if t not in keep]
             if removed:
                 _slim_keep = keep
-                config = dict(orig_config)
-                config["type_names"] = keep
-                config["num_types"] = len(keep)
+                config = slim_config(orig_config, keep)
                 _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                      f"(removing: {removed})")
             else:
@@ -659,9 +657,7 @@ def train_nep_sharded(
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
             _slim_keep = keep
-            config = dict(orig_config)
-            config["type_names"] = keep
-            config["num_types"] = len(keep)
+            config = slim_config(orig_config, keep)
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -1371,7 +1367,9 @@ def train_nep_sharded(
                     # lock-step hazard); the async flag keeps every rank
                     # stepping, so collectives always stay aligned.
                     bad = (~torch.isfinite(gn_t)).to(dtype)
-                    optimizer.found_inf = bad
+                    # fused Adam takes a float32 flag whatever the parameter
+                    # dtype (a float64 one fails in every float64 run)
+                    optimizer.found_inf = bad.to(torch.float32)
                     optimizer.step()
                     n_bad_t += bad
                     ok_f = (1.0 - bad).to(torch.float64)
@@ -1379,6 +1377,7 @@ def train_nep_sharded(
                     gn = float(gn_t)
                     if not np.isfinite(gn):
                         optimizer.zero_grad(set_to_none=True)
+                        n_bad_t += 1
                         continue
                     optimizer.step()
                     ok_f = 1.0

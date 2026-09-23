@@ -166,6 +166,75 @@ def test_finetune_with_slim_types_and_random_split(tmp_path):
     torch.testing.assert_close(got[1], got[0], rtol=1e-10, atol=1e-10)
 
 
+@pytest.mark.parametrize("key", ["zbl_in", "per_species_cutoff"])
+@pytest.mark.parametrize("streamed", [False, True], ids=["in_memory", "streamed"])
+def test_finetune_slim_types_with_zbl_table_and_species_cutoffs(tmp_path, key, streamed):
+    """slim_types in the sharded trainer (both loaders pick the kept types
+    their own way) on models whose per-type data must follow the kept types:
+    a zbl.in pair table, per-species cutoffs with typewise ZBL. lr 0: forces
+    and virials of the slimmed model equal the parent's."""
+    from test_slim import MODELS, _compressed, _efv, _nep_in, _without_co, _write_xyz
+    from torchnep.data import read_xyz
+    xyz = tmp_path / "noco.xyz"
+    _write_xyz(xyz, _without_co(read_xyz(str(XYZ))[:16]))
+    nepin = _nep_in(tmp_path, key, "epoch 1\nbatch 4\nlr 0\nstage2 0\n")
+    env = {"TORCHNEP_STREAM_THRESHOLD": "0"} if streamed else None
+    log = _run(tmp_path, str(nepin), str(xyz), tmp_path / "out", env=env, restart=False, run_seed=0,
+               slim_types=True, finetune_from=str(DATA_DIR / MODELS[key][0]))
+    assert "[3 -> 2 types]" in log and ("streamed shard loading" in log) == streamed
+    frames = _compressed()
+    got, ref = _efv(tmp_path / "out" / "nep_final.txt", frames), _efv(DATA_DIR / MODELS[key][0], frames)
+    for a, b in zip(got[1:], ref[1:]):
+        np.testing.assert_allclose(a, b, rtol=1e-10, atol=1e-10)
+
+
+def test_finished_run_resume_and_finetune_from_checkpoint(tmp_path):
+    """Without a validation set: resuming a finished run (no epochs left)
+    leaves nep_final.txt as it was (its exact b1 is re-solved from the same
+    all-reduced pass). Fine-tuning from that run's checkpoint.pt with
+    recompute_q_scaler sets the scaler to 1 / (max - min) of the loaded
+    model's descriptors on the new data."""
+    from torchnep.data import read_xyz
+    from torchnep.nep import NEPCalculator
+    xyz = _frames(tmp_path / "train.xyz", 0, 16)
+    parent = tmp_path / "parent"
+    nepin = _nep_in(tmp_path / "nep.in", TYPES3, "epoch 2\nstage2 0\n")
+    _run(tmp_path, nepin, xyz, parent, restart=False, run_seed=3, checkpoint_interval=1)
+    final = (parent / "nep_final.txt").read_text()
+    _run(tmp_path, nepin, xyz, parent, restart=True, run_seed=3)
+    assert (parent / "nep_final.txt").read_text() == final
+    log = _run(tmp_path, _nep_in(tmp_path / "ft.in", TYPES3, "epoch 1\nlr 0\nstage2 0\n"), xyz,
+               tmp_path / "ft", restart=False, run_seed=3, recompute_q_scaler=True,
+               finetune_from=str(parent / "checkpoint.pt"))
+    assert "q_scaler: RECOMPUTED" in log
+    calc = NEPCalculator(str(parent / "nep_final.txt"))
+    q = np.concatenate([np.asarray(calc.get_descriptor(f["species"], f["positions"], f["cell"]))
+                        / calc.q_scaler.numpy() for f in read_xyz(xyz)])
+    np.testing.assert_allclose(NEPCalculator(str(tmp_path / "ft" / "nep_final.txt")).q_scaler.numpy(),
+                               1.0 / np.maximum(q.max(0) - q.min(0), 1e-10), rtol=1e-5)
+
+
+def test_non_finite_gradient_steps_are_skipped(tmp_path):
+    """Every rank skips a step whose (all-reduced) gradient is not finite and
+    the skips are reported; with a nan label in every frame no step applies,
+    so the forces equal those of an lr-0 run on the clean data."""
+    from test_train_features import _nan_force_in_every_frame
+    from torchnep.data import read_xyz
+    from torchnep.nep import NEPCalculator
+    clean = _frames(tmp_path / "clean.xyz", 0, 16)
+    bad = _frames(tmp_path / "bad.xyz", 0, 16)
+    _nan_force_in_every_frame(bad)
+    log = _run(tmp_path, _nep_in(tmp_path / "bad.in", TYPES3, "epoch 2\nstage2 0\n"), bad,
+               tmp_path / "bad", restart=False, run_seed=6)
+    _run(tmp_path, _nep_in(tmp_path / "frozen.in", TYPES3, "epoch 2\nstage2 0\nlr 0\n"), clean,
+         tmp_path / "frozen", restart=False, run_seed=6)
+    assert log.count("2 step(s) skipped this epoch") == 2
+    f = read_xyz(clean)[0]
+    got = [NEPCalculator(str(tmp_path / d / "nep_final.txt")).compute(f["species"], f["positions"], f["cell"])["forces"]
+           for d in ("bad", "frozen")]
+    torch.testing.assert_close(got[0], got[1], rtol=1e-10, atol=1e-10)
+
+
 def test_early_stop_jumps_to_stage2_then_stops(tmp_path):
     """With frozen weights (lr 0 in both stages) the loss plateaus: stage 1 hands
     over to stage 2 early, stage 2 then stops early, long before `epoch`."""

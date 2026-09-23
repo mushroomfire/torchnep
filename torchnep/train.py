@@ -40,7 +40,7 @@ from datetime import datetime
 from typing import List, Dict
 from torch.optim.swa_utils import AveragedModel
 
-from .model import NEPModel, slim_model, gpumd_init_parameters
+from .model import NEPModel, slim_model, slim_config, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices, build_neighbor_list_np,
                    build_neighbor_list_np_ex, wrap_positions,
@@ -2050,9 +2050,7 @@ def train_nep(
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
             _slim_keep = keep
-            config = dict(orig_config)
-            config["type_names"] = keep
-            config["num_types"] = len(keep)
+            config = slim_config(orig_config, keep)
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -2637,7 +2635,9 @@ def train_nep(
                     # still averages the (unchanged) weights, and that
                     # step's metrics are excluded via the same flag.
                     bad = (~torch.isfinite(gn_t)).to(dtype)
-                    optimizer.found_inf = bad
+                    # fused Adam takes a float32 flag whatever the parameter
+                    # dtype (a float64 one fails in every float64 run)
+                    optimizer.found_inf = bad.to(torch.float32)
                     optimizer.step()
                     n_bad_t += bad
                     ok_f = (1.0 - bad).to(torch.float64)
@@ -2645,6 +2645,7 @@ def train_nep(
                     gn = float(gn_t)
                     if not np.isfinite(gn):
                         optimizer.zero_grad(set_to_none=True)
+                        n_bad_t += 1
                         continue
                     optimizer.step()
                     ok_f = 1.0
