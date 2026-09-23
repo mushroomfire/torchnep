@@ -48,6 +48,7 @@ from .data import (read_xyz, parse_nep_in, valid_split_indices,
 from . import ops
 from . import __version__
 from .predict import predict_from_store
+from ._runtime import ensure_triton_runtime
 
 
 # ---------------------------------------------------------------------------
@@ -1763,11 +1764,14 @@ def _compile_check(dev):
     """Decide whether torch.compile can be used; never raises.
 
     Returns (ok: bool, msg: str). The CUDA backend (TorchInductor) lowers to
-    Triton kernels, so Triton must be importable — this is the usual failure
-    mode on a cluster compute node. On CPU, Inductor uses the C++ backend and
-    needs no Triton. ``msg`` is a short reason when ``ok`` is False, so callers
-    can log a warning and fall back to eager instead of crashing mid-training.
+    Triton kernels, so Triton must be importable AND able to build its C
+    launcher, and Inductor also builds C++ for the CPU parts of a graph —
+    compute nodes without a compiler are the usual failure mode on a cluster.
+    On CPU, Inductor uses the C++ backend and needs no Triton. ``msg`` is a
+    short reason when ``ok`` is False, so callers can log a warning and fall
+    back to eager instead of crashing mid-training.
     """
+    from ._runtime import cxx_compiler_found, triton_runtime_ok
     if not hasattr(torch, "compile"):
         return False, "torch.compile is unavailable in this PyTorch build"
     if dev.type == "cuda":
@@ -1776,12 +1780,13 @@ def _compile_check(dev):
             return False, ("Triton not found (the CUDA TorchInductor backend "
                            "needs it) — install triton, or set "
                            "use_compile=False to silence this")
-    else:
-        # CPU Inductor generates and builds C++ — needs a compiler.
-        import shutil
-        if not any(shutil.which(c) for c in ("g++", "clang++", "c++")):
-            return False, ("no C++ compiler found (the CPU TorchInductor "
-                           "backend needs one) — falling back to eager")
+        ok, reason = triton_runtime_ok()
+        if not ok:
+            return False, (f"Triton cannot launch kernels ({reason}) — load a "
+                           "compiler or set CC/CXX")
+    if not cxx_compiler_found():
+        return False, ("no C++ compiler found (TorchInductor builds C++; set "
+                       "CXX or load a compiler) — falling back to eager")
     return True, ""
 
 
@@ -1938,6 +1943,7 @@ def train_nep(
         _log(line)
     _log(f"Precision: {precision}")
     _maybe_enable_tf32(dev, dtype, _log)
+    ensure_triton_runtime(dev, _log)     # before the first CUDA kernel, see torchnep/_runtime.py
     _log("")
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
