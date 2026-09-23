@@ -1,5 +1,10 @@
 # Release Notes
 
+## 1.0.7a1
+
+- **GPU machines without a C compiler**: PyTorch 2.12+ runs some built-in CUDA operations through Triton even without `torch.compile`, and Triton needs a C compiler the first time it runs on a machine. TorchNEP now checks this at start-up: it warns, runs those operations with the regular CUDA kernels and keeps `torch.compile` off, instead of failing in the middle of training. See [Installation](getting-started/installation.md#a-c-compiler-on-the-gpu-machine).
+- **Training on Apple GPUs (MPS) works again**; it had failed at the first epoch since 1.0.2.
+
 ## 1.0.6
 
 - **Extrapolation grade** (`torchnep.extrapolation`): pick new training structures with one model instead of a committee, with multi-GPU variants and export to GPUMD's `compute_extrapolation`. See the [guide](https://mushroomfire.github.io/torchnep/guide/extrapolation/).

@@ -47,6 +47,7 @@ from .data import (read_xyz, parse_nep_in, valid_split_indices,
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded, _dist_timeout
+from ._runtime import ensure_triton_runtime
 from .model import slim_model
 from .train import (
     _BANNER, _AUTHOR, _metric_dtype,
@@ -414,6 +415,7 @@ def train_nep_sharded(
         _log(line)
     _log(f"Precision: {precision}")
     _maybe_enable_tf32(dev, dtype, _log)   # sets the flag on every rank
+    ensure_triton_runtime(dev, _log)       # every rank; the message only on rank 0
     _log(f"Mode     : data-sharded DDP ({world_size} ranks, "
          f"each holds 1/{world_size} of structures)")
     _log("")

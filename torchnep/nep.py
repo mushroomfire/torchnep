@@ -30,6 +30,7 @@ from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
 from .data import cutoff_pair_table
 from .neighbor import build_neighbor_list, CellList
 from . import ops
+from ._runtime import ensure_triton_runtime
 
 
 def _available_memory_bytes(device: torch.device) -> int:
@@ -93,6 +94,7 @@ class NEPCalculator:
     def __init__(self, model_file: str, dtype=torch.float64, device="cpu"):
         self.dtype = dtype
         self.device = torch.device(device)
+        ensure_triton_runtime(self.device)   # no-op off CUDA; see torchnep/_runtime.py
         self._load_model(model_file)
 
     def cutoff_args(self):
@@ -669,6 +671,8 @@ class NEPCalculator:
             warnings.warn("torch.compile is unsupported on MPS; running eager.",
                           RuntimeWarning)
             compile = False
+        if compile and not ensure_triton_runtime(self.device):
+            compile = False     # Triton cannot run here; already warned when the calculator was built
         if compile:
             # bmm backend is compile-friendly (no per-type Python loop). Compile
             # once and cache on the instance so MD steps reuse the dynamic graph.
