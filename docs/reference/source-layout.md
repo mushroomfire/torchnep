@@ -11,7 +11,9 @@
 | `predict.py` | Streamed, batched full-dataset prediction. |
 | `train.py` | Single-device training: streaming data store, two-stage loop, schedulers, checkpoints. |
 | `train_sharded.py` | Data-parallel multi-GPU / multi-node training. |
+| `extrapolation.py` | Extrapolation grade: `build_active_set`, `compute_gamma`, `select_structures` (and `_sharded` variants); `ActiveSet.save_gpumd` exports the set for GPUMD's `compute_extrapolation`. |
 | `compiled_autograd.py` | `torch.compile` support for autograd forces. |
+| `_runtime.py` | Start-up check for a C compiler on GPU machines; falls back to plain CUDA kernels and keeps `torch.compile` off without one. |
 | `ase_calculator.py` | The ASE calculator `NEP`. |
 | `plot.py` | `NEPPlotter` and the readers of the output files. |
 | `constants.py` | Element table, covalent radii, NEP polynomial coefficients. |
