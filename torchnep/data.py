@@ -384,6 +384,19 @@ def validate_cutoffs(config, where="nep.in"):
                          f"neighbor list, so pairs beyond it would be lost")
 
 
+# Every keyword nep.in may contain. Anything else — a typo, or a GPUMD-only
+# keyword such as lambda_1 / population / generation — is an error: a keyword
+# that is silently dropped would leave its setting at the default unnoticed.
+NEP_IN_KEYWORDS = (
+    "type", "version", "zbl", "use_typewise_cutoff_zbl", "cutoff", "n_max",
+    "basis_size", "l_max", "neuron", "lambda_e", "lambda_f", "lambda_v",
+    "weight_decay", "batch", "epoch", "lr", "scheduler_patience", "early_stop",
+    "scheduler_factor", "stop_lr", "lr_scheduler", "max_grad_norm", "stage2",
+    "start_stage2", "stage2_lr", "stage2_lambda_e", "stage2_lambda_f",
+    "stage2_lambda_v", "stage2_scheduler_patience", "stage2_scheduler_factor",
+)
+
+
 def parse_nep_in(filename: str) -> Dict:
     """Parse nep.in parameter file.
 
@@ -400,13 +413,17 @@ def parse_nep_in(filename: str) -> Dict:
     params = {}
 
     with open(filename) as f:
-        for line in f:
+        for lineno, line in enumerate(f, 1):
             line = line.split("#")[0].strip()
             if not line:
                 continue
 
             parts = line.split()
             key = parts[0].lower()
+            if key not in NEP_IN_KEYWORDS:
+                raise ValueError(
+                    f"{filename}, line {lineno}: unknown keyword {parts[0]!r}. nep.in takes "
+                    f"only these keywords: {', '.join(NEP_IN_KEYWORDS)}")
 
             if key == "type":
                 params["num_types"] = int(parts[1])
@@ -482,12 +499,6 @@ def parse_nep_in(filename: str) -> Dict:
                 params["weight_decay"] = float(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
-            elif key == "save_potential":
-                params["save_interval"] = int(parts[1])
-                if len(parts) > 2:
-                    params["save_start"] = int(parts[2])
-                if len(parts) > 3:
-                    params["save_count"] = int(parts[3])
             # --- torchnep training parameters ---
             elif key == "epoch":
                 params["num_epochs"] = int(parts[1])

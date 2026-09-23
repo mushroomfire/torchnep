@@ -1,6 +1,6 @@
 # nep.in reference
 
-`nep.in` sets the model architecture and the training hyperparameters, one keyword per line (`#` starts a comment). The architecture keywords follow GPUMD, so a GPUMD `nep.in` describes the same model. Keywords TorchNEP does not use (e.g. `lambda_1`, `population`, `generation`) are ignored.
+`nep.in` sets the model architecture and the training hyperparameters, one keyword per line (`#` starts a comment). The architecture keywords follow GPUMD, so a GPUMD `nep.in` describes the same model once its GPUMD-only lines (`lambda_1`, `population`, `generation`, …) are removed. Only the keywords listed on this page are accepted: any other one — a typo included — stops the run with an error that names it and its line.
 
 ```text title="nep.in"
 type       3 Cr Co Ni
