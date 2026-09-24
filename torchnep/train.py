@@ -393,6 +393,9 @@ class StreamDataStore:
         self.has_energy_flag = ["energy" in s for s in structures]
         self.has_forces_flag = ["forces" in s for s in structures]
         self.has_virial_flag = ["virial" in s for s in structures]
+        # per-frame weight of the training objective (weight= in the xyz,
+        # default 1; see data._parse_comment). Reported errors are unweighted.
+        self.weight = [float(s.get("weight", 1.0)) for s in structures]
 
         np_dtype = np.float32 if dtype == torch.float32 else np.float64
         f_parts = []
@@ -440,6 +443,7 @@ class StreamDataStore:
         self._f_flag_t = torch.tensor(self.has_forces_flag, dtype=torch.bool)
         self._v_flag_t = torch.tensor(self.has_virial_flag, dtype=torch.bool)
         self._energy_t = torch.tensor(self.energy, dtype=dtype)
+        self._w_t = torch.tensor(self.weight, dtype=dtype)
         self._nat_t = torch.from_numpy(self._nat)
 
         self.n_energy = sum(self.has_energy_flag)
@@ -693,6 +697,7 @@ class StreamDataStore:
                     out["dev_event"] = ev
         out.update({
             "energy": _stage(self._energy_t[idx_t]),
+            "weight": _stage(self._w_t[idx_t]),
             "natoms": _stage(self._nat_t[idx_t].to(self.dtype)),
             "energy_mask": _stage(self._e_flag_t[idx_t]),
             "forces": _stage(self._cat(self._f_all, idx, self._nat_cum)),
@@ -711,7 +716,7 @@ class StreamDataStore:
         })
         return out
 
-    _COMMON_KEYS = ("atom_types", "struct_idx", "energy", "natoms",
+    _COMMON_KEYS = ("atom_types", "struct_idx", "energy", "weight", "natoms",
                     "energy_mask", "forces", "force_mask", "virial",
                     "virial_mask", "volumes")
     _MODE_KEYS = {
@@ -959,6 +964,8 @@ def _preprocess_one_frame(args):
             s["pair_i_ang"] = s["pair_i_rad"][:n_ang]      # views, no copy
     if "energy" in frame:
         s["energy"] = frame["energy"]
+    if "weight" in frame:
+        s["weight"] = frame["weight"]
     if "forces" in frame:
         s["forces"] = frame["forces"].astype(dtype)
     if "virial" in frame:
@@ -1262,9 +1269,10 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     (current) mean per-atom residual, and since the predicted energy already
     contains ``b1`` it is an additive correction
 
-        b1 <- b1 + mean_over_energy_structs(E_pred/Na - E_ref/Na).
+        b1 <- b1 + mean_over_energy_structs(E_pred/Na - E_ref/Na),
 
-    This mirrors GPUMD, which recomputes the energy shift every generation so
+    the mean weighted by the frames' ``weight`` (the optimum of the weighted
+    objective). This mirrors GPUMD, which recomputes the energy shift every generation so
     the energy loss is offset-free and the overall level cannot drift.
     Returns the new b1 value (float).
     """
@@ -1273,7 +1281,7 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     dev = raw_model.b1.device
     dtype = raw_model.b1.dtype
     num = torch.zeros((), dtype=dtype, device=dev)
-    den = 0
+    den = torch.zeros((), dtype=dtype, device=dev)
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
         batch = data_store.collate(list(range(start, end)))
@@ -1285,9 +1293,10 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
         e_pa_pred = res["Etot"] / batch["natoms"]
         e_pa_ref = batch["energy"] / batch["natoms"]
         diff = (e_pa_pred - e_pa_ref)[e_mask]
-        num = num + diff.sum()
-        den += int(e_mask.sum().item())
-    if den > 0:
+        w = batch["weight"][e_mask].to(diff.device)
+        num = num + (w * diff).sum()
+        den = den + w.sum()
+    if float(den) > 0:
         raw_model.b1.add_(num / den)
     if was_training:
         raw_model.train()
@@ -1509,19 +1518,23 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
-    callers can finish the per-sample averaging themselves — the DDP path
-    all-reduces these numbers across ranks first, which makes the aggregated
-    loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
-    to the single-GPU result. ``sum_ls`` is the stress squared-error sum in
-    (eV/Å³)² (same normalisation as the train-loop accumulator).
-    ``sum_e_resid`` (Σ signed per-atom energy residual) lets the caller solve
-    the exact optimal energy offset b1 for these frozen weights in this same
-    pass: δ = sum_e_resid / n_e, and the offset-corrected energy MSE is
-    sum_le/n_e − δ².
+    Returns 12 sums so callers can finish the averaging
+    themselves (``_loss_from_sums``) — the DDP path all-reduces them across
+    ranks first, which makes the aggregated loss EXACTLY the full-dataset
+    value (a sum of per-shard sums), identical to the single-GPU result.
+
+    - ``sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v``: unweighted squared
+      errors and label counts — the reported RMSEs (``sum_ls`` is the stress
+      squared-error sum in (eV/Å³)², same normalisation as the train loop).
+    - ``sum_e_resid, sum_w_e``: Σ w·r and Σ w of the per-atom energy
+      residual r, for the exact optimal energy offset of these frozen
+      weights: δ = sum_e_resid / sum_w_e.
+    - ``wsum_le, wsum_lf, wsum_lv``: the frame-weighted squared errors of
+      the objective (averaged over the same label counts).
     """
     sum_le = sum_lf = sum_lv = sum_ls = 0.0
-    sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
+    sum_e_resid = sum_w_e = 0.0      # Σ w·r, Σ w (for the exact b1)
+    wsum_le = wsum_lf = wsum_lv = 0.0
     n_e = n_f = n_v = 0
 
     was_training = raw_model.training
@@ -1554,15 +1567,21 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                     e_pa_pred = result["Etot"] / batch["natoms"]
                     e_pa_ref = batch["energy"] / batch["natoms"]
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
+                    w_e = batch["weight"][e_mask]
                     sum_le += (diff_e ** 2).sum().item()
-                    sum_e_resid += diff_e.sum().item()
+                    wsum_le += (w_e * diff_e ** 2).sum().item()
+                    sum_e_resid += (w_e * diff_e).sum().item()
+                    sum_w_e += w_e.sum().item()
                     n_e += int(e_mask.sum().item())
 
                 if has_forces:
                     f_mask = batch["force_mask"]
                     if f_mask.any():
                         f_diff = result["forces"][f_mask] - batch["forces"][f_mask]
-                        sum_lf += (f_diff ** 2).mean(dim=1).sum().item()
+                        w_f = batch["weight"][batch["struct_idx"]][f_mask]
+                        f_err = (f_diff ** 2).mean(dim=1)
+                        sum_lf += f_err.sum().item()
+                        wsum_lf += (w_f * f_err).sum().item()
                         n_f += int(f_mask.sum().item())
 
                 if (has_virial and "virial" in result
@@ -1579,7 +1598,10 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         v_pred6 = v_sys[:, _VIRIAL_6]
                         v_ref6 = batch["virial"][:, _VIRIAL_6]
                         v_diff = (v_pred6[v_mask] - v_ref6[v_mask]) / na
-                        sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
+                        w_v = batch["weight"][v_mask]
+                        v_err = (v_diff ** 2).mean(dim=1)
+                        sum_lv += v_err.sum().item()
+                        wsum_lv += (w_v * v_err).sum().item()
                         # Stress (eV/A**3) = virial_per_atom * natoms / V.
                         s_scale = (batch["natoms"][v_mask]
                                    / batch["volumes"][v_mask]).unsqueeze(-1)
@@ -1590,7 +1612,34 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
+    return (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid, sum_w_e,
+            wsum_le, wsum_lf, wsum_lv)
+
+
+def _loss_from_sums(sums, pref_e, pref_f, pref_v, solve_b1=False):
+    """Objective, energy offset and reported errors from the (possibly
+    all-reduced) sums of ``_accumulate_true_loss_sums``.
+
+    The objective averages the frame-weighted squared errors over the labels
+    (a frame with weight w counts about like w copies). With ``solve_b1`` its
+    energy term is taken at the exact optimal
+    offset ``b1 + delta``, delta = Σ w·r / Σ w, whose weighted mean square is
+    Σ w·r² / n − delta²·(Σ w / n). The RMSEs are the unweighted physical
+    errors at the current b1.
+
+    Returns (loss, delta, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
+    """
+    from .constants import EV_PER_A3_TO_GPa
+    (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid, sum_w_e,
+     wsum_le, wsum_lf, wsum_lv) = sums
+    delta = sum_e_resid / sum_w_e if solve_b1 and sum_w_e > 0 else 0.0
+    ne = max(n_e, 1)
+    # Clamp tiny negatives from float round-off.
+    mse_e = max(0.0, wsum_le / ne - delta * delta * (sum_w_e / ne))
+    loss = (pref_e * mse_e + pref_f * (wsum_lf / max(n_f, 1))
+            + pref_v * (wsum_lv / max(n_v, 1)))
+    return (loss, delta, np.sqrt(sum_le / max(n_e, 1)), np.sqrt(sum_lf / max(n_f, 1)),
+            np.sqrt(sum_lv / max(n_v, 1)), np.sqrt(sum_ls / max(n_v, 1)) * EV_PER_A3_TO_GPa)
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
@@ -1604,7 +1653,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     best-save block in the epoch loop).
 
     The loss is that of the exact optimal energy offset for these frozen
-    weights, ``b1 + delta`` (delta = sum_e_resid / n_e). ``b1`` itself is left
+    weights, ``b1 + delta`` (see ``_loss_from_sums``). ``b1`` itself is left
     alone: the caller saves the candidate under ``_b1_shifted(raw_model,
     delta)``, so every candidate (the final epoch always among them) is judged
     AND saved with its own exact b1 — which keeps nep_best <= nep_final —
@@ -1612,25 +1661,15 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     evaluated (a run extended from its checkpoint then retraces the longer
     run exactly).
 
-    Returns (true_loss, rmse_e, rmse_f, rmse_v, delta) — energy terms
-    offset-corrected.
+    Returns (true_loss, delta).
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
-        _accumulate_true_loss_sums(
-            data_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
-    # Exact optimal b1 shift for these frozen weights, solved from this same pass.
-    delta = sum_e_resid / n_e if n_e > 0 else 0.0
-    # Offset-corrected energy MSE = Var(residual) = E[r²] − δ². Clamp tiny
-    # negatives from float round-off.
-    mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
-    mse_f = sum_lf / max(n_f, 1)
-    mse_v = sum_lv / max(n_v, 1)
-    true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v), delta
+    sums = _accumulate_true_loss_sums(
+        data_store, batch_size, raw_model, compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    true_loss, delta = _loss_from_sums(sums, pref_e, pref_f, pref_v, solve_b1=True)[:2]
+    return true_loss, delta
 
 
 @contextlib.contextmanager
@@ -1658,25 +1697,18 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
     offset is fitted on training data only (the analytical b1 update in the
     epoch loop) — re-fitting it on validation energies would leak validation
     information into the saved model. Energy MSE is therefore the plain
-    residual mean square with the current (train-fitted) b1.
+    residual mean square with the current (train-fitted) b1. The loss is
+    frame-weighted like the training objective, the RMSEs are not.
 
     Returns (valid_loss, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
     """
-    from .constants import EV_PER_A3_TO_GPa
     has_forces = valid_store.has_forces and pref_f > 0
     has_virial = valid_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
-        _accumulate_true_loss_sums(
-            valid_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
-    mse_e = sum_le / max(n_e, 1)
-    mse_f = sum_lf / max(n_f, 1)
-    mse_v = sum_lv / max(n_v, 1)
-    mse_s = sum_ls / max(n_v, 1)
-    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
-            np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
+    sums = _accumulate_true_loss_sums(
+        valid_store, batch_size, raw_model, compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    valid_loss, _, *rmse = _loss_from_sums(sums, pref_e, pref_f, pref_v)
+    return (valid_loss, *rmse)
 
 
 def _quiet_compile_logs():
@@ -2178,9 +2210,11 @@ def train_nep(
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
-        mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
-                            for i in range(data_store.n)
-                            if data_store.has_energy_flag[i]])
+        # frame-weighted mean energy per atom
+        e_idx = [i for i in range(data_store.n) if data_store.has_energy_flag[i]]
+        epa = np.array([data_store.energy[i] / data_store.natoms[i] for i in e_idx])
+        w_e = np.array([data_store.weight[i] for i in e_idx])
+        mean_epa = np.average(epa, weights=w_e)
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
@@ -2465,7 +2499,7 @@ def train_nep(
             # pipeline (the CPU must run a full step ahead of the GPU for
             # the streamed collate + kernel launches to hide).
             # Layout: [sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, resid]
-            acc = torch.zeros(8, dtype=_metric_dtype(dev), device=dev)
+            acc = torch.zeros(12, dtype=_metric_dtype(dev), device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -2569,22 +2603,34 @@ def train_nep(
                 # AFTER the one unavoidable sync (the grad-norm guard), where
                 # the reads are free. Same math as the old masked-select
                 # form: sum(d^2 * mask) / sum(mask) == mean over selected.
+                # Frame weights: every squared error counts w times, the mean
+                # still runs over the labels (w = 1 everywhere gives exactly
+                # the unweighted loss); the m_* metrics stay unweighted, the
+                # m_w* ones feed the epoch's objective.
                 m_le = m_resid = m_lf = m_lv = m_ls = None
+                m_we = m_wle = m_wlf = m_wlv = None
+                fw = batch["weight"]
                 if batch["has_e"]:
                     emf = batch["energy_mask"].to(dtype)
+                    ew = fw * emf
                     ne_b = emf.sum()
                     de = (e_pa_pred - e_pa_ref) * emf
-                    loss = loss + cur_pref_e * ((de ** 2).sum() / ne_b)
                     m_le = (de ** 2).sum()
-                    # Signed residual for the analytical b1 update (folded
+                    m_wle = (ew * de ** 2).sum()
+                    loss = loss + cur_pref_e * (m_wle / ne_b)
+                    # Weighted residual for the analytical b1 update (folded
                     # into this pass — no extra forward).
-                    m_resid = de.sum()
+                    m_resid = (ew * de).sum()
+                    m_we = ew.sum()
 
                 if has_forces and batch["has_f"]:
                     fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
+                    aw = fw[batch["struct_idx"]].unsqueeze(-1) * fmf
                     nf_b = fmf.sum()
                     df = (result["forces"] - batch["forces"]) * fmf
-                    loss = loss + cur_pref_f * ((df ** 2).sum() / (3.0 * nf_b))
+                    s_wf = (aw * df ** 2).sum()
+                    loss = loss + cur_pref_f * (s_wf / (3.0 * nf_b))
+                    m_wlf = s_wf / 3.0
                     m_lf = (df ** 2).sum() / 3.0
 
                 if (has_virial and "virial" in result and batch["has_v"]
@@ -2604,7 +2650,10 @@ def train_nep(
                     v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
                     v_pred_pa = _v_pred_pa(result)
                     dv = (v_pred_pa - v_ref_pa) * vmf
-                    loss = loss + cur_pref_v * ((dv ** 2).sum() / (6.0 * nv_b))
+                    vw = fw.unsqueeze(-1) * vmf
+                    s_wv = (vw * dv ** 2).sum()
+                    loss = loss + cur_pref_v * (s_wv / (6.0 * nv_b))
+                    m_wlv = s_wv / 6.0
                     m_lv = (dv ** 2).sum() / 6.0
                     # Stress RMSE (eV/A**3): convert the same diff using
                     # per-frame (natoms/volume). Sign cancels under MSE.
@@ -2670,6 +2719,10 @@ def train_nep(
                     (batch["virial_mask"].sum().to(acc.dtype)
                      if m_lv is not None else zero_acc),
                     m_resid.to(acc.dtype) if m_resid is not None else zero_acc,
+                    m_we.to(acc.dtype) if m_we is not None else zero_acc,
+                    m_wle.to(acc.dtype) if m_wle is not None else zero_acc,
+                    m_wlf.to(acc.dtype) if m_wlf is not None else zero_acc,
+                    m_wlv.to(acc.dtype) if m_wlv is not None else zero_acc,
                 ])
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
@@ -2682,7 +2735,7 @@ def train_nep(
             # One epoch-level fetch of every device accumulator (the only
             # metric sync of the epoch).
             (sum_le, sum_lf, sum_lv, sum_ls, n_e_f, n_f_f, n_v_f,
-             sum_e_resid) = acc.tolist()
+             sum_e_resid, sum_w_e, wsum_le, wsum_lf, wsum_lv) = acc.tolist()
             sum_e_structs = int(round(n_e_f))
             sum_f_atoms = int(round(n_f_f))
             sum_v_structs = int(round(n_v_f))
@@ -2693,24 +2746,29 @@ def train_nep(
                      f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
-            # absorbs this epoch's mean per-atom energy residual. Updated AFTER
-            # the batch loop but BEFORE the best-model eval / nep_best save, so
-            # the saved weights and offset stay consistent. ``b1`` is not a
-            # gradient parameter (see the optimizer exclusion above).
-            if sum_e_structs > 0:
+            # absorbs this epoch's weighted mean per-atom energy residual
+            # (Σ w·r / Σ w — the optimum of the weighted objective). Updated
+            # AFTER the batch loop but BEFORE the best-model eval / nep_best
+            # save, so the saved weights and offset stay consistent. ``b1`` is
+            # not a gradient parameter (see the optimizer exclusion above).
+            if sum_w_e > 0:
                 with torch.no_grad():
-                    raw_model.b1.add_(sum_e_resid / sum_e_structs)
+                    raw_model.b1.add_(sum_e_resid / sum_w_e)
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
-            # consistent with rmse_{e,f,v}: avg_loss == \Sigma pref_X * MSE_X
-            # where each MSE_X aggregates over all samples in the epoch.
+            # consistent with the epoch: avg_loss == \Sigma pref_X * MSE_X
+            # where each MSE_X aggregates over all samples in the epoch —
+            # frame-weighted like the objective; the RMSEs are unweighted.
             from .constants import EV_PER_A3_TO_GPa
             mse_e = sum_le / max(sum_e_structs, 1)
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
-            avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
-                        + cur_pref_v * mse_v)
+            wmse_e = wsum_le / max(sum_e_structs, 1)
+            wmse_f = wsum_lf / max(sum_f_atoms, 1) if wsum_lf > 0 else 0.0
+            wmse_v = wsum_lv / max(sum_v_structs, 1) if wsum_lv > 0 else 0.0
+            avg_loss = (cur_pref_e * wmse_e + cur_pref_f * wmse_f
+                        + cur_pref_v * wmse_v)
             # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
@@ -2837,7 +2895,7 @@ def train_nep(
                 if new_min:
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                t_loss, _te, _tf, _tv, final_b1_delta = _evaluate_true_loss(
+                t_loss, final_b1_delta = _evaluate_true_loss(
                     data_store, batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,

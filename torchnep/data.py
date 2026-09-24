@@ -203,6 +203,9 @@ def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
     return [_parse_frame_block(b, energy_key=energy_key) for b in blocks]
 
 
+MAX_FRAME_WEIGHT = 100.0       # upper bound of a frame's weight= (as in GPUMD)
+
+
 def _find_quoted(comment: str, key: str):
     """Return the content inside key="..." or None if absent.
 
@@ -226,7 +229,8 @@ def _find_scalar(comment: str, key: str):
 
     Matches ``key`` case-insensitively. Only returns a match when ``key=``
     is preceded by whitespace or start of string — prevents
-    ``atomization_energy=`` from matching ``energy=``.
+    ``atomization_energy=`` from matching ``energy=`` (and ``energy_weight=``
+    from matching ``weight=``). A quoted value (``key="1.5"``) is unquoted.
     """
     low = comment.lower()
     needle = key.lower() + "="
@@ -237,6 +241,9 @@ def _find_scalar(comment: str, key: str):
             return None
         if i == 0 or low[i - 1] in (" ", "\t"):
             i += len(needle)
+            if comment[i:i + 1] == '"':
+                j = comment.find('"', i + 1)
+                return comment[i + 1:j] if j >= 0 else comment[i + 1:]
             j = i
             while j < len(comment) and comment[j] not in (" ", "\t", '"'):
                 j += 1
@@ -276,6 +283,20 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
     e_val = _find_scalar(comment, energy_key)
     if e_val is not None:
         frame["energy"] = float(e_val)
+
+    # per-frame weight of the training objective (default 1): the frame's
+    # energy, force and virial squared errors count w times
+    w_val = _find_scalar(comment, "weight")
+    if w_val is not None:
+        try:
+            w = float(w_val)
+        except ValueError:
+            raise ValueError(f"weight must be a number, got {w_val!r}; "
+                             "comment: " + comment[:160]) from None
+        if not 0.0 < w <= MAX_FRAME_WEIGHT:
+            raise ValueError(f"weight must be in (0, {MAX_FRAME_WEIGHT:g}], got {w_val}; "
+                             "comment: " + comment[:160])
+        frame["weight"] = w
 
     vir_str = _find_quoted(comment, "virial")
     if vir_str is not None:

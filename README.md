@@ -67,7 +67,7 @@ pip install -e ".[dev]"
 TORCHNEP_TEST_DDP=1 pytest -n auto    # CPU; GPU-only tests are skipped
 ```
 
-The coverage badge is this CPU run in CI. On 2 × NVIDIA GH200 the full suite (326 tests, including GPU training with `torch.compile` and multi-GPU training) covers **94 %** of the code (September 2026). How to run it on your own GPU machine: [Running the test suite](https://mushroomfire.github.io/torchnep/getting-started/installation/#running-the-test-suite).
+The coverage badge is this CPU run in CI. On 2 × NVIDIA GH200 the full suite (339 tests, including GPU training with `torch.compile` and multi-GPU training) covers **94 %** of the code (September 2026). How to run it on your own GPU machine: [Running the test suite](https://mushroomfire.github.io/torchnep/getting-started/installation/#running-the-test-suite).
 
 ## Building the documentation
 
@@ -79,7 +79,7 @@ mkdocs serve    # preview at http://127.0.0.1:8000/torchnep/, reloaded on every 
 mkdocs build    # static site in site/
 ```
 
-The API reference is read from the source files, so TorchNEP itself does not need to be installed. MkDocs stays below 2.0, which the Material theme does not support.
+The API reference is read from the source files, so TorchNEP itself does not need to be installed. MkDocs stays below 2.0, which the Material theme does not support. Formulas (`$...$`, `$$...$$`) are rendered in the browser by MathJax, loaded from a CDN, so the preview needs an internet connection to show them; nothing else needs to be installed.
 
 ## Citation
 

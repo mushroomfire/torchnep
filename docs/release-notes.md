@@ -1,5 +1,10 @@
 # Release Notes
 
+## 1.0.7a2
+
+- **Frame weights**: `weight=w` on the comment line of the training (or validation) xyz makes a frame count `w` times in the loss — its energy, forces and virial — with `0 < w <= 100`, default 1. The reported errors stay unweighted. See [Frame weights](getting-started/training-data.md#frame-weights).
+- **Documentation**: a [NEP theory](getting-started/theory.md) chapter (the model, descriptor, ZBL, forces and how TorchNEP trains it) and the theory of the [extrapolation grade](guide/extrapolation.md#theory); formulas are now rendered on the site.
+
 ## 1.0.7a1
 
 - **GPU machines without a C compiler**: PyTorch 2.12+ runs some built-in CUDA operations through Triton even without `torch.compile`, and Triton needs a C compiler the first time it runs on a machine. TorchNEP now checks this at start-up: it warns, runs those operations with the regular CUDA kernels and keeps `torch.compile` off, instead of failing in the middle of training. See [Installation](getting-started/installation.md#a-c-compiler-on-the-gpu-machine).
