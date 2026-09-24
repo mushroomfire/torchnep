@@ -86,6 +86,6 @@ module load gcc                          # if the node has no C compiler (see ab
 TORCHNEP_TEST_DDP=1 pytest -rs           # one process: the GPU tests share the devices
 ```
 
-On 2 × NVIDIA GH200 this takes about 25 minutes (measured with coverage on) and runs every test but one (it needs an Apple GPU). With a single GPU the two-GPU tests are skipped; `-rs` lists every skipped test and why.
+On 2 × NVIDIA GH200 this takes about 30 minutes (measured with coverage on) and runs every test but one (it needs an Apple GPU). With a single GPU the two-GPU tests are skipped; `-rs` lists every skipped test and why.
 
 **Coverage.** Add `--cov=torchnep --cov-report=term-missing` to either command to see which lines the run did not reach.

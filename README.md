@@ -67,7 +67,7 @@ pip install -e ".[dev]"
 TORCHNEP_TEST_DDP=1 pytest -n auto    # CPU; GPU-only tests are skipped
 ```
 
-The coverage badge is this CPU run in CI. On 2 × NVIDIA GH200 the full suite (326 tests, including GPU training with `torch.compile` and multi-GPU training) covers **94 %** of the code (September 2026). How to run it on your own GPU machine: [Running the test suite](https://mushroomfire.github.io/torchnep/getting-started/installation/#running-the-test-suite).
+The coverage badge is this CPU run in CI. On 2 × NVIDIA GH200 the full suite (339 tests, including GPU training with `torch.compile` and multi-GPU training) covers **94 %** of the code (September 2026). How to run it on your own GPU machine: [Running the test suite](https://mushroomfire.github.io/torchnep/getting-started/installation/#running-the-test-suite).
 
 ## Building the documentation
 
