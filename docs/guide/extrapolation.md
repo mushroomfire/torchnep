@@ -105,6 +105,8 @@ gamma = max_j |c_j|
 
 Two choices are specific to this implementation. The rows are numerically far from full rank — their singular values decay smoothly over many orders of magnitude — so γ is computed in the leading subspace of each element, the directions whose singular value is above `rcond` × the largest; the rows are projected onto it and whitened, which leaves γ unchanged (γ does not depend on the basis) and keeps the matrices well conditioned. The part of `b` outside the subspace is measured by **γ_res**: its norm divided by the largest one met in the training set (> 1: more weight outside the training subspace than any training atom). An atom's **grade** is the larger of γ and γ_res — both scale with how far the atom lies outside, and both are ≤ 1 for every training atom. The choice of structures (above) is a greedy, re-graded variant of choosing by MaxVol, in which a chosen frame's atoms enter the active set and their directions outside the subspace are added to it.
 
+The formulas behind all this are in [Theory](#theory) at the end of this page.
+
 ## Build the active set
 
 `build_active_set(model_file, xyz_file, output_file)` streams the training set:
@@ -200,6 +202,120 @@ The upper figures of `compute_gamma` include the start-up of a fresh run. On one
 - **Memory while building:** the Gram matrices take K² × 8 bytes per element on the GPU (70 MB for K = 2960). With the sharded build, each element's matrix is summed on one rank.
 - **γ_res** in float64 is computed as `|b|² − |b V|²`, which costs digits: it is accurate to about 1e-8 relative, plenty for a grade.
 - The active set depends on the model; rebuild it after retraining.
+
+## Theory
+
+This section derives what the functions above compute, following [[1, 4, 5]](#references) and TorchNEP's implementation (`torchnep/extrapolation.py`). It is not needed to use them.
+
+### The model linearised in its parameters
+
+The NEP energy of atom $i$ of element $e$ is a one-hidden-layer network of its descriptor $\mathbf q_i \in \mathbb R^D$ (scaled by `q_scaler`):
+
+$$
+E_i = \sum_{h=1}^{H} w^{(1)}_h \tanh\!\Big(\sum_{d=1}^{D} w^{(0)}_{hd}\, q_{id} - b^{(0)}_h\Big) - b^{(1)} ,
+$$
+
+with the parameters $\boldsymbol\theta_e = (w^{(0)}, b^{(0)}, w^{(1)})$ of element $e$'s network, $K = H(D+2)$ numbers. Near the trained parameters the energy is linear in a change $\boldsymbol\delta$ of them,
+
+$$
+E_i(\boldsymbol\theta_e + \boldsymbol\delta) \approx E_i(\boldsymbol\theta_e) + \mathbf b_i \cdot \boldsymbol\delta ,
+\qquad
+\mathbf b_i = \frac{\partial E_i}{\partial \boldsymbol\theta_e} \in \mathbb R^{K} ,
+$$
+
+and with $t_{ih} = \tanh(\cdot)$ and $g_{ih} = w^{(1)}_h (1 - t_{ih}^2)$ the $K$ components of $\mathbf b_i$ are, for every neuron $h$,
+
+$$
+\frac{\partial E_i}{\partial w^{(0)}_{hd}} = g_{ih}\, q_{id} , \qquad
+\frac{\partial E_i}{\partial b^{(0)}_h} = -g_{ih} , \qquad
+\frac{\partial E_i}{\partial w^{(1)}_h} = t_{ih} .
+$$
+
+Every training atom of element $e$ contributes one row $\mathbf b_i$ to the matrix $B_e$ ($n_e \times K$). Fitting the linearised model to the training data is a linear least-squares problem in $\boldsymbol\delta$ with design matrix $B_e$, and $\mathbf b$ is what an atom looks like to that problem. The descriptor coefficients and $b^{(1)}$, shared by all elements, are left out, as in the per-element active sets of [[4]](#references).
+
+### The grade as a volume ratio
+
+Choose $K$ rows of $B_e$ as the **active set** $A$ ($K \times K$) and write any row in their basis,
+
+$$
+\mathbf b = \mathbf c\, A , \qquad \mathbf c = \mathbf b\, A^{-1} , \qquad
+\gamma(\mathbf b) = \max_j |c_j| .
+$$
+
+By Cramer's rule, replacing active row $j$ by $\mathbf b$ multiplies $|\det A|$ by $|c_j|$. The active set of **maximal volume** $|\det A|$ among all choices of $K$ training rows therefore has $\gamma \le 1$ for every training row, and a row with $\gamma > 1$ would enlarge that volume: its environment lies outside the region the training set spans [[1]](#references). Maximising $\det A$ is D-optimal design: $\det(B^\mathsf T B)$ measures how tightly the data pin down the parameters, and a maximal-volume submatrix is its best $K$-row approximation.
+
+The grade also bounds how much the energy of the atom can move. If a change $\boldsymbol\delta$ of the parameters changes the energy of every active atom by at most $\varepsilon$, $|A\boldsymbol\delta|_j \le \varepsilon$, then
+
+$$
+|\mathbf b\cdot\boldsymbol\delta| = |\mathbf c\, A\boldsymbol\delta| \le \sum_j |c_j|\, \varepsilon \le K\,\gamma\,\varepsilon ,
+$$
+
+so an atom with $\gamma \le 1$ is as well constrained as the training atoms, and the bound grows linearly with $\gamma$ outside.
+
+### MaxVol
+
+Finding the maximal-volume submatrix is NP-hard; the MaxVol algorithm [[5]](#references) finds a **dominant** one, where no single swap increases the volume by more than a factor `tol`. For the matrix $C = X A^{-1}$ of the coefficients of all rows $X$:
+
+1. take the entry of largest modulus, $c_{ij}$; stop if $|c_{ij}| \le$ `tol`;
+2. swap row $i$ into position $j$ of $A$, which multiplies $|\det A|$ by $|c_{ij}| >$ `tol`;
+3. update $A^{-1}$ and $C$ by the rank-one (Sherman–Morrison) formula. With $\mathbf v = \mathbf c_i - \mathbf e_j$ the new matrix is $A' = (I + \mathbf e_j \mathbf v)\,A$, so
+
+$$
+A'^{-1} = A^{-1} - \frac{A^{-1}\mathbf e_j\, \mathbf v}{c_{ij}} , \qquad
+C' = C - \frac{C\,\mathbf e_j\, \mathbf v}{c_{ij}} .
+$$
+
+The volume grows by at least `tol` = 1.01 per swap and is bounded, so the loop ends. TorchNEP seeds $A$ with rows picked by LU with partial pivoting, recomputes $A^{-1}$ exactly every 256 swaps against round-off, and repeats the passes over the training set until every row has $\gamma \le$ `tol` (the check passes of [Build the active set](#build-the-active-set)).
+
+### Subspace, whitening and γ_res
+
+The rows of $B_e$ are far from full rank: the singular values of $B_e$ decay smoothly over many orders of magnitude, so a $K \times K$ active set would be numerically singular. TorchNEP works in the leading subspace of each element. From the Gram matrix of the training rows,
+
+$$
+G = B_e^\mathsf T B_e = V \Lambda V^\mathsf T , \qquad \lambda_1 \ge \lambda_2 \ge \dots ,
+$$
+
+it keeps the $r$ directions with $\sqrt{\lambda_k / \lambda_1} >$ `rcond` and represents a row by its whitened coordinates
+
+$$
+\mathbf x = \mathbf b\, V_r\, S , \qquad S = \operatorname{diag}\big(\sqrt{n_e/\lambda_k}\big)_{k \le r} ,
+$$
+
+unit variance per direction over the training set. The active set is then $r \times r$. For any invertible $r \times r$ matrix $M$, the coefficients of $\mathbf x M$ in the basis $A M$ equal those of $\mathbf x$ in $A$, so the whitening does not change $\gamma$; it only keeps $A$ well conditioned.
+
+What the projection drops is the residual $\mathbf b - \mathbf b V_r V_r^\mathsf T$, whose norm
+
+$$
+\rho(\mathbf b) = \sqrt{\lVert \mathbf b \rVert^2 - \lVert \mathbf b V_r \rVert^2}
+$$
+
+is compared with the largest one over the training rows, $\rho_\text{max}$:
+
+$$
+\gamma_\text{res} = \frac{\rho(\mathbf b)}{\rho_\text{max}} , \qquad
+\text{grade} = \max(\gamma, \gamma_\text{res}) .
+$$
+
+$\gamma_\text{res} > 1$ means more weight in directions where the training set has (almost) no variance than any training atom — extrapolation that $\gamma$, confined to the subspace, cannot see. Both quantities are $\le 1$ for the training atoms and grow with how far an environment lies outside.
+
+### Choosing structures
+
+`select_structures` is a greedy D-optimal choice. The candidate frames are visited in order of decreasing grade; each is re-graded against the current active set and taken only if its grade still exceeds `grade_min`. Taking a frame
+
+- swaps its atoms into the active set by MaxVol (each accepted swap multiplies the volume by more than `tol`), and
+- adds the directions of its atoms with $\gamma_\text{res} > 1$ to the subspace: the orthonormalised residuals $U$, after which the residual of every later row is measured outside them, $\rho^2 \leftarrow \rho^2 - \lVert \mathbf b U \rVert^2$.
+
+A frame close to one already taken therefore no longer extrapolates and is skipped. At the end, MaxVol runs once more over all atoms of the chosen frames.
+
+### The active set in GPUMD
+
+GPUMD's `compute_extrapolation` grades an atom as $\max_j |(\mathbf b M)_j|$ with one $K \times K$ matrix $M$ per element. TorchNEP writes
+
+$$
+M = \big[\, V_r\, S\, A^{-1} \;\; 0 \,\big] ,
+$$
+
+the $K \times r$ product padded with zero columns, so that $\mathbf b M = (\mathbf c, 0)$ and GPUMD's grade is exactly $\gamma$. GPUMD does not compute $\gamma_\text{res}$.
 
 ## References
 

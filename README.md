@@ -79,7 +79,7 @@ mkdocs serve    # preview at http://127.0.0.1:8000/torchnep/, reloaded on every 
 mkdocs build    # static site in site/
 ```
 
-The API reference is read from the source files, so TorchNEP itself does not need to be installed. MkDocs stays below 2.0, which the Material theme does not support.
+The API reference is read from the source files, so TorchNEP itself does not need to be installed. MkDocs stays below 2.0, which the Material theme does not support. Formulas (`$...$`, `$$...$$`) are rendered in the browser by MathJax, loaded from a CDN, so the preview needs an internet connection to show them; nothing else needs to be installed.
 
 ## Citation
 
