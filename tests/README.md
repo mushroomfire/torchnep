@@ -15,7 +15,7 @@ multi-GPU paths are only exercised there.
 
 | file | covers |
 | --- | --- |
-| `test_gpumd_parity.py` | E / F / V / descriptor vs the GPUMD reference (incl. compressed CrCoNi frames where ZBL forces reach ~120 eV/Å); analytical vs autograd; train path vs predict path. |
+| `test_gpumd_parity.py` | E / F / V / descriptor vs the GPUMD reference (incl. compressed CrCoNi frames where ZBL forces reach ~120 eV/Å); analytical vs autograd; train path vs predict path on every frame (float64 to round-off). |
 | `test_descriptors.py` | Angular basis L=1..8; gradient checks; the six higher-body channels (q_222, q_1111, q_112, q_123, q_233, q_134) — GPUMD-polynomial match and rotational invariance; backend auto-resolution and loop/bmm/mulsum numerical equivalence. |
 | `test_neighbor.py` | Cell-list vs brute-force neighbor search; tiled / auto-block paths. |
 | `test_parsing.py` | Legacy and current `l_max` nep.in / nep.txt parsing. |
@@ -33,6 +33,8 @@ multi-GPU paths are only exercised there.
 | `test_predict_features.py` | `predict_dataset`: descriptor.out vs GPUMD, the out-of-memory retry and small chunks leave the results unchanged, progress line without tqdm. |
 | `test_cutoff_per_type.py` | Per-species cutoffs: parsing, pair table, equal values reproduce the uniform cutoff, agreement of the four compute paths. |
 | `test_cutoff_rules.py` | Cutoff rules checked on nep.in and every model (angular/radial/ZBL limits, typewise factor). |
+| `test_zbl_matrix.py` | Every ZBL variant on every path, against NEP_CPU (double precision, `data/zbl/*.nepcpu.npz`) and GPUMD (`data/zbl/*.gpumd.npz`): universal, typewise with the cap active / inactive, `zbl.in`, `zbl.in` + typewise line, each with per-species cutoffs, one type, CrCoNi with `zbl 2`. Paths: the four training paths (float64 whole model and ZBL term; float32 ZBL forces), calculator `compute` / `compute_batch` / `compute_tiled`, ASE, `predict_dataset`, nep.txt header and round trip, checkpoints, `slim_model`, the end-of-training `*_train.out` (single process and sharded). The structures sample both sides of every cutoff; a test checks that they do. |
+| `test_typewise_zbl_cap.py` | The typewise pair cutoff is capped at the `zbl` value (PR #29). |
 | `test_zbl_flexible.py` | Flexible ZBL (`zbl.in`): universal-parameter file equals the universal path, per-pair parameters vs a numpy reference, nep.txt round trip. |
 | `test_neighbor_modes.py` | The `cached` / `compact` / `on_the_fly` neighbor layouts give the same batches; training runs in every mode. |
 | `test_noise_and_wd.py` | weight_decay with bias-exempt groups, the gathered NN, the compiled ZBL path. |
@@ -48,3 +50,12 @@ multi-GPU paths are only exercised there.
 ```bash
 GPUMD_NEP=/path/to/GPUMD/src/nep python tests/bake_fixtures.py
 ```
+
+**ZBL fixtures** (`data/zbl/`, defined in `zbl_cases.py`): `python tests/make_zbl_fixtures.py inputs` writes the
+structures, nep.in / zbl.in files and nep.txt files; `NEP_CPU=/path/to/NEP_CPU python tests/make_zbl_fixtures.py nepcpu`
+compiles `nepcpu_driver.cpp` against NEP_CPU and writes the double-precision references; `gpumd-prepare` /
+`gpumd-collect` do the same with GPUMD's `nep` on a GPU machine. `zbl_oracle.py` is an independent numpy port of
+GPUMD's ZBL that reads the nep.in text.
+
+**Mutation audit** of the ZBL tests (minutes, not part of the pytest run): `python tests/mutate_zbl.py` plants each
+listed ZBL bug in a scratch copy and runs the ZBL tests; every mutant must be killed.

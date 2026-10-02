@@ -169,10 +169,11 @@ def _build_batch(structures, indices, calc, dtype, device):
 RTOL, ATOL = 1e-5, 2e-4
 # (A) analytical vs autograd — same context, formula re-ordering only, so the
 # bound is relative (forces reach ~120 eV/A on the ZBL frames). (B) train vs
-# predict — different autograd contexts dispatch to different kernels with
-# subtly different accumulation order, hence the looser float64 bound.
+# predict — different kernels, the same arithmetic: float64 agrees to
+# round-off (~1e-14; the 5e-6 this used to allow hid coefficient tables that
+# the model stored in float32), float32 to its precision.
 TOL_ANA = {"float64": 1e-9, "float32": 1e-4}   # relative
-TOL_TVP = {"float64": 5e-6, "float32": 5e-3}   # absolute
+TOL_TVP = {"float64": (1e-10, 1e-9), "float32": (1e-4, 5e-3)}   # (rtol, atol)
 
 
 def _ids(seq, prefix):
@@ -322,36 +323,32 @@ def _model_from_calc(calc: NEPCalculator, device) -> NEPModel:
 @_DEV
 @_DT
 def test_train_vs_predict(fixture, device, dtype_s):
-    """Training-path forward agrees with the predict-path forward."""
+    """Training-path forward agrees with the predict-path forward on every
+    frame (the compressed ones carry the strong ZBL): per-atom energies,
+    forces, per-atom virials."""
     torch_dtype = DTYPE_MAP[dtype_s]
     np_dtype = NP_DTYPE_MAP[dtype_s]
     calc = NEPCalculator(str(fixture["nep"]), dtype=torch_dtype, device=device)
     model = _model_from_calc(calc, device)
-    frame = read_xyz(str(fixture["xyz"]))[0]
+    frames = read_xyz(str(fixture["xyz"]))
 
-    structures = _preprocess_for_prediction([frame], calc, np_dtype)
-    batch = _build_batch(structures, [0], calc, torch_dtype, torch.device(device))
+    structures = _preprocess_for_prediction(frames, calc, np_dtype)
+    batch = _build_batch(structures, list(range(len(frames))), calc, torch_dtype,
+                         torch.device(device))
 
     with torch.enable_grad():
         r_train = model.compute_properties_cached(
             batch, need_forces=True, need_virial=True, backend="loop")
-    f_train = r_train["forces"].detach().cpu().double().numpy()
-    v_train = r_train["virial"].detach().cpu().double().numpy()
-
     with torch.no_grad():
         r_pred = calc.compute_batch(batch)
-    f_pred = r_pred["forces"].cpu().double().numpy()
-    v_pred = r_pred["virial"].cpu().double().numpy()
 
-    dF = float(np.abs(f_train - f_pred).max())
-    dV = float(np.abs(v_train - v_pred).max())
-
-    tol = TOL_TVP[dtype_s]
-    msg = (f"[{fixture['name']:8s} {device:4s} {dtype_s:7s}]  "
-           f"|dF|={dF:.2e}  |dV|={dV:.2e}")
-    print("\n" + msg)
-    assert dF < tol, f"{msg}  (F tol={tol})"
-    assert dV < tol, f"{msg}  (V tol={tol})"
+    rtol, atol = TOL_TVP[dtype_s]
+    for key in ("Ei", "forces", "virial"):
+        a = r_train[key].detach().cpu().double().numpy()
+        b = r_pred[key].detach().cpu().double().numpy()
+        np.testing.assert_allclose(
+            a, b, rtol=rtol, atol=atol,
+            err_msg=f"[{fixture['name']} {device} {dtype_s}] {key}")
 
 
 @_DEV
