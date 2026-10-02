@@ -63,6 +63,15 @@ NAMES = list(CASES)
 PATHS = ["autograd", "autograd+compile", "analytical", "analytical+compile"]
 RTOL64, ATOL64 = 1e-10, 1e-8
 DEVICES = [d for d in devices() if d != "mps"]
+# Inductor's code depends on the graph, not on the table values the cases
+# differ in: on CUDA the compiled paths run one case per distinct graph (T = 4,
+# 1, 3; with the zbl.in screening table; with per-species cutoffs). On the CPU
+# (eager dynamo backend) every case runs every path.
+INDUCTOR_CASES = {"PbHCsI_uni25", "PbHCsI_tw25", "PbHCsI_flex", "PbHCsI_pc_tw25",
+                  "PbHCsI_pc_flex", "Cs_tw25", "CrCoNi_tw20"}
+PATH_CASES = [pytest.param(n, p, d, id=f"{n}-{p}-{d}")
+              for n in NAMES for p in PATHS for d in DEVICES
+              if not (d == "cuda" and p.endswith("+compile") and n not in INDUCTOR_CASES)]
 
 
 # --------------------------------------------------------------------------
@@ -253,9 +262,7 @@ def test_typewise_line_with_zbl_in_warns():
 # --------------------------------------------------------------------------
 # training paths
 
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name, path, device", PATH_CASES)
 def test_training_paths_float64(name, path, device):
     """Energy, forces, virial (per frame and per atom) of the whole model and
     of the ZBL term alone (model minus the same model without ZBL) equal
@@ -274,9 +281,7 @@ def test_training_paths_float64(name, path, device):
     _close(v - v0, ref["virial_zbl"], f"{name} {path} ZBL virial", **tol)
 
 
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("path", PATHS)
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name, path, device", PATH_CASES)
 def test_training_paths_float32(name, path, device):
     """float32: ZBL forces of the dimer frames, atom by atom (each atom has a
     single partner, so the relative error is meaningful down to the smallest
