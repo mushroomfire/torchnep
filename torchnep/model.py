@@ -143,7 +143,7 @@ class NEPModel(nn.Module):
                 self.register_buffer("zbl_rc_outer_per_type",
                                      torch.tensor([2.0 * r for r in rc_i]))
                 self.zbl_rc_inner = min(rc_i)
-                self.zbl_rc_outer = max(2.0 * r for r in rc_i)
+                self.zbl_rc_outer = self.zbl        # GPUMD caps the per-pair cutoff at the zbl value
                 self.zbl_typewise_factor = tw
             else:
                 self.zbl_rc_inner = self.zbl / 2.0
