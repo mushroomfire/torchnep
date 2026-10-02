@@ -88,8 +88,8 @@ def _driver():
 
 
 def nepcpu_compute(exe, nep_file, frames, type_names):
-    """Run the NEP_CPU driver; per-atom energy (N,), forces (N, 3) and the
-    per-frame total virial (F, 3, 3)."""
+    """Run the NEP_CPU driver; per-atom energy (N,), forces (N, 3), the
+    per-frame total virial (F, 3, 3) and the per-atom virial (N, 9)."""
     with tempfile.TemporaryDirectory() as d:
         fin, fout = Path(d) / "frames.txt", Path(d) / "out.txt"
         lines = [str(len(frames))]
@@ -107,7 +107,7 @@ def nepcpu_compute(exe, nep_file, frames, type_names):
         n = len(fr["species"])
         vir.append(out[off:off + n, 4:].sum(0).reshape(3, 3))
         off += n
-    return out[:, 0], out[:, 1:4], np.array(vir)
+    return out[:, 0], out[:, 1:4], np.array(vir), out[:, 4:]
 
 
 def _zbl_only_nep_txt(name, dst):
@@ -128,11 +128,11 @@ def bake_nepcpu():
     exe = _driver()
     for name, case in CASES.items():
         frames = read_xyz(str(xyz(case["system"])))
-        e, f, v = nepcpu_compute(exe, nep_txt(name), frames, case["types"])
+        e, f, v, va = nepcpu_compute(exe, nep_txt(name), frames, case["types"])
         with tempfile.TemporaryDirectory() as d:
             _zbl_only_nep_txt(name, Path(d) / "nep.txt")
-            ez, fz, vz = nepcpu_compute(exe, Path(d) / "nep.txt", frames, case["types"])
-        np.savez(nepcpu_ref(name), e_atom=e, forces=f, virial=v,
+            ez, fz, vz, _ = nepcpu_compute(exe, Path(d) / "nep.txt", frames, case["types"])
+        np.savez_compressed(nepcpu_ref(name), e_atom=e, forces=f, virial=v, virial_atom=va,
                  e_atom_zbl=ez, forces_zbl=fz, virial_zbl=vz)
         print(f"{nepcpu_ref(name).name}: |F| max {np.abs(f).max():.1f} eV/A, "
               f"ZBL |e| max {np.abs(ez).max():.1f} eV")

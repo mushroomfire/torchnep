@@ -142,13 +142,13 @@ def _pairs(positions, cell, rc):
 
 
 def zbl_reference(spec, species, positions, cell):
-    """Per-atom energy (N,), forces (N, 3) and the total virial (3, 3) of the
-    ZBL term, GPUMD's accumulation: for each directed pair (n1, n2),
+    """Per-atom energy (N,), forces (N, 3) and per-atom virial (N, 3, 3) of
+    the ZBL term, GPUMD's accumulation: for each directed pair (n1, n2),
     pe[n1] += f / 2, f12 = r12 * fp / d / 2, F[n1] += f12, F[n2] -= f12,
-    virial -= r12 (x) f12."""
+    virial[n1] -= r12 (x) f12."""
     types = [spec.type_names.index(s) for s in species]
     N = len(types)
-    pe, F, W = np.zeros(N), np.zeros((N, 3)), np.zeros((3, 3))
+    pe, F, W = np.zeros(N), np.zeros((N, 3)), np.zeros((N, 3, 3))
     for n1, n2, r12 in _pairs(positions, cell, spec.max_rc() + 1e-9):
         t1, t2 = types[n1], types[n2]
         rc_inner, rc_outer, coef = spec.pair(t1, t2)
@@ -160,5 +160,5 @@ def zbl_reference(spec, species, positions, cell):
         pe[n1] += 0.5 * f
         F[n1] += f12
         F[n2] -= f12
-        W -= np.outer(r12, f12)
+        W[n1] -= np.outer(r12, f12)
     return pe, F, W

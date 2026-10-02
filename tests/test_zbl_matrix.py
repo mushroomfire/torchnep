@@ -116,7 +116,8 @@ def _batch(name, frames, dtype=torch.float64, device="cpu"):
 
 
 def _efv(model, batch, path, device="cpu"):
-    """Per-frame energy, per-atom forces, per-frame virial (3 x 3) through one
+    """Per-frame energy, per-atom forces, per-frame virial (3 x 3) and per-atom
+    virial (N, 9) through one
     of the four training paths (the objects train_nep wires up for
     use_autograd_forces x use_compile). On CPU the compiled paths run the
     traced graph without code generation, on CUDA through Inductor."""
@@ -143,7 +144,7 @@ def _efv(model, batch, path, device="cpu"):
     v = torch.zeros(S, 9, dtype=torch.float64, device=out["virial"].device)
     v.index_add_(0, batch["struct_idx"], out["virial"].detach().double())
     return (out["Etot"].detach().double().cpu().numpy(), out["forces"].detach().double().cpu().numpy(),
-            v.reshape(S, 3, 3).cpu().numpy())
+            v.reshape(S, 3, 3).cpu().numpy(), out["virial"].detach().double().cpu().numpy())
 
 
 def _close(actual, desired, what, rtol=RTOL64, atol=ATOL64):
@@ -176,7 +177,7 @@ def test_oracle_matches_nepcpu(name):
         pe, F, W = zbl_oracle.zbl_reference(spec(name), fr["species"], fr["positions"], fr["cell"])
         _close(pe, ref["e_atom_zbl"][off[k]:off[k + 1]], f"{name} frame {k} energy")
         _close(F, ref["forces_zbl"][off[k]:off[k + 1]], f"{name} frame {k} forces")
-        _close(W, ref["virial_zbl"][k], f"{name} frame {k} virial")
+        _close(W.sum(0), ref["virial_zbl"][k], f"{name} frame {k} virial")
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -256,16 +257,18 @@ def test_typewise_line_with_zbl_in_warns():
 @pytest.mark.parametrize("path", PATHS)
 @pytest.mark.parametrize("name", NAMES)
 def test_training_paths_float64(name, path, device):
-    """Energy, forces, virial of the whole model and of the ZBL term alone
-    (model minus the same model without ZBL) equal NEP_CPU."""
+    """Energy, forces, virial (per frame and per atom) of the whole model and
+    of the ZBL term alone (model minus the same model without ZBL) equal
+    NEP_CPU."""
     frames, ref = _frames(CASES[name]["system"]), _ref(name)
     batch = _batch(name, frames, device=device)
-    e, f, v = _efv(_model(name, device=device), batch, path, device)
-    e0, f0, v0 = _efv(_model(name, device=device, zbl=False), batch, path, device)
+    e, f, v, va = _efv(_model(name, device=device), batch, path, device)
+    e0, f0, v0, _ = _efv(_model(name, device=device, zbl=False), batch, path, device)
     tol = {} if device == "cpu" else {"rtol": 1e-9, "atol": 1e-7}
     _close(e, _frame_energies(ref["e_atom"], frames), f"{name} {path} energy", **tol)
     _close(f, ref["forces"], f"{name} {path} forces", **tol)
     _close(v, ref["virial"], f"{name} {path} virial", **tol)
+    _close(va, ref["virial_atom"], f"{name} {path} per-atom virial", **tol)
     _close(e - e0, _frame_energies(ref["e_atom_zbl"], frames), f"{name} {path} ZBL energy", **tol)
     _close(f - f0, ref["forces_zbl"], f"{name} {path} ZBL forces", **tol)
     _close(v - v0, ref["virial_zbl"], f"{name} {path} ZBL virial", **tol)
@@ -283,8 +286,8 @@ def test_training_paths_float32(name, path, device):
     frames, ref = _frames(system)[:nd], _ref(name)
     n_atoms = _offsets(frames)[-1]
     batch = _batch(name, frames, torch.float32, device)
-    _, f, _ = _efv(_model(name, torch.float32, device), batch, path, device)
-    _, f0, _ = _efv(_model(name, torch.float32, device, zbl=False), batch, path, device)
+    f = _efv(_model(name, torch.float32, device), batch, path, device)[1]
+    f0 = _efv(_model(name, torch.float32, device, zbl=False), batch, path, device)[1]
     _close(f - f0, ref["forces_zbl"][:n_atoms], f"{name} {path} float32 ZBL forces",
            rtol=2e-4, atol=2e-3)
 
@@ -299,8 +302,9 @@ def _calc(name, device="cpu", dtype=torch.float64):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("name", NAMES)
 def test_calculator_compute(name, device):
-    """NEPCalculator.compute: per-atom energies, forces, virial, and the ZBL
-    component it reports."""
+    """NEPCalculator.compute: per-atom energies, forces, virials, and the ZBL
+    component it reports (its per-atom virial against the oracle: GPUMD puts
+    a pair's virial on the central atom)."""
     frames, ref = _frames(CASES[name]["system"]), _ref(name)
     calc, off = _calc(name, device), _offsets(frames)
     for k, fr in enumerate(frames):
@@ -314,6 +318,11 @@ def test_calculator_compute(name, device):
         for key, rk in (("virial", "virial"), ("virial_zbl", "virial_zbl")):
             _close(r[key].cpu().numpy().reshape(n, 9).sum(0).reshape(3, 3), ref[rk][k],
                    f"{name} frame {k} {key}")
+        _close(r["virial"].cpu().numpy().reshape(n, 9), ref["virial_atom"][sl],
+               f"{name} frame {k} per-atom virial")
+        W = zbl_oracle.zbl_reference(spec(name), fr["species"], fr["positions"], fr["cell"])[2]
+        _close(r["virial_zbl"].cpu().numpy().reshape(n, 9), W.reshape(n, 9),
+               f"{name} frame {k} per-atom ZBL virial (oracle)")
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -332,13 +341,13 @@ def test_calculator_batch_and_tiled(name, device):
         r = calc.compute_batch(batch)
     _close(r["Ei"].detach().cpu().numpy(), ref["e_atom"], f"{name} batch energy")
     _close(r["forces"].detach().cpu().numpy(), ref["forces"], f"{name} batch forces")
+    _close(r["virial"].detach().cpu().numpy(), ref["virial_atom"], f"{name} batch per-atom virial")
     for k, fr in enumerate(frames[:_n_dimer_frames(CASES[name]["system"])]):
         t = calc.compute_tiled(fr["species"], fr["positions"], fr["cell"], block_size=7)
         sl = slice(off[k], off[k + 1])
         _close(t["energy"].cpu().numpy(), ref["e_atom"][sl], f"{name} tiled frame {k} energy")
         _close(t["forces"].cpu().numpy(), ref["forces"][sl], f"{name} tiled frame {k} forces")
-        _close(t["virial"].cpu().numpy().sum(0).reshape(3, 3), ref["virial"][k],
-               f"{name} tiled frame {k} virial")
+        _close(t["virial"].cpu().numpy(), ref["virial_atom"][sl], f"{name} tiled frame {k} virial")
 
 
 @pytest.mark.parametrize("name", NAMES)
@@ -481,14 +490,15 @@ def test_slim_model(name, keep, tmp_path):
         warnings.simplefilter("ignore")
         trainer_model = NEPModel(cfg).double()
     trainer_model.load_state_dict(slim.state_dict())
-    e_f, f_f, v_f = _efv(full, _batch(name, frames), "analytical")
+    e_f, f_f, v_f, va_f = _efv(full, _batch(name, frames), "analytical")
     structs = preprocess_structures(frames, cfg, np.float64)
     nn_r, nn_a = compute_max_neighbors(structs)
     sbatch = StreamDataStore(structs, torch.device("cpu"), torch.float64, config=cfg).collate(
         list(range(len(frames))))
     for m in (slim, trainer_model):
         for path in ("autograd", "analytical"):
-            for a, b, what in zip(_efv(m, sbatch, path), (e_f, f_f, v_f), ("energy", "forces", "virial")):
+            for a, b, what in zip(_efv(m, sbatch, path), (e_f, f_f, v_f, va_f),
+                                  ("energy", "forces", "virial", "per-atom virial")):
                 _close(a, b, f"{name} slim {keep} {path} {what}", rtol=1e-9)
     structs = preprocess_structures(frames, cfg, np.float64)
     slim.save_nep_txt(str(tmp_path / "slim.txt"), nn_r, nn_a)
@@ -501,7 +511,7 @@ def test_slim_model(name, keep, tmp_path):
         n = len(fr["species"])
         _close(r["energy_zbl"].numpy(), pe, f"{name} slim {keep} frame {k} ZBL energy")
         _close(r["forces_zbl"].numpy(), F, f"{name} slim {keep} frame {k} ZBL forces")
-        _close(r["virial_zbl"].numpy().reshape(n, 9).sum(0).reshape(3, 3), W, f"{name} slim ZBL virial")
+        _close(r["virial_zbl"].numpy().reshape(n, 9), W.reshape(n, 9), f"{name} slim ZBL virial")
         _close(r["energy"].sum().item(), e_f[k], f"{name} slim {keep} frame {k} energy", rtol=1e-9)
         _close(r["forces"].numpy(), f_f[off[k]:off[k + 1]], f"{name} slim {keep} frame {k} forces",
                rtol=1e-9)

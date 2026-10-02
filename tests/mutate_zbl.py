@@ -76,6 +76,8 @@ MUTANTS = {
                             "e_atom.scatter_add_(0, pj, 0.5 * e_pair)"),
     "pair_table_index_i_only": (O, "idx = atom_types[pair_i] * T + atom_types[pair_j]",
                                 "idx = atom_types[pair_i] * T + atom_types[pair_i]"),
+    "per_atom_virial_on_centre": (O, "virial.scatter_add_(0, pj.unsqueeze(-1).expand_as(v9), v9)",
+                                  "virial.scatter_add_(0, pi.unsqueeze(-1).expand_as(v9), v9)"),
     # flexible (zbl.in)
     "flex_index_formula": (D, "return t1 * num_types - (t1 * (t1 - 1)) // 2 + (t2 - t1)",
                            "return t1 * num_types - (t1 * (t1 + 1)) // 2 + (t2 - t1)"),
