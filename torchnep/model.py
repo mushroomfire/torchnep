@@ -138,10 +138,13 @@ class NEPModel(nn.Module):
                 self.set_flexible_zbl(config["zbl_flexible"])
             elif tw is not None:
                 # COVALENT_RADIUS is 0-indexed, atomic_numbers is real Z -> z-1.
+                # float64 like the pair tables below (a float32 default here
+                # rounded the cutoffs of float64 models to float32).
                 rc_i = [tw * COVALENT_RADIUS[z - 1] for z in atomic_numbers]
-                self.register_buffer("zbl_rc_inner_per_type", torch.tensor(rc_i))
+                self.register_buffer("zbl_rc_inner_per_type",
+                                     torch.tensor(rc_i, dtype=torch.float64))
                 self.register_buffer("zbl_rc_outer_per_type",
-                                     torch.tensor([2.0 * r for r in rc_i]))
+                                     torch.tensor([2.0 * r for r in rc_i], dtype=torch.float64))
                 self.zbl_rc_inner = min(rc_i)
                 self.zbl_rc_outer = self.zbl        # GPUMD caps the per-pair cutoff at the zbl value
                 self.zbl_typewise_factor = tw
@@ -164,9 +167,9 @@ class NEPModel(nn.Module):
             if tw is not None:
                 # NEP_CPU typewise convention: rc_outer per pair is
                 # min((cov_i + cov_j) * factor, global rc_outer), rc_inner 0.
-                # Built FROM the registered per-type buffer (float32-rounded)
-                # so the table matches the eager compute_zbl path bit-for-bit.
-                rt = self.zbl_rc_outer_per_type.to(torch.float64)
+                # Built FROM the registered per-type buffer so the table
+                # matches the eager compute_zbl path bit-for-bit.
+                rt = self.zbl_rc_outer_per_type
                 rc_o_pair = torch.clamp(0.5 * (rt.view(-1, 1) + rt.view(1, -1)),
                                         max=self.zbl_rc_outer)
                 rc_i_pair = torch.zeros_like(rc_o_pair)
@@ -225,10 +228,31 @@ class NEPModel(nn.Module):
 
         # q_scaler (computed from data, not learned)
         self.register_buffer("q_scaler", torch.ones(self.dim))
-        self.register_buffer("_c3b", torch.tensor(C3B[:self.num_lm]))
-        self.register_buffer("_c4b", torch.tensor(C4B))
-        self.register_buffer("_c5b", torch.tensor(C5B))
-        self.register_buffer("_c4b2", torch.tensor(C4B2))
+        # float64 (the module-level .to(dtype) casts them): a float32 default
+        # here rounded the coefficients of float64 models to float32.
+        self.register_buffer("_c3b", torch.tensor(C3B[:self.num_lm], dtype=torch.float64))
+        self.register_buffer("_c4b", torch.tensor(C4B, dtype=torch.float64))
+        self.register_buffer("_c5b", torch.tensor(C5B, dtype=torch.float64))
+        self.register_buffer("_c4b2", torch.tensor(C4B2, dtype=torch.float64))
+        self.register_load_state_dict_post_hook(NEPModel._restore_constants)
+
+    @staticmethod
+    def _restore_constants(module, incompatible_keys):
+        """The coefficient tables and the typewise ZBL radii are constants of
+        the architecture, not trained state: re-fill them after a load, so a
+        checkpoint written while they were float32 (up to 1.0.7a2) does not
+        bring the rounding back into a float64 model."""
+        with torch.no_grad():
+            for name, src in (("_c3b", C3B[:module.num_lm]), ("_c4b", C4B),
+                              ("_c5b", C5B), ("_c4b2", C4B2)):
+                getattr(module, name).copy_(torch.tensor(src, dtype=torch.float64))
+            if (getattr(module, "zbl_typewise_factor", None) is not None
+                    and hasattr(module, "zbl_rc_inner_per_type")):
+                rc_i = torch.tensor([module.zbl_typewise_factor * COVALENT_RADIUS[z - 1]
+                                     for z in module.atomic_numbers.tolist()],
+                                    dtype=torch.float64)
+                module.zbl_rc_inner_per_type.copy_(rc_i)
+                module.zbl_rc_outer_per_type.copy_(2.0 * rc_i)
 
     def cutoff_args(self):
         """``(rc_radial, rc_angular)`` as the basis functions take them: the
