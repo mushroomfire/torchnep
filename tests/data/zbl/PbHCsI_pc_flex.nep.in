@@ -1,0 +1,7 @@
+type 4 Pb H Cs I
+cutoff 6 4 5 3.5 5.5 3 4.5 3.5
+n_max 4 4
+basis_size 4 4
+l_max 4 2 0
+neuron 8
+zbl PbHCsI_pc_flex.zbl.in

@@ -1,0 +1,8 @@
+type 4 Pb H Cs I
+cutoff 6 4
+n_max 4 4
+basis_size 4 4
+l_max 4 2 0
+neuron 8
+zbl 3
+use_typewise_cutoff_zbl 0.5
