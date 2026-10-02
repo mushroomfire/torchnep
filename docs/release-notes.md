@@ -1,12 +1,12 @@
 # Release Notes
 
-## 1.0.7a2
+## 1.0.7
 
+- **Fix: typewise ZBL cutoff** ([#29](https://github.com/mushroomfire/torchnep/pull/29), thanks to @erikfransson): with `use_typewise_cutoff_zbl`, training now caps the ZBL cutoff of each element pair at the `zbl` value, min(factor × (R<sub>i</sub> + R<sub>j</sub>), `zbl`), as GPUMD does. Before, training did not apply the cap, while GPUMD, LAMMPS and the TorchNEP calculator apply it when they run the written `nep.txt`: pairs with factor × (R<sub>i</sub> + R<sub>j</sub>) above `zbl` were trained with a repulsion the `nep.txt` does not have. With factor 0.7 and `zbl 2.5` this concerns pairs with alkali or alkaline-earth metals, Y, Zr or lanthanides; with `zbl 2` already Mg, Al, Ti, V, Cr and Zn. **Retrain such models.**
+- **Fix: float64 training**: the typewise ZBL cutoffs and the angular coefficient tables of the model were stored in float32 precision, so float64 training and the calculator differed by up to ~1e-4 eV on close contacts. They now agree to round-off; checkpoints of earlier versions are corrected when loaded. float32 training was not affected.
+- **ZBL tests**: every ZBL variant (universal, typewise with and without the cap, `zbl.in`, each also with per-species cutoffs) on every training and prediction path, against NEP_CPU and GPUMD, with structures on both sides of every cutoff; planted ZBL bugs are all caught.
 - **Frame weights**: `weight=w` on the comment line of the training (or validation) xyz makes a frame count `w` times in the loss — its energy, forces and virial — with `0 < w <= 100`, default 1. The reported errors stay unweighted. See [Frame weights](getting-started/training-data.md#frame-weights).
 - **Documentation**: a [NEP theory](getting-started/theory.md) chapter (the model, descriptor, ZBL, forces and how TorchNEP trains it) and the theory of the [extrapolation grade](guide/extrapolation.md#theory); formulas are now rendered on the site.
-
-## 1.0.7a1
-
 - **GPU machines without a C compiler**: PyTorch 2.12+ runs some built-in CUDA operations through Triton even without `torch.compile`, and Triton needs a C compiler the first time it runs on a machine. TorchNEP now checks this at start-up: it warns, runs those operations with the regular CUDA kernels and keeps `torch.compile` off, instead of failing in the middle of training. See [Installation](getting-started/installation.md#a-c-compiler-on-the-gpu-machine).
 - **Training on Apple GPUs (MPS) works again**; it had failed at the first epoch since 1.0.2.
 - **Unknown nep.in keywords are an error**: a typo or a GPUMD-only option stops the run with the keyword and its line, instead of being ignored.
@@ -18,6 +18,10 @@
     - The loss plot marks stage 2 where it really started when stage 1 stopped early.
     - Blank lines between frames of an xyz file are accepted everywhere, not only by the streamed reader.
 - **Test coverage** reported on [Codecov](https://codecov.io/gh/mushroomfire/torchnep); new tests for fine-tuning, slimming, restart, the multi-GPU trainer and GPU training with `torch.compile`, and unused code removed.
+
+### New contributors
+
+- @erikfransson made their first contribution in [#29](https://github.com/mushroomfire/torchnep/pull/29)
 
 ## 1.0.6
 
