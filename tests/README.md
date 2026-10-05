@@ -53,7 +53,7 @@ GPUMD_NEP=/path/to/GPUMD/src/nep python tests/bake_fixtures.py
 
 **ZBL fixtures** (`data/zbl/`, defined in `zbl_cases.py`): `python tests/make_zbl_fixtures.py inputs` writes the
 structures, nep.in / zbl.in files and nep.txt files; `NEP_CPU=/path/to/NEP_CPU python tests/make_zbl_fixtures.py nepcpu`
-compiles `nepcpu_driver.cpp` against NEP_CPU and writes the double-precision references; `gpumd-prepare` /
+compiles a small driver against NEP_CPU and writes the double-precision references; `gpumd-prepare` /
 `gpumd-collect` do the same with GPUMD's `nep` on a GPU machine. `zbl_oracle.py` is an independent numpy port of
 GPUMD's ZBL that reads the nep.in text.
 
